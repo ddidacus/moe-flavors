@@ -1,0 +1,4 @@
+*.out
+*.pth
+.claude
+wandb/

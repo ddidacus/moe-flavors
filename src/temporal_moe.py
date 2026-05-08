@@ -5,7 +5,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-EPS = 1e-20
 
 @dataclass
 class MoEConfig:
@@ -21,23 +20,21 @@ class ChunkingRouter(nn.Module):
         self.top_k = top_k
         self.num_experts = num_experts
         self.gate = nn.Linear(hidden_dim, num_experts, bias=False, dtype=dtype)
-        self.Wq = nn.Linear(hidden_dim, hidden_dim, dtype=dtype)
-        self.Wk = nn.Linear(hidden_dim, hidden_dim, dtype=dtype)
+        self.q_proj = nn.Linear(hidden_dim, hidden_dim, bias=False, dtype=dtype)
+        self.k_proj = nn.Linear(hidden_dim, hidden_dim, bias=False, dtype=dtype)
+        nn.init.eye_(self.q_proj.weight)
+        nn.init.eye_(self.k_proj.weight)
         self._boundary_threshold = 0.5
 
     def forward(self, x: torch.Tensor):
         # x: (B, L, D)
         B, L, D = x.shape
 
-        # project token qk
-        q_t = self.Wq(x)[:, 1:, :] # B, L-1, D
-        k_t_minus_1 = self.Wk(x)[:, :-1, :] # B, L-1, D
-
-        # boundary segmentation
-        qk_dot = (q_t * k_t_minus_1).sum(-1) # B, L-1
-        n1 = torch.norm(q_t, p=2, dim=-1) # B, L-1
-        n2 = torch.norm(k_t_minus_1, p=2, dim=-1) # B, L-1
-        pt_minus_1 = 1/2 * (1 - (qk_dot / (n1 * n2 + EPS))) # B, L-1
+        # boundary segmentation via cosine distance between adjacent tokens
+        q = F.normalize(self.q_proj(x[:, :-1, :]), dim=-1) # B, L-1, D
+        k = F.normalize(self.k_proj(x[:, 1:, :]), dim=-1)  # B, L-1, D
+        cos_sim = (q * k).sum(-1)                           # B, L-1
+        pt_minus_1 = torch.clamp((1 - cos_sim) / 2, min=0.0, max=1.0) # B, L-1
 
         pt = torch.cat([torch.ones((B, 1), device=x.device, dtype=x.dtype), pt_minus_1], dim=1) # B, L
         bt = (pt >= self._boundary_threshold) # B, L

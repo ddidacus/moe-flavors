@@ -39,8 +39,9 @@ def get_fineweb_loader(tokenizer, seq_len: int, batch_size: int, num_samples: in
                 max_length=self.seq_len + 1, padding="max_length",
                 return_tensors="pt"
             )
-            input_ids = tokens["input_ids"].squeeze(0) # seq_len+1
-            return input_ids[:-1], input_ids[1:]       # x, y
+            input_ids = tokens["input_ids"].squeeze(0)      # seq_len+1
+            attention_mask = tokens["attention_mask"].squeeze(0) # seq_len+1
+            return input_ids[:-1], input_ids[1:], attention_mask[:-1]
 
     dataset = TokenizedDataset(ds["text"], tokenizer, seq_len)
     return DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
@@ -216,8 +217,8 @@ def main():
     for epoch in range(100): # enough epochs to hit num_steps
         pbar = tqdm(loader, desc=f"epoch {epoch}", leave=False,
                     disable=not accelerator.is_main_process)
-        for x, y in pbar:
-            outputs = model(input_ids=x, labels=y)
+        for x, y, mask in pbar:
+            outputs = model(input_ids=x, labels=y, attention_mask=mask)
             total_loss = outputs.loss
             ratio_loss = raw_model.get_moe_loss().detach()
             lm_loss = (total_loss - ratio_loss).detach()

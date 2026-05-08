@@ -2,3 +2,5 @@
 *.pth
 .claude
 wandb/
+src/__pycache__
+*/__pycache__

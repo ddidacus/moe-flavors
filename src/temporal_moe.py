@@ -77,27 +77,37 @@ class ChunkingMoELayer(nn.Module):
         device = next(original_ffn.parameters()).device
         dtype = next(original_ffn.parameters()).dtype
         self.router = ChunkingRouter(hidden_dim, config.num_experts, config.top_k, dtype=dtype).to(device)
-        self._ratio_loss_alpha = 0.05 # 0.03
+        self._ratio_loss_alpha = 0.3 # 0.03
         self._N = N
         self._ratio_loss = torch.tensor(0.0, device=device, dtype=dtype)
+        self._padding_mask = None
 
     @property
     def ratio_loss(self) -> torch.Tensor:
         return self._ratio_loss
 
-    def _compute_ratio_loss(self, p_t, tau: float = 0.1) -> torch.Tensor:
+    def _compute_ratio_loss(self, p_t, b_t) -> torch.Tensor:
         N = self._N
-        f = torch.sigmoid((p_t - self.router._boundary_threshold) / tau).mean(-1) # B
-        g = p_t.mean(-1) # B
-        loss = (N/(N-1)) * ((N-1) * f * g + (1-f) * (1-g))
-        return self._ratio_loss_alpha * loss.mean()
+        mask = self._padding_mask
+        if mask is not None:
+            mask = mask.bool()
+            true_ratio = b_t[mask].float().mean()
+            average_prob = p_t[mask].mean()
+        else:
+            true_ratio = b_t.float().mean()
+            average_prob = p_t.mean()
+        loss = (
+            (1 - true_ratio) * (1 - average_prob) +
+            true_ratio * average_prob * (N - 1)
+        ) * N / (N - 1)
+        return self._ratio_loss_alpha * loss
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         orig_shape = x.shape                          # (batch, seq_len, hidden)
         B, L, D = orig_shape
 
         top_k_probs, top_k_indices, pt, bt = self.router(x)
-        self._ratio_loss = self._compute_ratio_loss(pt)
+        self._ratio_loss = self._compute_ratio_loss(pt, bt)
 
         # batched expert dispatch: sort tokens by expert, run each expert on
         # a contiguous slice, then scatter results back in one pass.
@@ -163,6 +173,13 @@ class MoEMixin:
             moe_layers.append(moe)
 
         model._moe_layers = moe_layers
+        model._padding_mask = None
+
+        def _capture_mask(_module, _args, kwargs):
+            mask = kwargs.get('attention_mask', None)
+            for m in model._moe_layers:
+                m._padding_mask = mask
+        model.register_forward_pre_hook(_capture_mask, with_kwargs=True)
 
         def _get_moe_loss():
             return sum(m.ratio_loss for m in model._moe_layers)

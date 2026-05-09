@@ -1,5 +1,9 @@
 import argparse
 import random
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tqdm import tqdm
 
@@ -9,7 +13,8 @@ import wandb
 from accelerate import Accelerator
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from src.temporal_moe import MoEConfig, MoEMixin
+from src.temporal_moe import MoEConfig as TemporalMoEConfig, MoEMixin as TemporalMoEMixin
+from src.vanilla_moe import MoEConfig as VanillaMoEConfig, MoEMixin as VanillaMoEMixin
 
 
 # ====================================================================
@@ -17,33 +22,37 @@ from src.temporal_moe import MoEConfig, MoEMixin
 def count_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
 
-def get_fineweb_loader(tokenizer, seq_len: int, batch_size: int, num_samples: int):
+def get_nemotron_loader(tokenizer, seq_len: int, batch_size: int, num_samples: int,
+                        split: str = "code"):
     from datasets import load_dataset
     from torch.utils.data import DataLoader, Dataset
 
-    ds = load_dataset("HuggingFaceFW/fineweb", name="sample-10BT",
-                       split=f"train[:{num_samples}]", streaming=False)
+    ds = load_dataset("nvidia/Nemotron-Post-Training-Dataset-v2",
+                       split=f"{split}[:{num_samples}]", streaming=False)
+
+    def messages_to_text(messages):
+        return "\n".join(m["content"] for m in messages)
 
     class TokenizedDataset(Dataset):
-        def __init__(self, texts, tokenizer, seq_len):
+        def __init__(self, rows, tokenizer, seq_len):
             self.tokenizer = tokenizer
             self.seq_len = seq_len
-            self.texts = texts
+            self.rows = rows
 
         def __len__(self):
-            return len(self.texts)
+            return len(self.rows)
 
         def __getitem__(self, idx):
+            text = messages_to_text(self.rows[idx]["messages"])
             tokens = self.tokenizer(
-                self.texts[idx], truncation=True,
+                text, truncation=True,
                 max_length=self.seq_len + 1, padding="max_length",
                 return_tensors="pt"
             )
-            input_ids = tokens["input_ids"].squeeze(0)      # seq_len+1
-            attention_mask = tokens["attention_mask"].squeeze(0) # seq_len+1
-            return input_ids[:-1], input_ids[1:], attention_mask[:-1]
+            input_ids = tokens["input_ids"].squeeze(0) # seq_len+1
+            return input_ids[:-1], input_ids[1:]       # x, y
 
-    dataset = TokenizedDataset(ds["text"], tokenizer, seq_len)
+    dataset = TokenizedDataset(ds, tokenizer, seq_len)
     return DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
 
 @torch.no_grad()
@@ -149,12 +158,24 @@ def _unwrap(model):
 
 def main():
     parser = argparse.ArgumentParser(description="MoE Mixin PoC")
-    parser.add_argument("--model", default="Qwen/Qwen2-0.5B", help="HF model id")
+    parser.add_argument("--moe-type", choices=["vanilla", "temporal"], default="temporal",
+                        help="MoE variant: vanilla (standard top-k) or temporal (chunking)")
+    parser.add_argument("--model", default="Qwen/Qwen3-0.6B", help="HF model id")
     parser.add_argument("--num-experts", type=int, default=8)
     parser.add_argument("--top-k", type=int, default=2)
+    parser.add_argument("--ratio-loss-N", type=int, default=3,
+                        help="N parameter for temporal ratio loss (target segment length)")
+    parser.add_argument("--ratio-loss-alpha", type=float, default=0.3,
+                        help="Weight for temporal ratio loss")
     parser.add_argument("--seq-len", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--num-samples", type=int, default=10_000_000)
+    parser.add_argument("--dataset-split", default="code",
+                        choices=["code", "math", "stem", "chat",
+                                 "multilingual_ja", "multilingual_de",
+                                 "multilingual_it", "multilingual_es",
+                                 "multilingual_fr"],
+                        help="Nemotron SFT split to use")
+    parser.add_argument("--num-samples", type=int, default=100_000)
     parser.add_argument("--num-steps", type=int, default=100_000)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--log-every", type=int, default=10)
@@ -187,18 +208,28 @@ def main():
 
     # dense --> MoE
 
-    moe_config = MoEConfig(
-        num_experts=args.num_experts,
-        top_k=args.top_k,
-    )
-    MoEMixin.apply(model, moe_config)
+    if args.moe_type == "temporal":
+        moe_config = TemporalMoEConfig(
+            num_experts=args.num_experts,
+            top_k=args.top_k,
+            ratio_loss_N=args.ratio_loss_N,
+            ratio_loss_alpha=args.ratio_loss_alpha,
+        )
+        TemporalMoEMixin.apply(model, moe_config)
+    else:
+        moe_config = VanillaMoEConfig(
+            num_experts=args.num_experts,
+            top_k=args.top_k,
+        )
+        VanillaMoEMixin.apply(model, moe_config)
     moe_params = count_params(model)
     accelerator.print(f"MoE model parameters:   {moe_params:,}  "
                       f"({moe_params / dense_params:.1f}x dense)")
 
-    # load fineweb
-    accelerator.print(f"Loading FineWeb (sample-10BT, {args.num_samples} docs) ...")
-    loader = get_fineweb_loader(tokenizer, args.seq_len, args.batch_size, args.num_samples)
+    # load dataset
+    accelerator.print(f"Loading Nemotron SFT ({args.dataset_split}, {args.num_samples} docs) ...")
+    loader = get_nemotron_loader(tokenizer, args.seq_len, args.batch_size, args.num_samples,
+                                 split=args.dataset_split)
 
     # prepare for distributed training
 
@@ -212,16 +243,27 @@ def main():
 
     model.train()
     raw_model = _unwrap(model)
+    num_moe_layers = len(raw_model._moe_layers)
+    if args.moe_type == "temporal":
+        ratio_loss_alpha = raw_model._moe_layers[0]._ratio_loss_alpha
+    else:
+        ratio_loss_alpha = None
 
     step = 0
     for epoch in range(100): # enough epochs to hit num_steps
         pbar = tqdm(loader, desc=f"epoch {epoch}", leave=False,
                     disable=not accelerator.is_main_process)
-        for x, y, mask in pbar:
-            outputs = model(input_ids=x, labels=y, attention_mask=mask)
-            total_loss = outputs.loss
-            ratio_loss = raw_model.get_moe_loss().detach()
-            lm_loss = (total_loss - ratio_loss).detach()
+        for x, y in pbar:
+            outputs = model(input_ids=x, labels=y)
+            aux_loss = raw_model.get_moe_loss()
+            if args.moe_type == "temporal":
+                total_loss = outputs.loss
+                lm_loss = (total_loss - aux_loss).detach()
+            else:
+                lm_loss = outputs.loss
+                total_loss = lm_loss + aux_loss
+                lm_loss = lm_loss.detach()
+            aux_loss = aux_loss.detach()
 
             optimizer.zero_grad()
             accelerator.backward(total_loss)
@@ -230,17 +272,22 @@ def main():
 
             step += 1
             if accelerator.is_main_process:
-                pbar.set_postfix(lm=f"{lm_loss.item():.4f}", ratio=f"{ratio_loss.item():.4f}",
+                pbar.set_postfix(lm=f"{lm_loss.item():.4f}", aux=f"{aux_loss.item():.4f}",
                                  step=step)
                 if step % args.log_every == 0:
-                    wandb.log({
+                    metrics = {
                         "train/lm_loss": lm_loss.item(),
-                        "train/ratio_loss": ratio_loss.item(),
+                        "train/aux_loss": aux_loss.item(),
                         "train/total_loss": total_loss.item(),
                         "train/epoch": epoch,
-                    }, step=step)
+                    }
+                    if ratio_loss_alpha is not None:
+                        metrics["train/ratio_loss_per_layer_unscaled"] = (
+                            aux_loss.item() / (num_moe_layers * ratio_loss_alpha)
+                        )
+                    wandb.log(metrics, step=step)
 
-                if step % args.eval_every == 0:
+                if step % args.eval_every == 0 and args.moe_type == "temporal":
                     eval_boundaries(raw_model, tokenizer, x, step)
 
             if step >= args.num_steps:

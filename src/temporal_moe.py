@@ -10,6 +10,9 @@ import torch.nn.functional as F
 class MoEConfig:
     num_experts: int = 4
     top_k: int = 2
+    ratio_loss_N: int = 3
+    ratio_loss_alpha: float = 0.3
+
 
 class ChunkingRouter(nn.Module):
     """Boundary-aware router: segments tokens via cosine distance, then
@@ -74,7 +77,7 @@ class ChunkingMoELayer(nn.Module):
         device = next(original_ffn.parameters()).device
         dtype = next(original_ffn.parameters()).dtype
         self.router = ChunkingRouter(hidden_dim, config.num_experts, config.top_k, dtype=dtype).to(device)
-        self._ratio_loss_alpha = 0.3 # 0.03
+        self._ratio_loss_alpha = config.ratio_loss_alpha
         self._N = N
         self._ratio_loss = torch.tensor(0.0, device=device, dtype=dtype)
         self._padding_mask = None
@@ -162,10 +165,9 @@ class MoEMixin:
         decoder_layers = list(MoEMixin._find_decoder_layers(model))
 
         moe_layers = []
-        Ns = len(decoder_layers) * [3]
         for idx, layer in enumerate(decoder_layers):
             original_mlp = layer.mlp
-            moe = ChunkingMoELayer(original_mlp, config, hidden_dim, Ns[idx])
+            moe = ChunkingMoELayer(original_mlp, config, hidden_dim, config.ratio_loss_N)
             layer.mlp = moe
             moe_layers.append(moe)
 

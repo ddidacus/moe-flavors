@@ -1,6 +1,9 @@
 import argparse
+import json
+import math
 import random
 import sys
+from dataclasses import asdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -10,7 +13,7 @@ from tqdm import tqdm
 import torch
 import torch.nn as nn
 import wandb
-from accelerate import Accelerator
+from accelerate import Accelerator, DistributedDataParallelKwargs
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from src.temporal_moe import MoEConfig as TemporalMoEConfig, MoEMixin as TemporalMoEMixin
@@ -23,12 +26,17 @@ def count_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
 
 def get_nemotron_loader(tokenizer, seq_len: int, batch_size: int, num_samples: int,
-                        split: str = "code"):
-    from datasets import load_dataset
+                        splits: list[str] = ("code",)):
+    from datasets import load_dataset, concatenate_datasets
     from torch.utils.data import DataLoader, Dataset
 
-    ds = load_dataset("nvidia/Nemotron-Post-Training-Dataset-v2",
-                       split=f"{split}[:{num_samples}]", streaming=False)
+    per_split = num_samples // len(splits)
+    all_ds = []
+    for split in splits:
+        ds = load_dataset("nvidia/Nemotron-Post-Training-Dataset-v2",
+                          split=f"{split}[:{per_split}]", streaming=False)
+        all_ds.append(ds)
+    ds = concatenate_datasets(all_ds).shuffle(seed=42)
 
     def messages_to_text(messages):
         return "\n".join(m["content"] for m in messages)
@@ -56,28 +64,47 @@ def get_nemotron_loader(tokenizer, seq_len: int, batch_size: int, num_samples: i
     return DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
 
 @torch.no_grad()
-def eval_boundaries(model, tokenizer, x, step, layer_idx=0):
-    """Pick a random sequence from the batch, run layer-0 router, log boundaries to wandb."""
+def eval_boundaries(model, tokenizer, x, step, layer_idx=0, num_samples=16):
+    """Run a full forward pass on num_samples sequences, read cached router state for metrics."""
     model.eval()
-    seq_idx = random.randint(0, x.shape[0] - 1)
-    input_ids = x[seq_idx] # L
+    moe_layer = model._moe_layers[layer_idx]
+    router = moe_layer.router
+    B = x.shape[0]
+    n = min(num_samples, B)
+    sample_indices = random.sample(range(B), n)
+    viz_local = 0
 
-    # get hidden states at the target layer
-    embeds = model.model.embed_tokens(input_ids.unsqueeze(0)) # 1, L, D
-    router = model._moe_layers[layer_idx].router
-    _, top_k_indices, pt, bt = router(embeds)
+    sub_x = x[sample_indices]
+    model(input_ids=sub_x)
 
-    bt = bt[0].cpu().tolist()           # L bools
-    pt_vals = pt[0].cpu().tolist()      # L floats
-    expert_ids = top_k_indices[0].cpu().tolist() # L, top_k
+    pt_all = moe_layer._last_pt
+    bt_all = moe_layer._last_bt
+    top_k_indices_all = moe_layer._last_top_k_indices
 
-    tokens = [tokenizer.decode(tid) for tid in input_ids.cpu().tolist()]
+    all_G, all_F, all_entropy, all_num_segments = [], [], [], []
+    for i in range(n):
+        pt_list = pt_all[i].cpu().tolist()
+        bt_list = bt_all[i].cpu().tolist()
+        all_G.append(sum(pt_list) / len(pt_list))
+        all_F.append(sum(bt_list) / len(bt_list))
+        pt_clamped = [max(1e-7, min(1 - 1e-7, p)) for p in pt_list]
+        all_entropy.append(
+            sum(-p * math.log(p) - (1 - p) * math.log(1 - p) for p in pt_clamped) / len(pt_clamped)
+        )
+        all_num_segments.append(sum(1 for j, b in enumerate(bt_list) if b or j == 0))
 
-    # build annotated string: | marks boundaries
+    viz_pt = pt_all[viz_local].cpu().tolist()
+    viz_bt = bt_all[viz_local].cpu().tolist()
+    viz_expert_ids = top_k_indices_all[viz_local].cpu().tolist()
+    viz_input_ids = sub_x[viz_local]
+
+    # --- visualization for one sample ---
+    tokens = [tokenizer.decode(tid) for tid in viz_input_ids.cpu().tolist()]
+
     segments = []
     current_segment = []
     for i, tok in enumerate(tokens):
-        if bt[i] and current_segment:
+        if viz_bt[i] and current_segment:
             segments.append("".join(current_segment))
             current_segment = []
         current_segment.append(tok)
@@ -85,12 +112,10 @@ def eval_boundaries(model, tokenizer, x, step, layer_idx=0):
         segments.append("".join(current_segment))
     annotated = " | ".join(segments)
 
-    # wandb table with per-token detail
     table = wandb.Table(columns=["pos", "token", "boundary", "p_t", "experts"])
     for i, tok in enumerate(tokens):
-        table.add_data(i, tok, int(bt[i]), round(pt_vals[i], 4), str(expert_ids[i]))
+        table.add_data(i, tok, int(viz_bt[i]), round(viz_pt[i], 4), str(viz_expert_ids[i]))
 
-    # plot: expert assignments over token positions with boundary lines
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -103,15 +128,13 @@ def eval_boundaries(model, tokenizer, x, step, layer_idx=0):
     fig, (ax_exp, ax_pt) = plt.subplots(2, 1, figsize=(max(14, L * 0.08), 5),
                                          sharex=True, gridspec_kw={"height_ratios": [3, 1]})
 
-    # top panel: expert assignment per token, one row per top-k slot
     colors = plt.cm.Set1(np.linspace(0, 1, num_experts))
     for k_idx in range(top_k):
-        experts_k = [expert_ids[i][k_idx] for i in range(L)]
+        experts_k = [viz_expert_ids[i][k_idx] for i in range(L)]
         ax_exp.scatter(range(L), [k_idx] * L, c=[colors[e] for e in experts_k],
                        s=12, marker="s")
 
-    # boundary vertical lines
-    boundary_positions = [i for i in range(L) if bt[i]]
+    boundary_positions = [i for i in range(L) if viz_bt[i]]
     for bp in boundary_positions:
         ax_exp.axvline(x=bp, color="red", alpha=0.4, linewidth=0.8, linestyle="--")
         ax_pt.axvline(x=bp, color="red", alpha=0.4, linewidth=0.8, linestyle="--")
@@ -121,13 +144,11 @@ def eval_boundaries(model, tokenizer, x, step, layer_idx=0):
     ax_exp.set_ylabel("expert slot")
     ax_exp.set_title(f"Expert assignments over tokens (step {step}, layer {layer_idx})")
 
-    # legend for expert colors
     from matplotlib.patches import Patch
     legend_patches = [Patch(facecolor=colors[e], label=f"expert {e}") for e in range(num_experts)]
     ax_exp.legend(handles=legend_patches, loc="upper right", fontsize=7, ncol=num_experts)
 
-    # bottom panel: boundary probability p_t
-    ax_pt.plot(range(L), pt_vals, color="black", linewidth=0.8)
+    ax_pt.plot(range(L), viz_pt, color="black", linewidth=0.8)
     ax_pt.axhline(y=router._boundary_threshold, color="red", alpha=0.5, linewidth=0.8, linestyle=":")
     ax_pt.set_ylabel("p_t")
     ax_pt.set_xlabel("token position")
@@ -135,20 +156,43 @@ def eval_boundaries(model, tokenizer, x, step, layer_idx=0):
 
     plt.tight_layout()
 
+    # --- log averaged metrics ---
+    avg_G = sum(all_G) / len(all_G)
+    avg_F = sum(all_F) / len(all_F)
+    avg_entropy = sum(all_entropy) / len(all_entropy)
+    avg_segments = sum(all_num_segments) / len(all_num_segments)
+
     wandb.log({
         "eval/segmented_text": wandb.Html(f"<pre>{annotated}</pre>"),
         "eval/boundary_table": table,
         "eval/expert_boundaries": wandb.Image(fig),
-        "eval/num_segments": len(segments),
-        "eval/boundary_frac": sum(bt) / len(bt),
+        "eval/num_segments": avg_segments,
+        "eval/G_value": avg_G,
+        "eval/F_value": avg_F,
+        "eval/pt_entropy": avg_entropy,
     }, step=step)
     plt.close(fig)
 
-    print(f"\n--- eval (step {step}, layer {layer_idx}) ---")
+    print(f"\n--- eval (step {step}, layer {layer_idx}, n={n}) ---")
     print(annotated[:500])
-    print(f"segments: {len(segments)}, boundary_frac: {sum(bt)/len(bt):.3f}")
+    print(f"avg segments: {avg_segments:.1f}, G_value: {avg_G:.3f}, F_value: {avg_F:.3f}, pt_entropy: {avg_entropy:.3f}")
 
     model.train()
+
+def save_checkpoint(model, tokenizer, save_dir, step, args, moe_config):
+    save_path = Path(save_dir) / f"step_{step}"
+    save_path.mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(save_path)
+    tokenizer.save_pretrained(save_path)
+    meta = {
+        "base_model": args.model,
+        "moe_type": args.moe_type,
+        "moe_config": asdict(moe_config),
+        "step": step,
+    }
+    (save_path / "moe_meta.json").write_text(json.dumps(meta, indent=2))
+    print(f"[checkpoint] Saved to {save_path}")
+
 
 def _unwrap(model):
     """Get the underlying model from DDP/accelerate wrappers."""
@@ -167,14 +211,20 @@ def main():
                         help="N parameter for temporal ratio loss (target segment length)")
     parser.add_argument("--ratio-loss-alpha", type=float, default=0.3,
                         help="Weight for temporal ratio loss")
+    parser.add_argument("--entropy-threshold", type=float, default=0.1,
+                        help="Floor for p_t entropy penalty (0 disables)")
+    parser.add_argument("--entropy-alpha", type=float, default=1.0,
+                        help="Weight for entropy penalty")
+    parser.add_argument("--entropy-warmup-steps", type=int, default=0,
+                        help="Steps to keep entropy alpha at zero before enabling")
     parser.add_argument("--seq-len", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--dataset-split", default="code",
+    parser.add_argument("--dataset-splits", nargs="+", default=["code"],
                         choices=["code", "math", "stem", "chat",
                                  "multilingual_ja", "multilingual_de",
                                  "multilingual_it", "multilingual_es",
                                  "multilingual_fr"],
-                        help="Nemotron SFT split to use")
+                        help="Nemotron SFT splits to use (multiple allowed)")
     parser.add_argument("--num-samples", type=int, default=100_000)
     parser.add_argument("--num-steps", type=int, default=100_000)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -182,11 +232,16 @@ def main():
     parser.add_argument("--eval-every", type=int, default=50)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--wandb-project", default="moe-chunking-poc")
+    parser.add_argument("--save-dir", type=str, default=None,
+                        help="Directory to save model checkpoints (default: no saving)")
+    parser.add_argument("--save-every", type=int, default=0,
+                        help="Save checkpoint every N steps (0 = only at end)")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
 
-    accelerator = Accelerator(log_with="wandb")
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator = Accelerator(log_with="wandb", kwargs_handlers=[ddp_kwargs])
 
     # logging with wandb
 
@@ -214,6 +269,8 @@ def main():
             top_k=args.top_k,
             ratio_loss_N=args.ratio_loss_N,
             ratio_loss_alpha=args.ratio_loss_alpha,
+            entropy_threshold=args.entropy_threshold,
+            entropy_alpha=args.entropy_alpha,
         )
         TemporalMoEMixin.apply(model, moe_config)
     else:
@@ -227,9 +284,9 @@ def main():
                       f"({moe_params / dense_params:.1f}x dense)")
 
     # load dataset
-    accelerator.print(f"Loading Nemotron SFT ({args.dataset_split}, {args.num_samples} docs) ...")
+    accelerator.print(f"Loading Nemotron SFT ({args.dataset_splits}, {args.num_samples} docs) ...")
     loader = get_nemotron_loader(tokenizer, args.seq_len, args.batch_size, args.num_samples,
-                                 split=args.dataset_split)
+                                 splits=args.dataset_splits)
 
     # prepare for distributed training
 
@@ -249,11 +306,18 @@ def main():
     else:
         ratio_loss_alpha = None
 
+    entropy_alpha_target = args.entropy_alpha if args.moe_type == "temporal" else 0.0
+
     step = 0
     for epoch in range(100): # enough epochs to hit num_steps
         pbar = tqdm(loader, desc=f"epoch {epoch}", leave=False,
                     disable=not accelerator.is_main_process)
         for x, y in pbar:
+            if args.moe_type == "temporal":
+                ea = entropy_alpha_target if step >= args.entropy_warmup_steps else 0.0
+                for m in raw_model._moe_layers:
+                    m._entropy_alpha = ea
+
             outputs = model(input_ids=x, labels=y)
             aux_loss = raw_model.get_moe_loss()
             if args.moe_type == "temporal":
@@ -285,10 +349,19 @@ def main():
                         metrics["train/ratio_loss_per_layer_unscaled"] = (
                             aux_loss.item() / (num_moe_layers * ratio_loss_alpha)
                         )
+                        avg_G = sum(m._last_G.item() for m in raw_model._moe_layers) / num_moe_layers
+                        avg_F = sum(m._last_F.item() for m in raw_model._moe_layers) / num_moe_layers
+                        avg_pt_entropy = sum(m._last_pt_entropy.item() for m in raw_model._moe_layers) / num_moe_layers
+                        metrics["train/G_value"] = avg_G
+                        metrics["train/F_value"] = avg_F
+                        metrics["train/pt_entropy"] = avg_pt_entropy
                     wandb.log(metrics, step=step)
 
                 if step % args.eval_every == 0 and args.moe_type == "temporal":
                     eval_boundaries(raw_model, tokenizer, x, step)
+
+                if args.save_dir and args.save_every > 0 and step % args.save_every == 0:
+                    save_checkpoint(raw_model, tokenizer, args.save_dir, step, args, moe_config)
 
             if step >= args.num_steps:
                 break
@@ -296,6 +369,9 @@ def main():
             break
 
     accelerator.print(f"\nTraining done ({step} steps).")
+
+    if accelerator.is_main_process and args.save_dir:
+        save_checkpoint(raw_model, tokenizer, args.save_dir, step, args, moe_config)
 
     # final inspection
     if accelerator.is_main_process:

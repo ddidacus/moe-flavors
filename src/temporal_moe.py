@@ -12,6 +12,8 @@ class MoEConfig:
     top_k: int = 2
     ratio_loss_N: int = 3
     ratio_loss_alpha: float = 0.3
+    entropy_threshold: float = 0.1
+    entropy_alpha: float = 1.0
 
 
 class ChunkingRouter(nn.Module):
@@ -78,6 +80,8 @@ class ChunkingMoELayer(nn.Module):
         dtype = next(original_ffn.parameters()).dtype
         self.router = ChunkingRouter(hidden_dim, config.num_experts, config.top_k, dtype=dtype).to(device)
         self._ratio_loss_alpha = config.ratio_loss_alpha
+        self._entropy_threshold = config.entropy_threshold
+        self._entropy_alpha = config.entropy_alpha
         self._N = N
         self._ratio_loss = torch.tensor(0.0, device=device, dtype=dtype)
         self._padding_mask = None
@@ -89,25 +93,40 @@ class ChunkingMoELayer(nn.Module):
     def _compute_ratio_loss(self, p_t, b_t) -> torch.Tensor:
         N = self._N
         mask = self._padding_mask
+        F_val = b_t.float().detach()
+        G = p_t
         if mask is not None:
             mask = mask.bool()
-            true_ratio = b_t[mask].float().mean()
-            average_prob = p_t[mask].mean()
+            F_val = F_val[mask].mean()
+            G = G[mask].mean()
+            pt_masked = p_t[mask]
         else:
-            true_ratio = b_t.float().mean()
-            average_prob = p_t.mean()
-        loss = (
-            (1 - true_ratio) * (1 - average_prob) +
-            true_ratio * average_prob * (N - 1)
+            F_val = F_val.mean()
+            G = G.mean()
+            pt_masked = p_t
+        ratio_loss = (
+            (1 - F_val) * (1 - G) +
+            F_val * G * (N - 1)
         ) * N / (N - 1)
-        return self._ratio_loss_alpha * loss
+        pt_f32 = pt_masked.float().clamp(1e-6, 1 - 1e-6)
+        entropy = F.binary_cross_entropy(pt_f32, pt_f32)
+        entropy_penalty = F.relu(entropy - self._entropy_threshold)
+        return self._ratio_loss_alpha * ratio_loss + self._entropy_alpha * entropy_penalty
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         orig_shape = x.shape                          # (batch, seq_len, hidden)
         B, L, D = orig_shape
 
         top_k_probs, top_k_indices, pt, bt = self.router(x)
-        self._ratio_loss = self._compute_ratio_loss(pt, bt)
+        if self.training:
+            self._ratio_loss = self._compute_ratio_loss(pt, bt)
+        self._last_G = pt.detach().mean()
+        self._last_F = bt.float().detach().mean()
+        pt_f32 = pt.detach().float().clamp(1e-6, 1 - 1e-6)
+        self._last_pt_entropy = F.binary_cross_entropy(pt_f32, pt_f32)
+        self._last_pt = pt.detach()
+        self._last_bt = bt.detach()
+        self._last_top_k_indices = top_k_indices.detach()
 
         # batched expert dispatch: sort tokens by expert, run each expert on
         # a contiguous slice, then scatter results back in one pass.

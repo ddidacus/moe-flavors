@@ -18,7 +18,7 @@ accelerate launch --multi_gpu --num_processes=4 scripts/moe_mixin_poc.py \
     --top-k 1 \
     --seq-len 256 \
     --batch-size 32 \
-    --dataset-split code \
+    --dataset-splits code math \
     --num-samples 1000000 \
     --num-steps 100000 \
     --lr 1e-4 \

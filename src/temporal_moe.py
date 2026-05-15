@@ -17,29 +17,28 @@ class MoEConfig:
 
 
 class ChunkingRouter(nn.Module):
-    """Boundary-aware router: segments tokens via cosine distance, then
-    forward-fills top-k routing decisions across each segment."""
+    """Boundary-aware router: learns a termination function (option-critic style)
+    over delta states to segment tokens, then forward-fills top-k routing
+    decisions across each segment."""
 
     def __init__(self, hidden_dim: int, num_experts: int, top_k: int, dtype=None):
         super().__init__()
         self.top_k = top_k
         self.num_experts = num_experts
         self.gate = nn.Linear(hidden_dim, num_experts, bias=False, dtype=dtype)
-        self.q_proj = nn.Linear(hidden_dim, hidden_dim, bias=False, dtype=dtype)
-        self.k_proj = nn.Linear(hidden_dim, hidden_dim, bias=False, dtype=dtype)
-        nn.init.eye_(self.q_proj.weight)
-        nn.init.eye_(self.k_proj.weight)
+        self.term_proj1 = nn.Linear(hidden_dim, hidden_dim, dtype=dtype)
+        self.term_proj2 = nn.Linear(hidden_dim, 1, dtype=dtype)
         self._boundary_threshold = 0.5
 
     def forward(self, x: torch.Tensor):
         # x: (B, L, D)
         B, L, D = x.shape
 
-        # boundary segmentation via cosine distance between adjacent tokens
-        q = F.normalize(self.q_proj(x[:, :-1, :]), dim=-1) # B, L-1, D
-        k = F.normalize(self.k_proj(x[:, 1:, :]), dim=-1)  # B, L-1, D
-        cos_sim = (q * k).sum(-1)                           # B, L-1
-        pt_minus_1 = torch.clamp((1 - cos_sim) / 2, min=0.0, max=1.0) # B, L-1
+        # option-critic style termination over delta states
+        delta = x[:, 1:, :] - x[:, :-1, :]                 # B, L-1, D
+        pt_minus_1 = torch.sigmoid(
+            self.term_proj2(F.relu(self.term_proj1(delta)))
+        ).squeeze(-1)                                        # B, L-1
 
         pt = torch.cat([torch.ones((B, 1), device=x.device, dtype=x.dtype), pt_minus_1], dim=1) # B, L
         bt = (pt >= self._boundary_threshold) # B, L

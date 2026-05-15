@@ -84,6 +84,9 @@ class MoELayer(nn.Module):
 
         top_k_probs, top_k_indices, aux_loss = self.router(flat)
         self._aux_loss = aux_loss
+        self._last_top_k_indices = top_k_indices.detach().reshape(
+            orig_shape[0], orig_shape[1], -1
+        )
 
         out = torch.zeros_like(flat)
 

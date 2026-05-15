@@ -2,19 +2,16 @@
 #SBATCH --job-name=e2e_vanilla
 #SBATCH --output=e2e_vanilla_%j.out
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=64G
-#SBATCH --gres=gpu:80gb:4
-#SBATCH --partition=long
-#SBATCH --time=6:00:00
+#SBATCH --mem=32G
+#SBATCH --gres=gpu:l40s:4
+#SBATCH --partition=short-unkillable
+#SBATCH --time=3:00:00
 
-set -euo pipefail
-
-cd /network/scratch/d/diego.calanzone/moe-playground
 source .venv/bin/activate
 export HF_HOME=/home/mila/d/diego.calanzone/scratch/cache
 export UV_CACHE_DIR=/home/mila/d/diego.calanzone/scratch/cache
 export PYTHONDONTWRITEBYTECODE=1
-export PYTHONPATH="/network/scratch/d/diego.calanzone/moe-playground/stubs:${PYTHONPATH:-}"
+# export PYTHONPATH="/network/scratch/d/diego.calanzone/moe-playground/stubs:${PYTHONPATH:-}"
 
 SAVE_DIR="checkpoints/vanilla_${SLURM_JOB_ID:-local}"
 
@@ -26,7 +23,7 @@ accelerate launch --multi_gpu --num_processes=4 scripts/moe_mixin_poc.py \
     --num-experts 4 \
     --top-k 2 \
     --seq-len 256 \
-    --batch-size 32 \
+    --batch-size 16 \
     --dataset-splits code math \
     --num-samples 1000000 \
     --num-steps 10000 \
@@ -35,6 +32,7 @@ accelerate launch --multi_gpu --num_processes=4 scripts/moe_mixin_poc.py \
     --eval-every 50 \
     --seed 42 \
     --wandb-project moe-chunking-poc \
+    --wandb-run-name vanilla-moe \
     --save-dir "$SAVE_DIR" \
     --save-every 10000
 
@@ -47,10 +45,10 @@ if [ -z "$FINAL_CKPT" ]; then
     exit 1
 fi
 
-echo "Evaluating checkpoint: $FINAL_CKPT"
+# echo "Evaluating checkpoint: $FINAL_CKPT"
 
-python scripts/eval_harness.py \
-    --checkpoint-dir "$FINAL_CKPT" \
-    --tasks mmlu gsm8k \
-    --batch-size auto \
-    --output-dir "$FINAL_CKPT/eval_results"
+# python scripts/eval_harness.py \
+#     --checkpoint-dir "$FINAL_CKPT" \
+#     --tasks mmlu gsm8k \
+#     --batch-size auto \
+#     --output-dir "$FINAL_CKPT/eval_results"

@@ -4,8 +4,8 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=32G
 #SBATCH --gres=gpu:l40s:4
-#SBATCH --partition=short-unkillable
-#SBATCH --time=3:00:00
+#SBATCH --partition=long
+#SBATCH --time=6:00:00
 
 source .venv/bin/activate
 export HF_HOME=/home/mila/d/diego.calanzone/scratch/cache
@@ -21,15 +21,15 @@ accelerate launch --multi_gpu --num_processes=4 scripts/moe_mixin_poc.py \
     --moe-type vanilla \
     --model Qwen/Qwen3-0.6B \
     --num-experts 4 \
-    --top-k 2 \
+    --top-k 1 \
     --seq-len 256 \
     --batch-size 16 \
     --dataset-splits code math \
     --num-samples 1000000 \
-    --num-steps 10000 \
-    --lr 1e-4 \
+    --num-steps 30000 \
+    --lr 8e-4 \
     --log-every 10 \
-    --eval-every 50 \
+    --eval-every 50000 \
     --seed 42 \
     --wandb-project moe-chunking-poc \
     --wandb-run-name vanilla-moe \
@@ -45,10 +45,10 @@ if [ -z "$FINAL_CKPT" ]; then
     exit 1
 fi
 
-# echo "Evaluating checkpoint: $FINAL_CKPT"
+echo "Evaluating checkpoint: $FINAL_CKPT"
 
-# python scripts/eval_harness.py \
-#     --checkpoint-dir "$FINAL_CKPT" \
-#     --tasks mmlu gsm8k \
-#     --batch-size auto \
-#     --output-dir "$FINAL_CKPT/eval_results"
+python scripts/eval_harness.py \
+    --checkpoint-dir "$FINAL_CKPT" \
+    --batch-size auto \
+    --output-dir "$FINAL_CKPT/eval_results" \
+    --wandb-project moe-chunking-poc

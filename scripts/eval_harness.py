@@ -1,9 +1,11 @@
 """
 Evaluate a local MoE checkpoint using EleutherAI's lm-evaluation-harness.
 
+Uses the same default tasks and evaluation setup as moe_mixin_poc.py.
+
 Usage:
     python scripts/eval_harness.py --checkpoint-dir checkpoints/step_10000
-    python scripts/eval_harness.py --checkpoint-dir checkpoints/step_10000 --tasks mmlu math
+    python scripts/eval_harness.py --checkpoint-dir checkpoints/step_10000 --tasks mmlu gsm8k --limit 256
 """
 
 import argparse
@@ -22,6 +24,13 @@ from src.vanilla_moe import MoEConfig as VanillaMoEConfig, MoEMixin as VanillaMo
 import wandb
 import lm_eval
 from lm_eval.models.huggingface import HFLM
+
+HARNESS_TASKS_DEFAULT = [
+    "mmlu_abstract_algebra",
+    "mmlu_college_mathematics",
+    "mmlu_high_school_mathematics",
+    "mmlu_elementary_mathematics",
+]
 
 
 def load_moe_model(checkpoint_dir: str, device: str = "cuda"):
@@ -71,8 +80,10 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate MoE checkpoint with lm-evaluation-harness")
     parser.add_argument("--checkpoint-dir", required=True,
                         help="Path to a saved checkpoint directory (contains moe_meta.json)")
-    parser.add_argument("--tasks", nargs="+", default=["mmlu", "gsm8k"],
-                        help="lm-eval task names (default: mmlu hellaswag)")
+    parser.add_argument("--tasks", nargs="+", default=HARNESS_TASKS_DEFAULT,
+                        help="lm-eval task names")
+    parser.add_argument("--limit", type=int, default=None,
+                        help="Max samples per task (default: None = full eval)")
     parser.add_argument("--num-fewshot", type=int, default=None,
                         help="Number of few-shot examples (uses task default if not set)")
     parser.add_argument("--batch-size", type=str, default="auto",
@@ -94,6 +105,7 @@ def main():
         config={
             "checkpoint_dir": args.checkpoint_dir,
             "tasks": args.tasks,
+            "limit": args.limit,
             "num_fewshot": args.num_fewshot,
             **meta,
         },
@@ -109,6 +121,7 @@ def main():
         model=lm,
         tasks=args.tasks,
         num_fewshot=args.num_fewshot,
+        limit=args.limit,
         batch_size=args.batch_size,
     )
 
@@ -127,7 +140,7 @@ def main():
     for task_name, task_results in results["results"].items():
         for metric, value in task_results.items():
             if isinstance(value, (int, float)):
-                wandb_metrics[f"eval/{task_name}/{metric}"] = value
+                wandb_metrics[f"eval/harness_{task_name}/{metric}"] = value
     wandb.log(wandb_metrics)
 
     if args.output_dir:

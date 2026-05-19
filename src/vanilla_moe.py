@@ -1,5 +1,4 @@
 import argparse
-import copy
 import random
 from dataclasses import dataclass
 
@@ -52,22 +51,33 @@ class Router(nn.Module):
         return (tokens_per_expert * router_prob_per_expert).sum() * self.num_experts
 
 
+class ExpertMLP(nn.Module):
+    def __init__(self, hidden_dim: int, intermediate_dim: int, dtype=None, device=None):
+        super().__init__()
+        self.up_proj = nn.Linear(hidden_dim, intermediate_dim, bias=False, dtype=dtype, device=device)
+        self.down_proj = nn.Linear(intermediate_dim, hidden_dim, bias=False, dtype=dtype, device=device)
+        self.act = nn.SiLU()
+
+    def forward(self, x):
+        return self.down_proj(self.act(self.up_proj(x)))
+
+
 class MoELayer(nn.Module):
     """
-    Replaces a single dense FFN with N expert copies + a router.
-
-    Each expert is a deep copy of the original FFN so the architecture
-    matches exactly. The router selects top-k experts per token.
+    Replaces a single dense FFN with N small expert MLPs + a router.
+    Each expert has 1/4 the intermediate size of the original FFN.
     """
 
-    def __init__(self, original_ffn: nn.Module, config: MoEConfig, hidden_dim: int):
+    def __init__(self, original_ffn: nn.Module, config: MoEConfig, hidden_dim: int, intermediate_size: int):
         super().__init__()
         self.config = config
         device = next(original_ffn.parameters()).device
         dtype = next(original_ffn.parameters()).dtype
         self.router = Router(hidden_dim, config.num_experts, config.top_k, dtype=dtype)
+        expert_intermediate = intermediate_size // 4
         self.experts = nn.ModuleList(
-            [copy.deepcopy(original_ffn) for _ in range(config.num_experts)]
+            [ExpertMLP(hidden_dim, expert_intermediate, dtype=dtype, device=device)
+             for _ in range(config.num_experts)]
         )
         self._aux_loss = torch.tensor(0.0, device=device, dtype=dtype)
 
@@ -122,6 +132,7 @@ class MoEMixin:
     @staticmethod
     def apply(model: nn.Module, config: MoEConfig) -> nn.Module:
         hidden_dim = model.config.hidden_size
+        intermediate_size = model.config.intermediate_size
         # gets decoder layers modules
         decoder_layers = list(MoEMixin._find_decoder_layers(model))
 
@@ -129,7 +140,7 @@ class MoEMixin:
         moe_layers = []
         for layer in decoder_layers:
             original_mlp = layer.mlp
-            moe = MoELayer(original_mlp, config, hidden_dim)
+            moe = MoELayer(original_mlp, config, hidden_dim, intermediate_size)
             layer.mlp = moe
             moe_layers.append(moe)
 

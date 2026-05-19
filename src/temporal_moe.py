@@ -1,5 +1,4 @@
-import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 import torch.nn as nn
@@ -10,10 +9,14 @@ import torch.nn.functional as F
 class MoEConfig:
     num_experts: int = 4
     top_k: int = 2
-    ratio_loss_N: int = 3
+    ratio_loss_N: list[int] = field(default_factory=lambda: [3])
     ratio_loss_alpha: float = 0.3
     entropy_threshold: float = 0.1
     entropy_alpha: float = 1.0
+
+    def __post_init__(self):
+        if isinstance(self.ratio_loss_N, int):
+            self.ratio_loss_N = [self.ratio_loss_N]
 
 
 class ChunkingRouter(nn.Module):
@@ -65,18 +68,31 @@ class ChunkingRouter(nn.Module):
         return top_k_probs, top_k_indices, pt, bt
 
 
+class ExpertMLP(nn.Module):
+    def __init__(self, hidden_dim: int, intermediate_dim: int, dtype=None, device=None):
+        super().__init__()
+        self.up_proj = nn.Linear(hidden_dim, intermediate_dim, bias=False, dtype=dtype, device=device)
+        self.down_proj = nn.Linear(intermediate_dim, hidden_dim, bias=False, dtype=dtype, device=device)
+        self.act = nn.SiLU()
+
+    def forward(self, x):
+        return self.down_proj(self.act(self.up_proj(x)))
+
+
 class ChunkingMoELayer(nn.Module):
     """
         Implements MoE with dynamic chunking from H-Nets, and the ratio loss
     """
-    def __init__(self, original_ffn: nn.Module, config: MoEConfig, hidden_dim: int, N:int):
+    def __init__(self, original_ffn: nn.Module, config: MoEConfig, hidden_dim: int, intermediate_size: int, N:int):
         super().__init__()
         self.config = config
-        self.experts = nn.ModuleList(
-            [copy.deepcopy(original_ffn) for _ in range(config.num_experts)]
-        )
         device = next(original_ffn.parameters()).device
         dtype = next(original_ffn.parameters()).dtype
+        expert_intermediate = intermediate_size // 4
+        self.experts = nn.ModuleList(
+            [ExpertMLP(hidden_dim, expert_intermediate, dtype=dtype, device=device)
+             for _ in range(config.num_experts)]
+        )
         self.router = ChunkingRouter(hidden_dim, config.num_experts, config.top_k, dtype=dtype).to(device)
         self._ratio_loss_alpha = config.ratio_loss_alpha
         self._entropy_threshold = config.entropy_threshold
@@ -179,13 +195,22 @@ class MoEMixin:
     @staticmethod
     def apply(model: nn.Module, config: MoEConfig) -> nn.Module:
         hidden_dim = model.config.hidden_size
+        intermediate_size = model.config.intermediate_size
         # gets decoder layers modules
         decoder_layers = list(MoEMixin._find_decoder_layers(model))
+
+        num_layers = len(decoder_layers)
+        N_list = config.ratio_loss_N
+        if len(N_list) == 1:
+            N_list = N_list * num_layers
+        assert len(N_list) == num_layers, (
+            f"ratio_loss_N has {len(N_list)} values but model has {num_layers} layers"
+        )
 
         moe_layers = []
         for idx, layer in enumerate(decoder_layers):
             original_mlp = layer.mlp
-            moe = ChunkingMoELayer(original_mlp, config, hidden_dim, config.ratio_loss_N)
+            moe = ChunkingMoELayer(original_mlp, config, hidden_dim, intermediate_size, N_list[idx])
             layer.mlp = moe
             moe_layers.append(moe)
 

@@ -248,7 +248,6 @@ def save_checkpoint(model, tokenizer, save_dir, step, args, moe_config):
 
 @torch.no_grad()
 def eval_perplexity(model, test_loader, step):
-    model.eval()
     x, y = next(iter(test_loader))
     device = next(model.parameters()).device
     x, y = x.to(device), y.to(device)
@@ -257,6 +256,40 @@ def eval_perplexity(model, test_loader, step):
     ppl = torch.exp(loss).item()
     wandb.log({"eval/perplexity": ppl, "eval/lm_loss": loss.item()}, step=step)
     print(f"eval perplexity (step {step}): {ppl:.2f}")
+
+
+HARNESS_TASKS_DEFAULT = [
+    "mmlu_abstract_algebra",
+    "mmlu_college_mathematics",
+    "mmlu_high_school_mathematics",
+    "mmlu_elementary_mathematics",
+]
+
+
+@torch.no_grad()
+def eval_harness(model, tokenizer, step, tasks=HARNESS_TASKS_DEFAULT, limit=256):
+    import lm_eval
+    from lm_eval.models.huggingface import HFLM
+
+    lm = HFLM(pretrained=model, tokenizer=tokenizer, batch_size="auto")
+    results = lm_eval.simple_evaluate(model=lm, tasks=list(tasks), limit=limit)
+
+    for task_name, task_results in results["results"].items():
+        summary = ", ".join(
+            f"{k}={v:.4f}" for k, v in sorted(task_results.items()) if isinstance(v, float)
+        )
+        print(f"  harness/{task_name}: {summary}")
+        for metric, value in task_results.items():
+            if isinstance(value, (int, float)):
+                wandb.log({f"eval/harness_{task_name}/{metric}": value}, step=step)
+
+
+@torch.no_grad()
+def evaluate(model, tokenizer, test_loader, step,
+             harness_tasks=HARNESS_TASKS_DEFAULT, harness_limit=256):
+    model.eval()
+    eval_perplexity(model, test_loader, step)
+    eval_harness(model, tokenizer, step, tasks=harness_tasks, limit=harness_limit)
     model.train()
 
 
@@ -285,8 +318,8 @@ def main():
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B", help="HF model id")
     parser.add_argument("--num-experts", type=int, default=8)
     parser.add_argument("--top-k", type=int, default=2)
-    parser.add_argument("--ratio-loss-N", type=int, default=3,
-                        help="N parameter for temporal ratio loss (target segment length)")
+    parser.add_argument("--ratio-loss-N", type=int, nargs="+", default=[3],
+                        help="N parameter(s) for temporal ratio loss — one per layer, or a single value broadcast to all")
     parser.add_argument("--ratio-loss-alpha", type=float, default=0.3,
                         help="Weight for temporal ratio loss")
     parser.add_argument("--entropy-threshold", type=float, default=0.1,
@@ -307,7 +340,7 @@ def main():
     parser.add_argument("--num-steps", type=int, default=100_000)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--log-every", type=int, default=10)
-    parser.add_argument("--eval-every", type=int, default=50)
+    parser.add_argument("--eval-every", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--wandb-project", default="moe-chunking-poc")
     parser.add_argument("--wandb-run-name", type=str, default=None,
@@ -316,6 +349,10 @@ def main():
                         help="Directory to save model checkpoints (default: no saving)")
     parser.add_argument("--save-every", type=int, default=0,
                         help="Save checkpoint every N steps (0 = only at end)")
+    parser.add_argument("--harness-tasks", nargs="+", default=HARNESS_TASKS_DEFAULT,
+                        help="lm-eval-harness tasks to run during eval")
+    parser.add_argument("--harness-limit", type=int, default=8,
+                        help="Number of samples per harness task")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -447,7 +484,9 @@ def main():
                     wandb.log(metrics, step=step)
 
                 if step % args.eval_every == 0:
-                    eval_perplexity(raw_model, test_loader, step)
+                    evaluate(raw_model, tokenizer, test_loader, step,
+                             harness_tasks=args.harness_tasks,
+                             harness_limit=args.harness_limit)
                     raw_model.eval()
                     n_eval = min(16, x.shape[0])
                     sub_x = x[random.sample(range(x.shape[0]), n_eval)]

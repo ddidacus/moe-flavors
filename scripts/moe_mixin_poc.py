@@ -26,26 +26,11 @@ from src.vanilla_moe import MoEConfig as VanillaMoEConfig, MoEMixin as VanillaMo
 def count_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
 
-def get_nemotron_loaders(tokenizer, seq_len: int, batch_size: int, num_samples: int,
-                         splits: list[str] = ("code",), test_frac: float = 0.1):
-    from datasets import load_dataset, concatenate_datasets
-    from torch.utils.data import DataLoader, Dataset
+def get_nemotron_loaders(tokenizer, seq_len: int, batch_size: int, data_dir: str):
+    from datasets import load_from_disk
+    from torch.utils.data import DataLoader, Dataset, Subset
 
-    per_split = num_samples // len(splits)
-    all_ds = []
-    for split in splits:
-        ds = load_dataset("nvidia/Nemotron-Post-Training-Dataset-v2",
-                          split=f"{split}[:{per_split}]", streaming=False)
-        all_ds.append(ds)
-    ds = concatenate_datasets(all_ds).shuffle(seed=42)
-
-    n_test = int(len(ds) * test_frac)
-    n_train = len(ds) - n_test
-    train_ds = ds.select(range(n_train))
-    test_ds = ds.select(range(n_train, len(ds)))
-
-    def messages_to_text(messages):
-        return "\n".join(m["content"] for m in messages)
+    ds = load_from_disk(data_dir)
 
     class TokenizedDataset(Dataset):
         def __init__(self, rows, tokenizer, seq_len):
@@ -57,19 +42,19 @@ def get_nemotron_loaders(tokenizer, seq_len: int, batch_size: int, num_samples: 
             return len(self.rows)
 
         def __getitem__(self, idx):
-            text = messages_to_text(self.rows[idx]["messages"])
+            text = "\n".join(m["content"] for m in self.rows[idx]["messages"])
             tokens = self.tokenizer(
                 text, truncation=True,
                 max_length=self.seq_len + 1, padding="max_length",
                 return_tensors="pt"
             )
-            input_ids = tokens["input_ids"].squeeze(0) # seq_len+1
-            return input_ids[:-1], input_ids[1:]       # x, y
+            input_ids = tokens["input_ids"].squeeze(0)
+            return input_ids[:-1], input_ids[1:]
 
-    train_dataset = TokenizedDataset(train_ds, tokenizer, seq_len)
-    test_dataset = TokenizedDataset(test_ds, tokenizer, seq_len)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
-    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=True, drop_last=True)
+    train_loader = DataLoader(TokenizedDataset(ds["train"], tokenizer, seq_len),
+                              batch_size=batch_size, shuffle=True, drop_last=True)
+    test_loader = DataLoader(TokenizedDataset(ds["test"], tokenizer, seq_len),
+                             batch_size=32, shuffle=True, drop_last=True)
     return train_loader, test_loader
 
 def _pick_eval_layers(num_layers):
@@ -231,65 +216,60 @@ def eval_expert_assignments(model, tokenizer, sub_x, step, layer_idx=0):
     plt.close(fig)
 
 
-def save_checkpoint(model, tokenizer, save_dir, step, args, moe_config):
+def save_checkpoint(model, tokenizer, save_dir, step, epoch, args, moe_config,
+                    accelerator):
     save_path = Path(save_dir) / f"step_{step}"
     save_path.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(save_path)
-    tokenizer.save_pretrained(save_path)
-    meta = {
-        "base_model": args.model,
-        "moe_type": args.moe_type,
-        "moe_config": asdict(moe_config),
-        "step": step,
-    }
-    (save_path / "moe_meta.json").write_text(json.dumps(meta, indent=2))
-    print(f"[checkpoint] Saved to {save_path}")
+    accelerator.wait_for_everyone()
+    unwrapped = accelerator.unwrap_model(model)
+    if accelerator.is_main_process:
+        unwrapped.save_pretrained(save_path)
+        tokenizer.save_pretrained(save_path)
+        meta = {
+            "base_model": args.model,
+            "moe_type": args.moe_type,
+            "moe_config": asdict(moe_config),
+            "step": step,
+            "epoch": epoch,
+        }
+        (save_path / "moe_meta.json").write_text(json.dumps(meta, indent=2))
+    accelerator.save_state(str(save_path / "accelerator_state"))
+    accelerator.print(f"[checkpoint] Saved to {save_path}")
+
+
+def find_latest_checkpoint(save_dir):
+    save_dir = Path(save_dir)
+    if not save_dir.exists():
+        return None
+    ckpts = sorted(save_dir.glob("step_*"), key=lambda p: int(p.name.split("_")[1]))
+    for ckpt in reversed(ckpts):
+        if (ckpt / "accelerator_state").exists():
+            return ckpt
+    return None
 
 
 @torch.no_grad()
-def eval_perplexity(model, test_loader, step):
-    x, y = next(iter(test_loader))
+def eval_perplexity(model, test_loader, step, n_batches=4):
     device = next(model.parameters()).device
-    x, y = x.to(device), y.to(device)
-    logits = model(input_ids=x).logits
-    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
-    ppl = torch.exp(loss).item()
-    wandb.log({"eval/perplexity": ppl, "eval/lm_loss": loss.item()}, step=step)
+    batches = list(test_loader)
+    subset = random.sample(batches, min(n_batches, len(batches)))
+    total_loss, total_tokens = 0.0, 0
+    for x, y in subset:
+        x, y = x.to(device), y.to(device)
+        logits = model(input_ids=x).logits
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+        total_loss += loss.item() * y.numel()
+        total_tokens += y.numel()
+    avg_loss = total_loss / total_tokens
+    ppl = math.exp(avg_loss)
+    wandb.log({"eval/perplexity": ppl, "eval/lm_loss": avg_loss}, step=step)
     print(f"eval perplexity (step {step}): {ppl:.2f}")
 
 
-HARNESS_TASKS_DEFAULT = [
-    "mmlu_abstract_algebra",
-    "mmlu_college_mathematics",
-    "mmlu_high_school_mathematics",
-    "mmlu_elementary_mathematics",
-]
-
-
 @torch.no_grad()
-def eval_harness(model, tokenizer, step, tasks=HARNESS_TASKS_DEFAULT, limit=256):
-    import lm_eval
-    from lm_eval.models.huggingface import HFLM
-
-    lm = HFLM(pretrained=model, tokenizer=tokenizer, batch_size="auto")
-    results = lm_eval.simple_evaluate(model=lm, tasks=list(tasks), limit=limit)
-
-    for task_name, task_results in results["results"].items():
-        summary = ", ".join(
-            f"{k}={v:.4f}" for k, v in sorted(task_results.items()) if isinstance(v, float)
-        )
-        print(f"  harness/{task_name}: {summary}")
-        for metric, value in task_results.items():
-            if isinstance(value, (int, float)):
-                wandb.log({f"eval/harness_{task_name}/{metric}": value}, step=step)
-
-
-@torch.no_grad()
-def evaluate(model, tokenizer, test_loader, step,
-             harness_tasks=HARNESS_TASKS_DEFAULT, harness_limit=256):
+def evaluate(model, test_loader, step):
     model.eval()
     eval_perplexity(model, test_loader, step)
-    eval_harness(model, tokenizer, step, tasks=harness_tasks, limit=harness_limit)
     model.train()
 
 
@@ -330,14 +310,13 @@ def main():
                         help="Steps to keep entropy alpha at zero before enabling")
     parser.add_argument("--seq-len", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--dataset-splits", nargs="+", default=["code"],
-                        choices=["code", "math", "stem", "chat",
-                                 "multilingual_ja", "multilingual_de",
-                                 "multilingual_it", "multilingual_es",
-                                 "multilingual_fr"],
-                        help="Nemotron SFT splits to use (multiple allowed)")
-    parser.add_argument("--num-samples", type=int, default=100_000)
-    parser.add_argument("--num-steps", type=int, default=100_000)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1,
+                        help="Number of gradient accumulation steps")
+    parser.add_argument("--data-dir", type=str, default="data/nemotron-moe-exam",
+                        help="Path to pre-compiled HuggingFace DatasetDict")
+    parser.add_argument("--num-steps", type=int, default=0,
+                        help="Stop after N optimizer steps (0 = run all epochs)")
+    parser.add_argument("--num-epochs", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--eval-every", type=int, default=1000)
@@ -349,22 +328,40 @@ def main():
                         help="Directory to save model checkpoints (default: no saving)")
     parser.add_argument("--save-every", type=int, default=0,
                         help="Save checkpoint every N steps (0 = only at end)")
-    parser.add_argument("--harness-tasks", nargs="+", default=HARNESS_TASKS_DEFAULT,
-                        help="lm-eval-harness tasks to run during eval")
-    parser.add_argument("--harness-limit", type=int, default=8,
-                        help="Number of samples per harness task")
+    parser.add_argument("--resume-from", type=str, default=None,
+                        help="Checkpoint dir to resume from, or 'auto' to find latest in --save-dir")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
 
+    # resolve resume checkpoint
+    resume_ckpt = None
+    if args.resume_from == "auto" and args.save_dir:
+        resume_ckpt = find_latest_checkpoint(args.save_dir)
+    elif args.resume_from and args.resume_from != "auto":
+        resume_ckpt = Path(args.resume_from)
+
+    if args.save_dir and (Path(args.save_dir) / "COMPLETED").exists():
+        print(f"Training already completed (found {args.save_dir}/COMPLETED). Exiting.")
+        return
+
+    if resume_ckpt:
+        print(f"Will resume from checkpoint: {resume_ckpt}")
+
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-    accelerator = Accelerator(log_with="wandb", kwargs_handlers=[ddp_kwargs])
+    accelerator = Accelerator(
+        log_with="wandb",
+        kwargs_handlers=[ddp_kwargs],
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+    )
 
     # logging with wandb
 
     wandb_kwargs = {}
     if args.wandb_run_name:
         wandb_kwargs["name"] = args.wandb_run_name
+    if resume_ckpt:
+        wandb_kwargs["resume"] = "allow"
     accelerator.init_trackers(
         args.wandb_project, config=vars(args),
         init_kwargs={"wandb": wandb_kwargs},
@@ -407,14 +404,25 @@ def main():
                       f"({moe_params / dense_params:.1f}x dense)")
 
     # load dataset
-    accelerator.print(f"Loading Nemotron SFT ({args.dataset_splits}, {args.num_samples} docs) ...")
+    accelerator.print(f"Loading dataset from {args.data_dir} ...")
     loader, test_loader = get_nemotron_loaders(tokenizer, args.seq_len, args.batch_size,
-                                               args.num_samples, splits=args.dataset_splits)
+                                               args.data_dir)
 
     # prepare for distributed training
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     model, optimizer, loader = accelerator.prepare(model, optimizer, loader)
+
+    # resume from checkpoint
+    start_epoch = 0
+    start_step = 0
+    if resume_ckpt:
+        accelerator.print(f"Restoring training state from {resume_ckpt} ...")
+        accelerator.load_state(str(resume_ckpt / "accelerator_state"))
+        meta = json.loads((resume_ckpt / "moe_meta.json").read_text())
+        start_step = meta["step"]
+        start_epoch = meta.get("epoch", 0)
+        accelerator.print(f"Resumed at step={start_step}, epoch={start_epoch}")
 
     if accelerator.is_main_process:
         wandb.log({"dense_params": dense_params, "moe_params": moe_params}, step=0)
@@ -431,38 +439,59 @@ def main():
 
     entropy_alpha_target = args.entropy_alpha if args.moe_type == "temporal" else 0.0
 
-    step = 0
-    for epoch in range(100): # enough epochs to hit num_steps
-        pbar = tqdm(loader, desc=f"epoch {epoch}", leave=False,
+    step = start_step
+    batches_per_step = args.gradient_accumulation_steps
+
+    # epochs
+    for epoch in range(start_epoch, args.num_epochs):
+
+        # resuming skipping
+        if epoch == start_epoch and start_step > 0:
+            skip_batches = start_step * batches_per_step
+            accelerator.print(f"Skipping {skip_batches} batches to resume epoch {epoch} ...")
+            active_loader = accelerator.skip_first_batches(loader, skip_batches)
+        else:
+            active_loader = loader
+        pbar = tqdm(active_loader, desc=f"epoch {epoch}", leave=False,
                     disable=not accelerator.is_main_process)
+
+        # iterate dataloader
         for x, y in pbar:
-            
-            if args.moe_type == "temporal":
-                ea = entropy_alpha_target if step >= args.entropy_warmup_steps else 0.0
-                for m in raw_model._moe_layers:
-                    m._entropy_alpha = ea
+            with accelerator.accumulate(model):
+                if args.moe_type == "temporal":
+                    ea = entropy_alpha_target if step >= args.entropy_warmup_steps else 0.0
+                    for m in raw_model._moe_layers:
+                        m._entropy_alpha = ea
 
-            outputs = model(input_ids=x, labels=y)
-            aux_loss = raw_model.get_moe_loss()
+                outputs = model(input_ids=x, labels=y)
+                aux_loss = raw_model.get_moe_loss()
 
-            if args.moe_type == "temporal":
-                total_loss = outputs.loss
-                lm_loss = (total_loss - aux_loss).detach()
-            else:
-                lm_loss = outputs.loss
-                total_loss = lm_loss + aux_loss
-                lm_loss = lm_loss.detach()
-            aux_loss = aux_loss.detach()
+                if args.moe_type == "temporal":
+                    total_loss = outputs.loss
+                    lm_loss = (total_loss - aux_loss).detach()
+                else:
+                    lm_loss = outputs.loss
+                    total_loss = lm_loss + aux_loss
+                    lm_loss = lm_loss.detach()
+                aux_loss = aux_loss.detach()
 
-            optimizer.zero_grad()
-            accelerator.backward(total_loss)
-            accelerator.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+                accelerator.backward(total_loss)
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                optimizer.zero_grad()
+
+            if not accelerator.sync_gradients:
+                continue
 
             step += 1
+
+            # logging
             if accelerator.is_main_process:
+
                 pbar.set_postfix(lm=f"{lm_loss.item():.4f}", aux=f"{aux_loss.item():.4f}",
                                  step=step)
+
                 if step % args.log_every == 0:
                     metrics = {
                         "train/lm_loss": lm_loss.item(),
@@ -483,11 +512,15 @@ def main():
                         metrics["train/pt_entropy"] = avg_pt_entropy
                     wandb.log(metrics, step=step)
 
+                # evaluation plots
                 if step % args.eval_every == 0:
-                    evaluate(raw_model, tokenizer, test_loader, step,
-                             harness_tasks=args.harness_tasks,
-                             harness_limit=args.harness_limit)
+
                     raw_model.eval()
+
+                    # perplexity
+                    evaluate(raw_model, test_loader, step)
+
+                    # plot boundaries for random batch                    
                     n_eval = min(16, x.shape[0])
                     sub_x = x[random.sample(range(x.shape[0]), n_eval)]
                     raw_model(input_ids=sub_x)
@@ -500,18 +533,23 @@ def main():
                                                     step, layer_idx=li)
                     raw_model.train()
 
-                if args.save_dir and args.save_every > 0 and step % args.save_every == 0:
-                    save_checkpoint(raw_model, tokenizer, args.save_dir, step, args, moe_config)
+            # save checkpoint
+            if args.save_dir and args.save_every > 0 and step % args.save_every == 0:
+                save_checkpoint(model, tokenizer, args.save_dir, step, epoch, args,
+                                moe_config, accelerator)
 
-            if step >= args.num_steps:
+            if args.num_steps and step >= args.num_steps:
                 break
-        if step >= args.num_steps:
+        if args.num_steps and step >= args.num_steps:
             break
 
     accelerator.print(f"\nTraining done ({step} steps).")
 
-    if accelerator.is_main_process and args.save_dir:
-        save_checkpoint(raw_model, tokenizer, args.save_dir, step, args, moe_config)
+    if args.save_dir:
+        save_checkpoint(model, tokenizer, args.save_dir, step, epoch, args,
+                        moe_config, accelerator)
+        if accelerator.is_main_process:
+            (Path(args.save_dir) / "COMPLETED").write_text(f"step={step}\n")
 
     # final inspection
     if accelerator.is_main_process:

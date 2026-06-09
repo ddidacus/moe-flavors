@@ -88,7 +88,7 @@ class ChunkingMoELayer(nn.Module):
         self.config = config
         device = next(original_ffn.parameters()).device
         dtype = next(original_ffn.parameters()).dtype
-        expert_intermediate = intermediate_size // 4
+        expert_intermediate = hidden_dim // config.num_experts
         self.experts = nn.ModuleList(
             [ExpertMLP(hidden_dim, expert_intermediate, dtype=dtype, device=device)
              for _ in range(config.num_experts)]

@@ -8,3 +8,4 @@ stubs
 checkpoints
 *.log
 eval_results
+data/

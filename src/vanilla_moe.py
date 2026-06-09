@@ -48,6 +48,7 @@ class Router(nn.Module):
         tokens_per_expert = one_hot.sum(dim=1).mean(dim=0)      # (E,)
         # mean routing probability per expert
         router_prob_per_expert = probs.mean(dim=0)               # (E,)
+        # p(route_expert) * tokens_count => sum(tokens_per_expert_expectation * experts) => total tokens over all experts 
         return (tokens_per_expert * router_prob_per_expert).sum() * self.num_experts
 
 
@@ -65,7 +66,7 @@ class ExpertMLP(nn.Module):
 class MoELayer(nn.Module):
     """
     Replaces a single dense FFN with N small expert MLPs + a router.
-    Each expert has 1/4 the intermediate size of the original FFN.
+    Each expert has hidden_dim // num_experts as its intermediate size.
     """
 
     def __init__(self, original_ffn: nn.Module, config: MoEConfig, hidden_dim: int, intermediate_size: int):
@@ -74,7 +75,7 @@ class MoELayer(nn.Module):
         device = next(original_ffn.parameters()).device
         dtype = next(original_ffn.parameters()).dtype
         self.router = Router(hidden_dim, config.num_experts, config.top_k, dtype=dtype)
-        expert_intermediate = intermediate_size // 4
+        expert_intermediate = hidden_dim // config.num_experts
         self.experts = nn.ModuleList(
             [ExpertMLP(hidden_dim, expert_intermediate, dtype=dtype, device=device)
              for _ in range(config.num_experts)]

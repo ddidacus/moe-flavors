@@ -11,16 +11,19 @@ Mode 'eci':
 """
 
 import argparse
+import copy
 import json
 import math
+import os
 import sys
-import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
-import torch.multiprocessing as mp
 import torch.nn.functional as F
 from tqdm import tqdm
 from datasets import load_from_disk
@@ -348,42 +351,48 @@ def extract_eci_data(model, tokenizer, dataset_rows, max_len, batch_size,
     }
 
 
-def _extraction_worker(rank, world_size, checkpoint_dir, mode, data, max_len,
-                       batch_size, num_viz_samples, tmp_dir):
-    device = f"cuda:{rank}"
-    model, tokenizer, moe_type = load_moe_model(checkpoint_dir, device)
+def _parallel_extract(num_gpus, args, data):
+    model, tokenizer, moe_type = load_moe_model(args.checkpoint_dir, "cpu")
 
-    shard_size = math.ceil(len(data) / world_size)
-    start = rank * shard_size
-    end = min(start + shard_size, len(data))
-    shard = data[start:end]
+    models = []
+    for i in range(num_gpus):
+        m = copy.deepcopy(model).to(f"cuda:{i}")
+        if moe_type == "hf_native":
+            m._moe_layers = _find_hf_moe_layers(m)
+        models.append(m)
+    del model
 
-    if not shard:
-        torch.save(None, str(Path(tmp_dir) / f"rank_{rank}.pt"))
-        return
+    shard_size = math.ceil(len(data) / num_gpus)
+    shards = [
+        data[i * shard_size : min((i + 1) * shard_size, len(data))]
+        for i in range(num_gpus)
+    ]
 
-    if mode == "routing":
-        result = extract_routing_vectors(
-            model, tokenizer, shard, max_len, batch_size, device, moe_type,
+    def _worker(rank):
+        device = f"cuda:{rank}"
+        shard = shards[rank]
+        if not shard:
+            return None
+        if args.mode == "routing":
+            return extract_routing_vectors(
+                models[rank], tokenizer, shard, args.max_len,
+                args.batch_size, device, moe_type,
+            )
+        viz = args.num_viz_samples if rank == 0 else 0
+        return extract_eci_data(
+            models[rank], tokenizer, shard, args.max_len,
+            args.batch_size, device, num_viz_samples=viz,
         )
-    else:
-        viz = num_viz_samples if rank == 0 else 0
-        result = extract_eci_data(
-            model, tokenizer, shard, max_len, batch_size, device,
-            num_viz_samples=viz,
-        )
 
-    torch.save(result, str(Path(tmp_dir) / f"rank_{rank}.pt"))
+    with ThreadPoolExecutor(max_workers=num_gpus) as pool:
+        futures = {pool.submit(_worker, i): i for i in range(num_gpus)}
+        partials = [None] * num_gpus
+        for fut in as_completed(futures):
+            partials[futures[fut]] = fut.result()
 
+    partials = [p for p in partials if p is not None]
 
-def _collect_results(tmp_dir, world_size, mode):
-    partials = []
-    for rank in range(world_size):
-        p = torch.load(str(Path(tmp_dir) / f"rank_{rank}.pt"), weights_only=False)
-        if p is not None:
-            partials.append(p)
-
-    if mode == "routing":
+    if args.mode == "routing":
         merged = {}
         for p in partials:
             for layer_idx, vecs in p.items():
@@ -419,7 +428,9 @@ def main():
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--output", default=None,
-                        help="Output .pt path (default: <checkpoint>/<mode>_vectors.pt)")
+                        help="Output .pt path (default: <output-dir>/<mode>_vectors.pt)")
+    parser.add_argument("--output-dir", default=None,
+                        help="Directory for output file (default: checkpoint dir or cwd)")
     parser.add_argument("--mode", choices=["routing", "eci"], default="routing",
                         help="'routing': sequence-averaged vectors; "
                              "'eci': per-domain routing for ECI analysis")
@@ -443,16 +454,7 @@ def main():
 
     if num_gpus > 1:
         print(f"Using {num_gpus} GPUs for parallel extraction")
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            mp.spawn(
-                _extraction_worker,
-                args=(num_gpus, args.checkpoint_dir, args.mode, data,
-                      args.max_len, args.batch_size, args.num_viz_samples,
-                      tmp_dir),
-                nprocs=num_gpus,
-                join=True,
-            )
-            result = _collect_results(tmp_dir, num_gpus, args.mode)
+        result = _parallel_extract(num_gpus, args, data)
     else:
         model, tokenizer, moe_type = load_moe_model(
             args.checkpoint_dir, args.device,
@@ -483,7 +485,16 @@ def main():
         print(f"Viz samples: {meta['num_viz_samples']}")
         default_name = "eci_routing_data.pt"
 
-    out_path = args.output or str(Path(args.checkpoint_dir) / default_name)
+    if args.output:
+        out_path = args.output
+    else:
+        if args.output_dir:
+            out_dir = Path(args.output_dir)
+        else:
+            ckpt_dir = Path(args.checkpoint_dir)
+            out_dir = ckpt_dir if ckpt_dir.is_dir() else Path(".")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = str(out_dir / default_name)
     torch.save(result, out_path)
     print(f"Saved to {out_path}")
 

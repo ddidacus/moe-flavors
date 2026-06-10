@@ -85,21 +85,81 @@ def plot_top_experts(eci, domain_names, out_dir):
     plt.close(fig)
 
 
-def plot_specialization_by_layer(eci, domain_names, out_dir):
-    """Per-layer average expert specialization (variance of ECI across domains)."""
+def compute_jaccard_similarity(eci, domain_names, out_dir, top_k=None):
+    """Jaccard similarity of top-k expert sets between domain pairs, per layer.
+
+    Jaccard_l(t1, t2) = |E_l,t1 ∩ E_l,t2| / |E_l,t1 ∪ E_l,t2|
+    (Equation 13 from arXiv:2601.03425)
+    """
     num_layers, num_domains, num_experts = eci.shape
-    var_across_domains = eci.var(dim=1)  # (L, E)
-    avg_spec = var_across_domains.mean(dim=1).numpy()  # (L,)
+    if top_k is None:
+        top_k = max(1, num_experts // 4)
+
+    pairs = [(i, j) for i in range(num_domains) for j in range(i + 1, num_domains)]
+    jaccard = torch.zeros(num_layers, len(pairs))
+
+    for l in range(num_layers):
+        top_sets = []
+        for d in range(num_domains):
+            topk_idx = eci[l, d].topk(min(top_k, num_experts)).indices
+            top_sets.append(set(topk_idx.tolist()))
+        for p, (i, j) in enumerate(pairs):
+            inter = len(top_sets[i] & top_sets[j])
+            union = len(top_sets[i] | top_sets[j])
+            jaccard[l, p] = inter / union if union > 0 else 0.0
+
+    pair_names = [f"{domain_names[i]} vs {domain_names[j]}" for i, j in pairs]
 
     fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(range(num_layers), avg_spec, marker="o", markersize=3)
+    for p, name in enumerate(pair_names):
+        ax.plot(range(num_layers), jaccard[:, p].numpy(), marker="o", markersize=3, label=name)
     ax.set_xlabel("Layer")
-    ax.set_ylabel("Avg ECI Variance Across Domains")
-    ax.set_title("Domain Specialization by Layer")
+    ax.set_ylabel("Jaccard Similarity")
+    ax.set_title(f"Top-{top_k} Expert Overlap Between Domains (per Layer)")
+    ax.set_ylim(-0.05, 1.05)
+    ax.legend()
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
-    fig.savefig(out_dir / "eci_specialization_by_layer.png", dpi=150)
+    fig.savefig(out_dir / "jaccard_similarity_by_layer.png", dpi=150)
     plt.close(fig)
+
+    print(f"\nJaccard similarity (top-{top_k}, avg across layers):")
+    for p, name in enumerate(pair_names):
+        print(f"  {name}: {jaccard[:, p].mean().item():.4f}")
+
+    return jaccard, pair_names
+
+
+def compute_gini_coefficient(eci, domain_names, out_dir):
+    """Gini coefficient of expert contributions per layer.
+
+    Gini(c_bar^l) = sum_i sum_j |c_bar_i - c_bar_j| / (2 * E * sum_i c_bar_i)
+    (Equation 14 from arXiv:2601.03425)
+    """
+    num_layers, num_domains, num_experts = eci.shape
+    avg_eci = eci.mean(dim=1)  # (L, E) — average ECI across domains
+
+    gini = torch.zeros(num_layers)
+    for l in range(num_layers):
+        c = avg_eci[l]
+        diffs = (c.unsqueeze(0) - c.unsqueeze(1)).abs().sum()
+        total = c.sum()
+        gini[l] = diffs / (2 * num_experts * total) if total > 0 else 0.0
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(range(num_layers), gini.numpy(), marker="o", markersize=3, color="#E91E63")
+    ax.set_xlabel("Layer")
+    ax.set_ylabel("Gini Coefficient")
+    ax.set_title("Expert Contribution Inequality by Layer")
+    ax.set_ylim(-0.05, 1.05)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    fig.savefig(out_dir / "gini_coefficient_by_layer.png", dpi=150)
+    plt.close(fig)
+
+    print(f"\nGini coefficient (avg across layers): {gini.mean().item():.4f}")
+
+    return gini
 
 
 def compute_entropy_by_domain(eci, domain_names, out_dir):
@@ -222,7 +282,7 @@ def plot_viz_samples(data, out_dir, num_plots=20, seed=42):
 
 
 def plot_avg_routing_across_samples(data, out_dir, indices, seed=42):
-    """Average routing probability per expert per domain across selected viz samples, for every layer."""
+    """One plot per domain: average routing probability per expert across selected viz samples, for every layer."""
     viz_probs = data["viz_routing_probs"]       # (V, max_len, L, E)
     viz_masks = data["viz_domain_masks"]         # (V, max_len)
     viz_attn = data["viz_attention_masks"]       # (V, max_len)
@@ -257,31 +317,28 @@ def plot_avg_routing_across_samples(data, out_dir, indices, seed=42):
     domain_colors = {"chat": "#2196F3", "code": "#4CAF50", "math": "#FF9800"}
     n_cols = 4
     n_rows = (num_layers + n_cols - 1) // n_cols
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4.5 * n_cols, 3 * n_rows))
-    axes = np.array(axes).flatten()
-
     x = np.arange(num_experts)
-    width = 0.8 / num_domains
 
-    for l_idx in range(num_layers):
-        ax = axes[l_idx]
-        for d_idx, d_name in enumerate(domain_names):
-            ax.bar(x + d_idx * width, avg_probs[l_idx, d_idx].numpy(), width,
-                   label=d_name, color=domain_colors.get(d_name), alpha=0.8)
-        ax.set_title(f"Layer {l_idx}", fontsize=9)
-        ax.set_xticks(x + width * (num_domains - 1) / 2)
-        ax.set_xticklabels([f"E{i}" for i in range(num_experts)], fontsize=7)
-        ax.tick_params(axis="y", labelsize=7)
-        if l_idx == 0:
-            ax.legend(fontsize=7)
+    for d_idx, d_name in enumerate(domain_names):
+        color = domain_colors.get(d_name, None)
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(4.5 * n_cols, 3 * n_rows))
+        axes = np.array(axes).flatten()
 
-    for idx in range(num_layers, len(axes)):
-        axes[idx].set_visible(False)
+        for l_idx in range(num_layers):
+            ax = axes[l_idx]
+            ax.bar(x, avg_probs[l_idx, d_idx].numpy(), 0.8, color=color, alpha=0.8)
+            ax.set_title(f"Layer {l_idx}", fontsize=9)
+            ax.set_xticks(x)
+            ax.set_xticklabels([f"E{i}" for i in range(num_experts)], fontsize=7)
+            ax.tick_params(axis="y", labelsize=7)
 
-    fig.suptitle(f"Avg Routing Prob by Domain (across {len(indices)} samples)", fontsize=12)
-    plt.tight_layout()
-    fig.savefig(out_dir / "avg_routing_by_domain_all_layers.png", dpi=150)
-    plt.close(fig)
+        for idx in range(num_layers, len(axes)):
+            axes[idx].set_visible(False)
+
+        fig.suptitle(f"Avg Routing Prob — {d_name} (across {len(indices)} samples)", fontsize=12)
+        plt.tight_layout()
+        fig.savefig(out_dir / f"avg_routing_{d_name}_all_layers.png", dpi=150)
+        plt.close(fig)
 
 
 def main():
@@ -320,9 +377,17 @@ def main():
 
     entropy = compute_entropy_by_domain(eci, meta["domain_names"], out_dir)
 
+    jaccard, jaccard_pair_names = compute_jaccard_similarity(
+        eci, meta["domain_names"], out_dir,
+    )
+    gini = compute_gini_coefficient(eci, meta["domain_names"], out_dir)
+
     torch.save({
         "global_eci": eci,
         "entropy_by_domain": entropy,
+        "jaccard_similarity": jaccard,
+        "jaccard_pair_names": jaccard_pair_names,
+        "gini_coefficient": gini,
         "domain_names": meta["domain_names"],
         "num_layers": meta["num_layers"],
         "num_experts": meta["num_experts"],
@@ -334,7 +399,6 @@ def main():
     print("Generating plots ...")
     plot_eci_heatmaps(eci, meta["domain_names"], out_dir)
     plot_top_experts(eci, meta["domain_names"], out_dir)
-    plot_specialization_by_layer(eci, meta["domain_names"], out_dir)
     viz_indices = plot_viz_samples(data, out_dir, num_plots=args.num_viz_plots, seed=args.seed)
     plot_avg_routing_across_samples(data, out_dir, viz_indices, seed=args.seed)
 

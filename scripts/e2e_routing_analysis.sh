@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=routing_analysis
 #SBATCH --output=routing_analysis_%j.out
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=32G
-#SBATCH --gres=gpu:l40s:1
+#SBATCH --cpus-per-task=24
+#SBATCH --mem=64G
+#SBATCH --gres=gpu:l40s:4
 #SBATCH --partition=long
 #SBATCH --time=3:00:00
 
@@ -23,18 +23,23 @@ fi
 echo "=== Step 1: Extract ECI routing data ==="
 echo "Checkpoint: $CHECKPOINT_DIR"
 
-python scripts/extract_routing_vectors.py \
-    --checkpoint-dir "$CHECKPOINT_DIR" \
-    --dataset-dir data/nemotron-moe-exam \
-    --max-len 2048 \
-    --batch-size 4 \
-    --mode eci \
-    --num-viz-samples 20 \
-    --output "${CHECKPOINT_DIR}/eci_routing_data.pt"
+if [ -f "${CHECKPOINT_DIR}/eci_routing_data.pt" ]; then
+    echo "Found existing ${CHECKPOINT_DIR}/eci_routing_data.pt, skipping extraction"
+else
+    python scripts/extract_routing_vectors.py \
+        --checkpoint-dir "$CHECKPOINT_DIR" \
+        --dataset-dir data/nemotron-moe-exam \
+        --max-len 2048 \
+        --batch-size 4 \
+        --mode eci \
+        --num-viz-samples 20 \
+        --num-gpus 4 \
+        --output "${CHECKPOINT_DIR}/eci_routing_data.pt"
 
-if [ $? -ne 0 ]; then
-    echo "ERROR: Extraction failed"
-    exit 1
+    if [ ! -f "${CHECKPOINT_DIR}/eci_routing_data.pt" ]; then
+        echo "ERROR: Extraction failed"
+        exit 1
+    fi
 fi
 
 echo "=== Step 2: Compute ECI metrics and plots ==="
@@ -42,5 +47,11 @@ echo "=== Step 2: Compute ECI metrics and plots ==="
 python scripts/compute_eci_metrics.py \
     --input "${CHECKPOINT_DIR}/eci_routing_data.pt" \
     --output-dir "${CHECKPOINT_DIR}/eci_results"
+
+echo "=== Step 3: Gate weight PCA & similarity analysis ==="
+
+python scripts/analyze_gate_weights.py \
+    --checkpoint-dir "$CHECKPOINT_DIR" \
+    --output-dir "${CHECKPOINT_DIR}/gate_analysis"
 
 echo "=== Done ==="

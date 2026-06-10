@@ -13,33 +13,35 @@ export UV_CACHE_DIR=/home/mila/d/diego.calanzone/scratch/cache
 export PYTHONDONTWRITEBYTECODE=1
 # export PYTHONPATH="/network/scratch/d/diego.calanzone/moe-playground/stubs:${PYTHONPATH:-}"
 
-EXPERT_DIM="${1:-}"   # default: hidden_size // num_experts
-SAVE_DIR="checkpoints/temporal_8e_k2_8192"
+SAVE_DIR="checkpoints/temporal_64e_k8_2048_deepseek_style"
+
+# Deepseek layers
+# --ratio-loss-N 3 3 4 5 5 6 6 7 7 8 8 9 9 10 10 11 11 12 12 13 13 14 15 15 \
 
 # ── Training ──
 
 accelerate launch --multi_gpu --num_processes=4 scripts/moe_mixin_poc.py \
     --moe-type temporal \
     --model Qwen/Qwen3-0.6B \
-    --num-experts 8 \
-    --top-k 2 \
-    ${EXPERT_DIM:+--expert-dim "$EXPERT_DIM"} \
+    --num-experts 64 \
+    --top-k 8 \
+    --expert-dim 32 \
     --ratio-loss-N 3 3 4 4 5 5 6 6 7 7 7 8 8 9 9 10 10 11 11 11 12 12 13 13 14 14 15 15 \
     --ratio-loss-alpha 0.03 \
     --entropy-threshold 0.1 \
     --entropy-alpha 0.05 \
     --entropy-warmup-steps 500 \
     --seq-len 8192 \
-    --batch-size 2 \
-    --gradient-accumulation-steps 8 \
+    --batch-size 1 \
+    --gradient-accumulation-steps 16 \
     --data-dir data/nemotron-moe-exam \
     --num-epochs 1 \
     --lr 8e-4 \
-    --log-every 10 \
+    --log-every 1 \
     --eval-every 500 \
     --seed 42 \
     --wandb-project moe-chunking-poc \
-    --wandb-run-name temporal-moe-N-9 \
+    --wandb-run-name temporal-qwen1.8b-64e-k8 \
     --save-dir "$SAVE_DIR" \
     --save-every 500 \
     --resume-from auto

@@ -13,6 +13,8 @@ class MoEConfig:
     ratio_loss_alpha: float = 0.3
     entropy_threshold: float = 0.1
     entropy_alpha: float = 1.0
+    expert_dim: int | None = None
+    num_copies: int = 0
 
     def __post_init__(self):
         if isinstance(self.ratio_loss_N, int):
@@ -79,6 +81,48 @@ class ExpertMLP(nn.Module):
         return self.down_proj(self.act(self.up_proj(x)))
 
 
+class SegmentedExperts(nn.Module):
+    """Virtual experts carved from concatenated FFN weight matrices."""
+
+    def __init__(self, hidden_dim: int, num_experts: int, expert_dim: int,
+                 dtype=None, device=None):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_experts = num_experts
+        self.expert_dim = expert_dim
+        total_intermediate = num_experts * expert_dim
+        self.gate_proj = nn.Linear(hidden_dim, total_intermediate, bias=False,
+                                   dtype=dtype, device=device)
+        self.up_proj = nn.Linear(hidden_dim, total_intermediate, bias=False,
+                                 dtype=dtype, device=device)
+        self.down_proj = nn.Linear(total_intermediate, hidden_dim, bias=False,
+                                   dtype=dtype, device=device)
+        self.act = nn.SiLU()
+
+    def forward_expert(self, x: torch.Tensor, expert_idx: int) -> torch.Tensor:
+        s = expert_idx * self.expert_dim
+        e = s + self.expert_dim
+        gate_out = F.linear(x, self.gate_proj.weight[s:e])
+        up_out = F.linear(x, self.up_proj.weight[s:e])
+        hidden = self.act(gate_out) * up_out
+        return F.linear(hidden, self.down_proj.weight[:, s:e])
+
+
+def _init_segmented_from_ffn(segmented: SegmentedExperts, original_mlp: nn.Module,
+                              num_copies: int, noise_std: float = 0.01):
+    with torch.no_grad():
+        orig_gate = original_mlp.gate_proj.weight.data
+        orig_up = original_mlp.up_proj.weight.data
+        orig_down = original_mlp.down_proj.weight.data
+        segmented.gate_proj.weight.data.copy_(orig_gate.repeat(num_copies, 1))
+        segmented.up_proj.weight.data.copy_(orig_up.repeat(num_copies, 1))
+        segmented.down_proj.weight.data.copy_(orig_down.repeat(1, num_copies))
+        if noise_std > 0:
+            segmented.gate_proj.weight.data += torch.randn_like(segmented.gate_proj.weight) * noise_std
+            segmented.up_proj.weight.data += torch.randn_like(segmented.up_proj.weight) * noise_std
+            segmented.down_proj.weight.data += torch.randn_like(segmented.down_proj.weight) * noise_std
+
+
 class ChunkingMoELayer(nn.Module):
     """
         Implements MoE with dynamic chunking from H-Nets, and the ratio loss
@@ -88,11 +132,19 @@ class ChunkingMoELayer(nn.Module):
         self.config = config
         device = next(original_ffn.parameters()).device
         dtype = next(original_ffn.parameters()).dtype
-        expert_intermediate = hidden_dim // config.num_experts
-        self.experts = nn.ModuleList(
-            [ExpertMLP(hidden_dim, expert_intermediate, dtype=dtype, device=device)
-             for _ in range(config.num_experts)]
-        )
+        if config.num_copies > 0:
+            self.experts = SegmentedExperts(
+                hidden_dim, config.num_experts, config.expert_dim,
+                dtype=dtype, device=device,
+            )
+            self._segmented = True
+        else:
+            expert_intermediate = config.expert_dim or (hidden_dim // config.num_experts)
+            self.experts = nn.ModuleList(
+                [ExpertMLP(hidden_dim, expert_intermediate, dtype=dtype, device=device)
+                 for _ in range(config.num_experts)]
+            )
+            self._segmented = False
         self.router = ChunkingRouter(hidden_dim, config.num_experts, config.top_k, dtype=dtype).to(device)
         self._ratio_loss_alpha = config.ratio_loss_alpha
         self._entropy_threshold = config.entropy_threshold
@@ -164,17 +216,28 @@ class ChunkingMoELayer(nn.Module):
         expert_counts = torch.bincount(flat_expert_ids, minlength=self.config.num_experts)
 
         out = torch.zeros_like(flat)
-        dummy = flat[:1].detach()
-        offset = 0
-        for e_idx, count in enumerate(expert_counts.tolist()):
-            if count == 0:
-                out = out + 0.0 * self.experts[e_idx](dummy).sum()
-            else:
+        if self._segmented:
+            offset = 0
+            for e_idx, count in enumerate(expert_counts.tolist()):
+                if count == 0:
+                    continue
                 inp = expert_tokens[offset:offset + count]
                 w = flat_weights[offset:offset + count].unsqueeze(-1)
                 idx = flat_token_idx[offset:offset + count]
-                out.index_add_(0, idx, w * self.experts[e_idx](inp))
+                out.index_add_(0, idx, w * self.experts.forward_expert(inp, e_idx))
                 offset += count
+        else:
+            dummy = flat[:1].detach()
+            offset = 0
+            for e_idx, count in enumerate(expert_counts.tolist()):
+                if count == 0:
+                    out = out + 0.0 * self.experts[e_idx](dummy).sum()
+                else:
+                    inp = expert_tokens[offset:offset + count]
+                    w = flat_weights[offset:offset + count].unsqueeze(-1)
+                    idx = flat_token_idx[offset:offset + count]
+                    out.index_add_(0, idx, w * self.experts[e_idx](inp))
+                    offset += count
 
         return out.reshape(orig_shape)
 
@@ -196,8 +259,16 @@ class MoEMixin:
     def apply(model: nn.Module, config: MoEConfig) -> nn.Module:
         hidden_dim = model.config.hidden_size
         intermediate_size = model.config.intermediate_size
-        # gets decoder layers modules
         decoder_layers = list(MoEMixin._find_decoder_layers(model))
+
+        if config.num_copies > 0:
+            assert config.expert_dim is not None and config.expert_dim > 0
+            total_intermediate = config.num_copies * intermediate_size
+            assert total_intermediate % config.expert_dim == 0, (
+                f"num_copies * intermediate_size ({total_intermediate}) must be "
+                f"divisible by expert_dim ({config.expert_dim})"
+            )
+            config.num_experts = total_intermediate // config.expert_dim
 
         num_layers = len(decoder_layers)
         N_list = config.ratio_loss_N
@@ -211,6 +282,8 @@ class MoEMixin:
         for idx, layer in enumerate(decoder_layers):
             original_mlp = layer.mlp
             moe = ChunkingMoELayer(original_mlp, config, hidden_dim, intermediate_size, N_list[idx])
+            if config.num_copies > 0:
+                _init_segmented_from_ffn(moe.experts, original_mlp, config.num_copies)
             layer.mlp = moe
             moe_layers.append(moe)
 
@@ -233,13 +306,15 @@ class MoEMixin:
             return output
         model.register_forward_hook(_inject_moe_loss)
 
-        print(f"[MoEMixin] Converted {len(moe_layers)} FFN layers -> "
-              f"MoE (experts={config.num_experts}, top_k={config.top_k})")
+        label = f"experts={config.num_experts}, top_k={config.top_k}"
+        if config.num_copies > 0:
+            label += f", segmented ({config.num_copies} copies, expert_dim={config.expert_dim})"
+        print(f"[MoEMixin] Converted {len(moe_layers)} FFN layers -> MoE ({label})")
         return model
 
     @staticmethod
     def _find_decoder_layers(model: nn.Module):
         """Locate transformer decoder layers by searching for .mlp attribute."""
         for module in model.modules():
-            if hasattr(module, 'mlp') and hasattr(module, 'self_attn'):
+            if hasattr(module, 'mlp') and (hasattr(module, 'self_attn') or hasattr(module, 'attn')):
                 yield module

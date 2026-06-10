@@ -13,6 +13,7 @@ export UV_CACHE_DIR=/home/mila/d/diego.calanzone/scratch/cache
 export PYTHONDONTWRITEBYTECODE=1
 # export PYTHONPATH="/network/scratch/d/diego.calanzone/moe-playground/stubs:${PYTHONPATH:-}"
 
+EXPERT_DIM="${1:-}"   # default: hidden_size // num_experts
 SAVE_DIR="checkpoints/vanilla_8e_k2_8192"
 
 # ── Training ──
@@ -22,6 +23,7 @@ accelerate launch --multi_gpu --num_processes=4 scripts/moe_mixin_poc.py \
     --model Qwen/Qwen3-0.6B \
     --num-experts 8 \
     --top-k 2 \
+    ${EXPERT_DIM:+--expert-dim "$EXPERT_DIM"} \
     --seq-len 8192 \
     --batch-size 2 \
     --gradient-accumulation-steps 8 \

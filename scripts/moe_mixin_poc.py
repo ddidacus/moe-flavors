@@ -15,6 +15,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 import wandb
 from accelerate import Accelerator, DistributedDataParallelKwargs
+
+# Stub symbols removed in transformers >=5.x but still imported by transformers_stream_generator
+# (used only for constrained beam search / streaming, not needed for training)
+import transformers
+import transformers.generation.utils as _gen_utils
+for _name in ("DisjunctiveConstraint", "BeamSearchScorer", "PhrasalConstraint",
+              "ConstrainedBeamSearchScorer"):
+    if not hasattr(transformers, _name):
+        setattr(transformers, _name, type(_name, (), {}))
+if not hasattr(_gen_utils, "SampleOutput"):
+    _gen_utils.SampleOutput = type("SampleOutput", (), {})
+
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from src.temporal_moe import MoEConfig as TemporalMoEConfig, MoEMixin as TemporalMoEMixin
@@ -298,6 +310,10 @@ def main():
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B", help="HF model id")
     parser.add_argument("--num-experts", type=int, default=8)
     parser.add_argument("--top-k", type=int, default=2)
+    parser.add_argument("--expert-dim", type=int, default=None,
+                        help="Per-expert intermediate dim (default: hidden_size // num_experts)")
+    parser.add_argument("--num-copies", type=int, default=0,
+                        help="FFN copies for segmentation upcycling (0 = random-init experts)")
     parser.add_argument("--ratio-loss-N", type=int, nargs="+", default=[3],
                         help="N parameter(s) for temporal ratio loss — one per layer, or a single value broadcast to all")
     parser.add_argument("--ratio-loss-alpha", type=float, default=0.3,
@@ -331,6 +347,9 @@ def main():
     parser.add_argument("--resume-from", type=str, default=None,
                         help="Checkpoint dir to resume from, or 'auto' to find latest in --save-dir")
     args = parser.parse_args()
+
+    if args.num_copies > 0 and not args.expert_dim:
+        parser.error("--expert-dim is required when --num-copies > 0")
 
     torch.manual_seed(args.seed)
 
@@ -372,11 +391,11 @@ def main():
     # loading dense LLM model
 
     accelerator.print(f"Loading {args.model} ...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, dtype=torch.bfloat16
+        args.model, dtype=torch.bfloat16, trust_remote_code=True
     )
     dense_params = count_params(model)
     accelerator.print(f"Dense model parameters: {dense_params:,}")
@@ -391,12 +410,16 @@ def main():
             ratio_loss_alpha=args.ratio_loss_alpha,
             entropy_threshold=args.entropy_threshold,
             entropy_alpha=args.entropy_alpha,
+            expert_dim=args.expert_dim,
+            num_copies=args.num_copies,
         )
         TemporalMoEMixin.apply(model, moe_config)
     else:
         moe_config = VanillaMoEConfig(
             num_experts=args.num_experts,
             top_k=args.top_k,
+            expert_dim=args.expert_dim,
+            num_copies=args.num_copies,
         )
         VanillaMoEMixin.apply(model, moe_config)
     moe_params = count_params(model)

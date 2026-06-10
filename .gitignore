@@ -9,3 +9,4 @@ checkpoints
 *.log
 eval_results
 data/
+results/

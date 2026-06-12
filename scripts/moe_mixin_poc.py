@@ -2,6 +2,7 @@ import argparse
 import json
 import math
 import random
+import signal
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -27,8 +28,10 @@ for _name in ("DisjunctiveConstraint", "BeamSearchScorer", "PhrasalConstraint",
 if not hasattr(_gen_utils, "SampleOutput"):
     _gen_utils.SampleOutput = type("SampleOutput", (), {})
 
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, get_scheduler
 
+from src.chunk_moe import MoEConfig as ChunkMoEConfig, MoEMixin as ChunkMoEMixin
+from src.deepseek_moe import MoEConfig as DeepSeekMoEConfig, MoEMixin as DeepSeekMoEMixin
 from src.temporal_moe import MoEConfig as TemporalMoEConfig, MoEMixin as TemporalMoEMixin
 from src.vanilla_moe import MoEConfig as VanillaMoEConfig, MoEMixin as VanillaMoEMixin
 
@@ -66,7 +69,7 @@ def get_nemotron_loaders(tokenizer, seq_len: int, batch_size: int, data_dir: str
     train_loader = DataLoader(TokenizedDataset(ds["train"], tokenizer, seq_len),
                               batch_size=batch_size, shuffle=True, drop_last=True)
     test_loader = DataLoader(TokenizedDataset(ds["test"], tokenizer, seq_len),
-                             batch_size=32, shuffle=True, drop_last=True)
+                             batch_size=max(1, batch_size), shuffle=True, drop_last=True)
     return train_loader, test_loader
 
 def _pick_eval_layers(num_layers):
@@ -246,6 +249,9 @@ def save_checkpoint(model, tokenizer, save_dir, step, epoch, args, moe_config,
         }
         (save_path / "moe_meta.json").write_text(json.dumps(meta, indent=2))
     accelerator.save_state(str(save_path / "accelerator_state"))
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        (save_path / ".complete").write_text("")
     accelerator.print(f"[checkpoint] Saved to {save_path}")
 
 
@@ -255,7 +261,7 @@ def find_latest_checkpoint(save_dir):
         return None
     ckpts = sorted(save_dir.glob("step_*"), key=lambda p: int(p.name.split("_")[1]))
     for ckpt in reversed(ckpts):
-        if (ckpt / "accelerator_state").exists():
+        if (ckpt / ".complete").exists() and (ckpt / "accelerator_state").exists():
             return ckpt
     return None
 
@@ -305,8 +311,8 @@ def _unwrap(model):
 
 def main():
     parser = argparse.ArgumentParser(description="MoE Mixin PoC")
-    parser.add_argument("--moe-type", choices=["vanilla", "temporal"], default="temporal",
-                        help="MoE variant: vanilla (standard top-k) or temporal (chunking)")
+    parser.add_argument("--moe-type", choices=["vanilla", "temporal", "deepseek", "chunk"], default="temporal",
+                        help="MoE variant: vanilla (plain top-k), deepseek (shared + routed), temporal (chunking), or chunk (CLS-token router)")
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B", help="HF model id")
     parser.add_argument("--num-experts", type=int, default=8)
     parser.add_argument("--top-k", type=int, default=2)
@@ -314,6 +320,10 @@ def main():
                         help="Per-expert intermediate dim (default: hidden_size // num_experts)")
     parser.add_argument("--num-copies", type=int, default=0,
                         help="FFN copies for segmentation upcycling (0 = random-init experts)")
+    parser.add_argument("--num-shared-experts", type=int, default=2,
+                        help="Number of always-active shared experts (deepseek mode)")
+    parser.add_argument("--aux-loss-coeff", type=float, default=0.01,
+                        help="Expert-level balance loss coefficient (deepseek mode)")
     parser.add_argument("--ratio-loss-N", type=int, nargs="+", default=[3],
                         help="N parameter(s) for temporal ratio loss — one per layer, or a single value broadcast to all")
     parser.add_argument("--ratio-loss-alpha", type=float, default=0.3,
@@ -334,6 +344,13 @@ def main():
                         help="Stop after N optimizer steps (0 = run all epochs)")
     parser.add_argument("--num-epochs", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--weight-decay", type=float, default=0.0,
+                        help="AdamW weight decay (default: 0)")
+    parser.add_argument("--warmup-ratio", type=float, default=0.0,
+                        help="Fraction of total steps used for LR warmup (default: 0)")
+    parser.add_argument("--lr-scheduler", type=str, default="cosine",
+                        choices=["cosine", "linear", "constant", "constant_with_warmup"],
+                        help="LR scheduler type (default: cosine)")
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--eval-every", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=42)
@@ -414,6 +431,28 @@ def main():
             num_copies=args.num_copies,
         )
         TemporalMoEMixin.apply(model, moe_config)
+    elif args.moe_type == "chunk":
+        moe_config = ChunkMoEConfig(
+            num_experts=args.num_experts,
+            top_k=args.top_k,
+            ratio_loss_N=args.ratio_loss_N,
+            ratio_loss_alpha=args.ratio_loss_alpha,
+            entropy_threshold=args.entropy_threshold,
+            entropy_alpha=args.entropy_alpha,
+            expert_dim=args.expert_dim,
+            num_copies=args.num_copies,
+        )
+        ChunkMoEMixin.apply(model, moe_config)
+    elif args.moe_type == "deepseek":
+        moe_config = DeepSeekMoEConfig(
+            num_experts=args.num_experts,
+            num_shared_experts=args.num_shared_experts,
+            top_k=args.top_k,
+            aux_loss_coeff=args.aux_loss_coeff,
+            expert_dim=args.expert_dim,
+            num_copies=args.num_copies,
+        )
+        DeepSeekMoEMixin.apply(model, moe_config)
     else:
         moe_config = VanillaMoEConfig(
             num_experts=args.num_experts,
@@ -433,8 +472,25 @@ def main():
 
     # prepare for distributed training
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    model, optimizer, loader = accelerator.prepare(model, optimizer, loader)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
+                                  weight_decay=args.weight_decay)
+
+    total_steps = len(loader) * args.num_epochs // args.gradient_accumulation_steps
+    if args.num_steps:
+        total_steps = min(total_steps, args.num_steps)
+    warmup_steps = int(total_steps * args.warmup_ratio)
+
+    lr_scheduler = get_scheduler(
+        name=args.lr_scheduler,
+        optimizer=optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_steps,
+    )
+    accelerator.print(f"LR scheduler: {args.lr_scheduler}, warmup={warmup_steps}/{total_steps} steps, "
+                      f"weight_decay={args.weight_decay}")
+
+    model, optimizer, loader, lr_scheduler = accelerator.prepare(
+        model, optimizer, loader, lr_scheduler)
 
     # resume from checkpoint
     start_epoch = 0
@@ -450,17 +506,31 @@ def main():
     if accelerator.is_main_process:
         wandb.log({"dense_params": dense_params, "moe_params": moe_params}, step=0)
 
+    # preemption handler — save checkpoint on SIGTERM/SIGUSR1 from SLURM
+    _preempt_state = {"step": start_step, "epoch": start_epoch}
+
+    def _preemption_handler(signum, frame):
+        s, e = _preempt_state["step"], _preempt_state["epoch"]
+        accelerator.print(f"\n[preemption] Signal {signum} received at step {s}, saving checkpoint...")
+        if args.save_dir:
+            save_checkpoint(model, tokenizer, args.save_dir, s, e, args, moe_config, accelerator)
+        accelerator.end_training()
+        sys.exit(0)
+
+    signal.signal(signal.SIGUSR1, _preemption_handler)
+    signal.signal(signal.SIGTERM, _preemption_handler)
+
     # train loop
 
     model.train()
     raw_model = _unwrap(model)
     num_moe_layers = len(raw_model._moe_layers)
-    if args.moe_type == "temporal":
+    if args.moe_type in ("temporal", "chunk"):
         ratio_loss_alpha = raw_model._moe_layers[0]._ratio_loss_alpha
     else:
         ratio_loss_alpha = None
 
-    entropy_alpha_target = args.entropy_alpha if args.moe_type == "temporal" else 0.0
+    entropy_alpha_target = args.entropy_alpha if args.moe_type in ("temporal", "chunk") else 0.0
 
     step = start_step
     batches_per_step = args.gradient_accumulation_steps
@@ -481,7 +551,7 @@ def main():
         # iterate dataloader
         for x, y in pbar:
             with accelerator.accumulate(model):
-                if args.moe_type == "temporal":
+                if args.moe_type in ("temporal", "chunk"):
                     ea = entropy_alpha_target if step >= args.entropy_warmup_steps else 0.0
                     for m in raw_model._moe_layers:
                         m._entropy_alpha = ea
@@ -489,7 +559,7 @@ def main():
                 outputs = model(input_ids=x, labels=y)
                 aux_loss = raw_model.get_moe_loss()
 
-                if args.moe_type == "temporal":
+                if args.moe_type in ("temporal", "chunk"):
                     total_loss = outputs.loss
                     lm_loss = (total_loss - aux_loss).detach()
                 else:
@@ -502,12 +572,15 @@ def main():
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
+                lr_scheduler.step()
                 optimizer.zero_grad()
 
             if not accelerator.sync_gradients:
                 continue
 
             step += 1
+            _preempt_state["step"] = step
+            _preempt_state["epoch"] = epoch
 
             # logging
             if accelerator.is_main_process:
@@ -520,10 +593,11 @@ def main():
                         "train/lm_loss": lm_loss.item(),
                         "train/aux_loss": aux_loss.item(),
                         "train/total_loss": total_loss.item(),
+                        "train/lr": lr_scheduler.get_last_lr()[0],
                         "train/epoch": epoch,
                         "train/switch_rate": compute_switch_rate(raw_model),
                     }
-                    if ratio_loss_alpha is not None:
+                    if ratio_loss_alpha:
                         metrics["train/ratio_loss_per_layer_unscaled"] = (
                             aux_loss.item() / (num_moe_layers * ratio_loss_alpha)
                         )
@@ -535,31 +609,30 @@ def main():
                         metrics["train/pt_entropy"] = avg_pt_entropy
                     wandb.log(metrics, step=step)
 
-                # evaluation plots
-                if step % args.eval_every == 0:
-
-                    raw_model.eval()
-
-                    # perplexity
-                    evaluate(raw_model, test_loader, step)
-
-                    # plot boundaries for random batch                    
-                    n_eval = min(16, x.shape[0])
-                    sub_x = x[random.sample(range(x.shape[0]), n_eval)]
-                    raw_model(input_ids=sub_x)
-                    for li in _pick_eval_layers(num_moe_layers):
-                        if args.moe_type == "temporal":
-                            eval_boundaries(raw_model, tokenizer, sub_x, step,
-                                            layer_idx=li, num_samples=n_eval)
-                        else:
-                            eval_expert_assignments(raw_model, tokenizer, sub_x,
-                                                    step, layer_idx=li)
-                    raw_model.train()
-
-            # save checkpoint
+            # save checkpoint (before eval so OOM in eval doesn't lose progress)
             if args.save_dir and args.save_every > 0 and step % args.save_every == 0:
                 save_checkpoint(model, tokenizer, args.save_dir, step, epoch, args,
                                 moe_config, accelerator)
+
+            # evaluation plots
+            if accelerator.is_main_process and step % args.eval_every == 0:
+                raw_model.eval()
+
+                # perplexity
+                evaluate(raw_model, test_loader, step)
+
+                # plot boundaries for random batch
+                n_eval = min(16, x.shape[0])
+                sub_x = x[random.sample(range(x.shape[0]), n_eval)]
+                raw_model(input_ids=sub_x)
+                for li in _pick_eval_layers(num_moe_layers):
+                    if args.moe_type in ("temporal", "chunk"):
+                        eval_boundaries(raw_model, tokenizer, sub_x, step,
+                                        layer_idx=li, num_samples=n_eval)
+                    else:
+                        eval_expert_assignments(raw_model, tokenizer, sub_x,
+                                                step, layer_idx=li)
+                raw_model.train()
 
             if args.num_steps and step >= args.num_steps:
                 break

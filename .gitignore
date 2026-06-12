@@ -12,4 +12,3 @@ data/
 results/
 .job_monitor_state.json
 logs
-*.toml

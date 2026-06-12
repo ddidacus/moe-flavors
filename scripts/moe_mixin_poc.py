@@ -41,11 +41,11 @@ from src.vanilla_moe import MoEConfig as VanillaMoEConfig, MoEMixin as VanillaMo
 def count_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
 
-def get_nemotron_loaders(tokenizer, seq_len: int, batch_size: int, data_dir: str):
-    from datasets import load_from_disk
+def get_nemotron_loaders(tokenizer, seq_len: int, batch_size: int, dataset_name: str):
+    from datasets import load_dataset
     from torch.utils.data import DataLoader, Dataset, Subset
 
-    ds = load_from_disk(data_dir)
+    ds = load_dataset(dataset_name)
 
     class TokenizedDataset(Dataset):
         def __init__(self, rows, tokenizer, seq_len):
@@ -338,8 +338,8 @@ def main():
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1,
                         help="Number of gradient accumulation steps")
-    parser.add_argument("--data-dir", type=str, default="data/nemotron-moe-exam",
-                        help="Path to pre-compiled HuggingFace DatasetDict")
+    parser.add_argument("--dataset", type=str, default="ddidacus/nemotron-moe-exam",
+                        help="HuggingFace Hub dataset name")
     parser.add_argument("--num-steps", type=int, default=0,
                         help="Stop after N optimizer steps (0 = run all epochs)")
     parser.add_argument("--num-epochs", type=int, default=1)
@@ -466,9 +466,9 @@ def main():
                       f"({moe_params / dense_params:.1f}x dense)")
 
     # load dataset
-    accelerator.print(f"Loading dataset from {args.data_dir} ...")
+    accelerator.print(f"Loading dataset {args.dataset} ...")
     loader, test_loader = get_nemotron_loaders(tokenizer, args.seq_len, args.batch_size,
-                                               args.data_dir)
+                                               args.dataset)
 
     # prepare for distributed training
 

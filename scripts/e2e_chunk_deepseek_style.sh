@@ -1,9 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=e2e_temporal
-#SBATCH --output=e2e_temporal_%j.out
+#SBATCH --job-name=e2e_chunk
+#SBATCH --output=e2e_chunk_%j.out
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
-#SBATCH --gres=gpu:80gb:4
+#SBATCH --gres=gpu:4
+#SBATCH --constraint=80gb
 #SBATCH --partition=long
 #SBATCH --time=12:00:00
 #SBATCH --signal=B:USR1@120
@@ -12,17 +13,13 @@ source .venv/bin/activate
 export HF_HOME=/home/mila/d/diego.calanzone/scratch/cache
 export UV_CACHE_DIR=/home/mila/d/diego.calanzone/scratch/cache
 export PYTHONDONTWRITEBYTECODE=1
-# export PYTHONPATH="/network/scratch/d/diego.calanzone/moe-playground/stubs:${PYTHONPATH:-}"
 
-SAVE_DIR="checkpoints/temporal_64e_k8_2048_deepseek_style"
-
-# Deepseek layers
-# --ratio-loss-N 3 3 4 5 5 6 6 7 7 8 8 9 9 10 10 11 11 12 12 13 13 14 15 15 \
+SAVE_DIR="checkpoints/chunk_64e_k8_2048_deepseek_style"
 
 # ── Training ──
 
 accelerate launch --multi_gpu --num_processes=4 scripts/moe_mixin_poc.py \
-    --moe-type temporal \
+    --moe-type chunk \
     --model Qwen/Qwen3-0.6B \
     --num-experts 64 \
     --top-k 8 \
@@ -45,7 +42,7 @@ accelerate launch --multi_gpu --num_processes=4 scripts/moe_mixin_poc.py \
     --eval-every 500 \
     --seed 42 \
     --wandb-project moe-chunking-poc \
-    --wandb-run-name temporal-qwen1.8b-64e-k8 \
+    --wandb-run-name chunk-qwen0.6b-64e-k8 \
     --save-dir "$SAVE_DIR" \
     --save-every 500 \
     --resume-from auto

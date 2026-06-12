@@ -65,6 +65,83 @@ class ExpertMLP(nn.Module):
         return self.down_proj(self.act(self.up_proj(x)))
 
 
+class BatchedExperts(nn.Module):
+    """Expert MLPs with stacked weight tensors for efficient batched computation.
+
+    Replaces a ModuleList of ExpertMLPs. Tokens are sorted by expert assignment
+    so each expert processes a contiguous slice — one F.linear per expert instead
+    of mask-gather-compute-scatter per expert per top-k slot.
+    """
+
+    def __init__(self, num_experts: int, hidden_dim: int, intermediate_dim: int,
+                 dtype=None, device=None):
+        super().__init__()
+        self.num_experts = num_experts
+        self.hidden_dim = hidden_dim
+        self.intermediate_dim = intermediate_dim
+        self.up_proj = nn.Parameter(
+            torch.empty(num_experts, intermediate_dim, hidden_dim, dtype=dtype, device=device))
+        self.down_proj = nn.Parameter(
+            torch.empty(num_experts, hidden_dim, intermediate_dim, dtype=dtype, device=device))
+        self.act = nn.SiLU()
+        self._init_weights()
+
+    def _init_weights(self):
+        import math
+        for e in range(self.num_experts):
+            nn.init.kaiming_uniform_(self.up_proj.data[e], a=math.sqrt(5))
+            nn.init.kaiming_uniform_(self.down_proj.data[e], a=math.sqrt(5))
+
+    def forward(self, x: torch.Tensor, top_k_indices: torch.Tensor,
+                top_k_weights: torch.Tensor) -> torch.Tensor:
+        """Routed forward: each token goes to its top-k experts.
+
+        x:             (T, H)
+        top_k_indices: (T, K)
+        top_k_weights: (T, K)
+        Returns:       (T, H)
+        """
+        T, K = top_k_indices.shape
+
+        flat_x = x.unsqueeze(1).expand(-1, K, -1).reshape(-1, self.hidden_dim)
+        flat_idx = top_k_indices.reshape(-1)
+        flat_w = top_k_weights.reshape(-1)
+
+        sort_order = flat_idx.argsort()
+        sorted_x = flat_x[sort_order]
+        sorted_idx = flat_idx[sort_order]
+        sorted_w = flat_w[sort_order]
+
+        counts = torch.bincount(sorted_idx, minlength=self.num_experts)
+
+        sorted_out = torch.empty_like(sorted_x)
+        offset = 0
+        for e in range(self.num_experts):
+            c = counts[e].item()
+            if c == 0:
+                continue
+            chunk = sorted_x[offset:offset + c]
+            h = self.act(F.linear(chunk, self.up_proj[e]))
+            sorted_out[offset:offset + c] = F.linear(h, self.down_proj[e])
+            offset += c
+
+        sorted_out = sorted_out * sorted_w.unsqueeze(-1)
+
+        unsort_order = sort_order.argsort()
+        return sorted_out[unsort_order].reshape(T, K, -1).sum(dim=1)
+
+    def forward_all(self, x: torch.Tensor) -> torch.Tensor:
+        """Shared forward: all tokens through ALL experts, outputs summed.
+
+        x:       (T, H)
+        Returns: (T, H)
+        """
+        x_exp = x.unsqueeze(0).expand(self.num_experts, -1, -1)
+        up = torch.bmm(x_exp, self.up_proj.transpose(1, 2))
+        down = torch.bmm(self.act(up), self.down_proj.transpose(1, 2))
+        return down.sum(dim=0)
+
+
 class SegmentedExperts(nn.Module):
     """Virtual experts carved from concatenated FFN weight matrices.
 

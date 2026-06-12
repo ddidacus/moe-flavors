@@ -11,3 +11,7 @@ eval_results
 data/
 results/
 .job_monitor_state.json
+logs
+scripts/job.sh
+scripts/safe_job.sh
+*.toml

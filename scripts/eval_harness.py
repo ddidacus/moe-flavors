@@ -18,7 +18,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from src.deepseek_moe import MoEConfig as DeepSeekMoEConfig, MoEMixin as DeepSeekMoEMixin
 from src.temporal_moe import MoEConfig as TemporalMoEConfig, MoEMixin as TemporalMoEMixin
+from src.temporal_moe_wrapper import TemporalWrapConfig, TemporalWrapMixin
 from src.vanilla_moe import MoEConfig as VanillaMoEConfig, MoEMixin as VanillaMoEMixin
 
 import wandb
@@ -49,9 +51,16 @@ def load_moe_model(checkpoint_dir: str, device: str = "cuda"):
         meta["base_model"], torch_dtype=torch.bfloat16
     )
 
-    if meta["moe_type"] == "temporal":
+    moe_type = meta["moe_type"]
+    if moe_type == "temporal":
         moe_config = TemporalMoEConfig(**meta["moe_config"])
         TemporalMoEMixin.apply(base_model, moe_config)
+    elif moe_type == "deepseek":
+        moe_config = DeepSeekMoEConfig(**meta["moe_config"])
+        DeepSeekMoEMixin.apply(base_model, moe_config)
+    elif moe_type == "temporal-wrap":
+        moe_config = TemporalWrapConfig(**meta["moe_config"])
+        TemporalWrapMixin.apply(base_model, moe_config)
     else:
         moe_config = VanillaMoEConfig(**meta["moe_config"])
         VanillaMoEMixin.apply(base_model, moe_config)

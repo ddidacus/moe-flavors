@@ -30,7 +30,6 @@ if not hasattr(_gen_utils, "SampleOutput"):
 
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_scheduler
 
-from src.chunk_moe import MoEConfig as ChunkMoEConfig, MoEMixin as ChunkMoEMixin
 from src.deepseek_moe import MoEConfig as DeepSeekMoEConfig, MoEMixin as DeepSeekMoEMixin
 from src.temporal_moe import MoEConfig as TemporalMoEConfig, MoEMixin as TemporalMoEMixin
 from src.temporal_moe_wrapper import TemporalWrapConfig, TemporalWrapMixin
@@ -327,8 +326,8 @@ def _unwrap(model):
 
 def main():
     parser = argparse.ArgumentParser(description="MoE Mixin PoC")
-    parser.add_argument("--moe-type", choices=["vanilla", "temporal", "deepseek", "chunk", "temporal-wrap"], default="temporal",
-                        help="MoE variant: vanilla (plain top-k), deepseek (shared + routed), temporal (chunking), chunk (CLS-token router), or temporal-wrap (boundary routing over existing MoE experts)")
+    parser.add_argument("--moe-type", choices=["vanilla", "temporal", "deepseek", "temporal-wrap"], default="temporal",
+                        help="MoE variant: vanilla (plain top-k), deepseek (shared + routed), temporal (boundary-aware chunking), or temporal-wrap (boundary routing over existing MoE experts)")
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B", help="HF model id")
     parser.add_argument("--num-experts", type=int, default=8)
     parser.add_argument("--top-k", type=int, default=2)
@@ -457,19 +456,6 @@ def main():
             learnable_N=args.learnable_N,
         )
         TemporalMoEMixin.apply(model, moe_config)
-    elif args.moe_type == "chunk":
-        moe_config = ChunkMoEConfig(
-            num_experts=args.num_experts,
-            top_k=args.top_k,
-            ratio_loss_N=args.ratio_loss_N,
-            ratio_loss_alpha=args.ratio_loss_alpha,
-            entropy_threshold=args.entropy_threshold,
-            entropy_alpha=args.entropy_alpha,
-            expert_dim=args.expert_dim,
-            num_copies=args.num_copies,
-            learnable_N=args.learnable_N,
-        )
-        ChunkMoEMixin.apply(model, moe_config)
     elif args.moe_type == "deepseek":
         moe_config = DeepSeekMoEConfig(
             num_experts=args.num_experts,
@@ -567,12 +553,12 @@ def main():
     model.train()
     raw_model = _unwrap(model)
     num_moe_layers = len(raw_model._moe_layers)
-    if args.moe_type in ("temporal", "chunk", "temporal-wrap"):
+    if args.moe_type in ("temporal", "temporal-wrap"):
         ratio_loss_alpha = raw_model._moe_layers[0]._ratio_loss_alpha
     else:
         ratio_loss_alpha = None
 
-    entropy_alpha_target = args.entropy_alpha if args.moe_type in ("temporal", "chunk", "temporal-wrap") else 0.0
+    entropy_alpha_target = args.entropy_alpha if args.moe_type in ("temporal", "temporal-wrap") else 0.0
 
     step = start_step
     batches_per_step = args.gradient_accumulation_steps
@@ -593,7 +579,7 @@ def main():
         # iterate dataloader
         for x, y in pbar:
             with accelerator.accumulate(model):
-                if args.moe_type in ("temporal", "chunk", "temporal-wrap"):
+                if args.moe_type in ("temporal", "temporal-wrap"):
                     ea = entropy_alpha_target if step >= args.entropy_warmup_steps else 0.0
                     for m in raw_model._moe_layers:
                         m._entropy_alpha = ea
@@ -601,7 +587,7 @@ def main():
                 outputs = model(input_ids=x, labels=y)
                 aux_loss = raw_model.get_moe_loss()
 
-                if args.moe_type in ("temporal", "chunk", "temporal-wrap"):
+                if args.moe_type in ("temporal", "temporal-wrap"):
                     total_loss = outputs.loss
                     lm_loss = (total_loss - aux_loss).detach()
                 else:
@@ -675,7 +661,7 @@ def main():
                 model(input_ids=sub_x)
                 if accelerator.is_main_process:
                     for li in _pick_eval_layers(num_moe_layers):
-                        if args.moe_type in ("temporal", "chunk", "temporal-wrap"):
+                        if args.moe_type in ("temporal", "temporal-wrap"):
                             eval_boundaries(raw_model, tokenizer, sub_x, step,
                                             layer_idx=li, num_samples=n_eval)
                         else:

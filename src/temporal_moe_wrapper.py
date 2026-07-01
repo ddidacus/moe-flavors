@@ -37,7 +37,8 @@ class TemporalMoEWrapper(nn.Module):
         super().__init__()
         self.moe_block = original_moe_block
 
-        gate = original_moe_block.gate
+        gate = getattr(original_moe_block, 'gate', None) or original_moe_block.router
+        self._gate_attr = 'gate' if hasattr(original_moe_block, 'gate') else 'router'
         hidden_dim = gate.hidden_dim
         num_experts = gate.num_experts
         top_k = gate.top_k
@@ -129,7 +130,8 @@ class TemporalMoEWrapper(nn.Module):
 
         flat = hidden_states.view(-1, D)
 
-        _, routing_weights, selected_experts = self.moe_block.gate(flat)
+        gate = getattr(self.moe_block, self._gate_attr)
+        _, routing_weights, selected_experts = gate(flat)
 
         routing_weights, selected_experts = self._forward_fill(
             routing_weights, selected_experts, bt, B, L,
@@ -137,11 +139,12 @@ class TemporalMoEWrapper(nn.Module):
 
         expert_output = self.moe_block.experts(flat, selected_experts, routing_weights)
 
-        shared_output = self.moe_block.shared_expert(flat)
-        shared_output = (
-            F.sigmoid(self.moe_block.shared_expert_gate(flat)) * shared_output
-        )
-        expert_output = expert_output + shared_output
+        if hasattr(self.moe_block, 'shared_expert') and self.moe_block.shared_expert is not None:
+            shared_output = self.moe_block.shared_expert(flat)
+            if hasattr(self.moe_block, 'shared_expert_gate') and self.moe_block.shared_expert_gate is not None:
+                shared_output = F.sigmoid(self.moe_block.shared_expert_gate(flat)) * shared_output
+            expert_output = expert_output + shared_output
+
         output = expert_output.view(B, L, D)
 
         if self.training:
@@ -169,9 +172,13 @@ class TemporalWrapMixin:
     def apply(model, config: TemporalWrapConfig):
         decoder_layers = list(TemporalWrapMixin._find_decoder_layers(model))
 
+        def _is_moe_layer(layer):
+            has_gate = hasattr(layer.mlp, "gate") or hasattr(layer.mlp, "router")
+            return has_gate and hasattr(layer.mlp, "experts")
+
         moe_indices = [
             i for i, layer in enumerate(decoder_layers)
-            if hasattr(layer.mlp, "gate") and hasattr(layer.mlp, "experts")
+            if _is_moe_layer(layer)
         ]
 
         num_moe = len(moe_indices)
@@ -210,7 +217,7 @@ class TemporalWrapMixin:
             return output
         model.register_forward_hook(_inject_moe_loss)
 
-        gate = moe_layers[0].moe_block.gate
+        gate = getattr(moe_layers[0].moe_block, moe_layers[0]._gate_attr)
         print(
             f"[TemporalWrapMixin] Wrapped {num_moe} MoE layers "
             f"(experts={gate.num_experts}, top_k={gate.top_k})"

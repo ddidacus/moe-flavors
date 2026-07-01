@@ -1,41 +1,119 @@
 # MoE Playground
 
-Proof-of-concept for **Mixture-of-Experts (MoE)** applied to pretrained dense language models. Supports two MoE variants:
+Mixture-of-Experts experiments on the [nemotron-moe-exam](https://huggingface.co/datasets/ddidacus/nemotron-moe-exam) dataset. Four experiment families compare different MoE routing strategies: vanilla top-k, temporal boundary-aware chunking, DeepSeek-style shared+routed experts, and LoRA fine-tuning of a pre-trained MoE model with optional temporal wrapping.
 
-- **Temporal (chunking):** A learned chunking router detects segment boundaries in the token sequence via cosine distance and forward-fills routing decisions across each segment, so tokens within the same chunk share the same experts.
-- **Vanilla:** Standard per-token top-k gating with a load-balancing auxiliary loss.
+## Experiments
 
-## How it works
+### 1. Vanilla MoE
 
-1. A dense pretrained LM (default: Qwen3-0.6B) is loaded.
-2. Every FFN/MLP layer is replaced with an MoE layer containing N expert copies of the original FFN plus a router.
-3. **Temporal mode:** The `ChunkingRouter` computes boundary probabilities between adjacent tokens using learned query/key projections and cosine distance. Tokens where `p_t >= threshold` start a new segment; routing decisions are forward-filled within each segment via `cummax`. A **ratio loss** encourages the router to produce meaningful segmentation and is folded into the model's forward pass for clean DDP compatibility.
-4. **Vanilla mode:** A standard `Router` computes per-token top-k expert assignments with a Switch Transformer style load-balancing loss.
+Standard per-token top-k gating with a Switch Transformer load-balancing loss. Each FFN layer in a dense model (Qwen3-0.6B) is replaced with N small expert MLPs and a learned router.
 
-## Research questions
+```bash
+sbatch scripts/run_vanilla_moe.sh
+```
 
-1. **Performance degradation.** Do we observe any performance degradation with temporally consistent routing? (perplexity, eval harness performance)
-2. **Switch rates.** How do switch rates compare between vanilla MoE and temporally consistent MoE?
-3. **Routing patterns.** Can we observe routing patterns more consistently with temporally consistent MoEs?
+### 2. Temporal MoE
+
+Boundary-aware chunking router that detects segment boundaries in the token sequence via delta-state termination (option-critic style). Tokens within a segment share the same expert routing. A **ratio loss** encourages meaningful segmentation, with variable N per layer. Supports a **learnable-N** variant where N is optimized during training.
+
+```bash
+# Fixed N
+sbatch scripts/run_temporal_moe.sh
+
+# Learnable N variant
+LEARNABLE_N=1 sbatch scripts/run_temporal_moe.sh
+```
+
+### 3. DeepSeek-style MoE
+
+Combines always-active shared experts with top-k routed experts, following the DeepSeek MoE architecture. Shared experts process all tokens (no gating), while routed experts are selected per-token via top-k routing.
+
+```bash
+sbatch scripts/run_deepseek_moe.sh
+```
+
+### 4. Fine-tune pre-trained MoE (gpt-oss-20b + LoRA)
+
+LoRA fine-tuning of [openai/gpt-oss-20b](https://huggingface.co/openai/gpt-oss-20b) (32 experts, top-4, 20B params). Two variants: baseline LoRA fine-tuning, and LoRA + temporal boundary routing on top of the existing MoE experts.
+
+```bash
+# Baseline LoRA fine-tuning
+sbatch scripts/run_finetune_moe.sh
+
+# LoRA + temporal boundary routing
+TEMPORAL=1 sbatch scripts/run_finetune_moe.sh
+```
 
 ## Project structure
 
 ```
 src/
-  temporal_moe.py      # ChunkingRouter, ChunkingMoELayer, MoEMixin, MoEConfig
-  vanilla_moe.py       # Baseline top-k MoE (no chunking) for comparison
+  vanilla_moe.py           # Top-k MoE: Router, ExpertMLP, BatchedExperts, SegmentedExperts, MoEMixin
+  temporal_moe.py          # Temporal MoE: ChunkingRouter (delta-state termination), ratio loss, MoEMixin
+  deepseek_moe.py          # DeepSeek-style MoE: shared + routed experts, MoEMixin
+  temporal_moe_wrapper.py  # Wraps an existing HF MoE model to add temporal boundary routing
+
 scripts/
-  moe_mixin_poc.py     # Training script (Nemotron SFT data, wandb logging, boundary eval)
-  e2e_temporal.sh      # SLURM end-to-end: train temporal MoE + eval harness
-  e2e_vanilla.sh       # SLURM end-to-end: train vanilla MoE + eval harness
-  eval_harness.py      # Standalone evaluation of any saved checkpoint via lm-evaluation-harness
-  eval_baseline.sh     # SLURM eval of the dense baseline (Qwen3-0.6B, no MoE)
-  sweep_ratio_loss.sh  # Grid sweep over ratio_loss_N and ratio_loss_alpha
+  train_moe.py             # Training script for experiments 1-3 (MoE from scratch on a dense model)
+  finetune_moe.py          # Fine-tuning script for experiment 4 (LoRA + optional temporal wrapping)
+  eval_harness.py          # Evaluate any checkpoint via lm-evaluation-harness
+  run_vanilla_moe.sh       # SLURM: experiment 1
+  run_temporal_moe.sh      # SLURM: experiment 2 (set LEARNABLE_N=1 for learnable N variant)
+  run_deepseek_moe.sh      # SLURM: experiment 3
+  run_finetune_moe.sh      # SLURM: experiment 4 (set TEMPORAL=1 for temporal variant)
 ```
 
-## Dataset
+## How it works
 
-Training uses the [nvidia/Nemotron-Post-Training-Dataset-v2](https://huggingface.co/datasets/nvidia/Nemotron-Post-Training-Dataset-v2) SFT dataset (gated, requires HF access). Messages are concatenated into a single text per sample for causal LM training. Available splits: `code`, `math`, `stem`, `chat`, and multilingual variants.
+### MoE from scratch (experiments 1-3)
+
+1. A dense pretrained LM (Qwen3-0.6B) is loaded.
+2. Every FFN/MLP layer is replaced with an MoE layer: N expert MLPs + a router.
+3. The model is trained on nemotron-moe-exam with the MoE routing and any auxiliary losses.
+
+**Vanilla:** Per-token top-k routing with load-balancing auxiliary loss.
+
+**Temporal:** The `ChunkingRouter` computes boundary probabilities from delta states (consecutive hidden state differences). Positions where `p_t >= 0.5` start new segments; routing decisions are forward-filled within each segment via `cummax`. A ratio loss encourages the router to produce segments of target length N. The learnable-N variant optimizes N during training via a softplus-parameterized scalar per layer.
+
+**DeepSeek:** Shared experts (always-active, no gating) are combined with routed experts (top-k selected per token). The shared experts stabilize training while routed experts specialize.
+
+### LoRA fine-tuning (experiment 4)
+
+1. gpt-oss-20b is loaded with its existing MoE architecture intact (32 experts, top-4).
+2. LoRA adapters are applied to attention projections (`q_proj`, `k_proj`, `v_proj`, `o_proj`).
+3. Optionally, temporal boundary routing is wrapped around the existing MoE blocks — only the boundary prediction layers and LoRA adapters are trained; the original experts remain frozen.
+
+## Key arguments
+
+### `train_moe.py` (experiments 1-3)
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--moe-type` | `temporal` | `vanilla`, `temporal`, `deepseek`, or `temporal-wrap` |
+| `--model` | `Qwen/Qwen3-0.6B` | Base dense model to convert |
+| `--num-experts` | `8` | Number of expert MLPs per layer |
+| `--top-k` | `2` | Experts active per token |
+| `--expert-dim` | auto | Per-expert intermediate dim |
+| `--ratio-loss-N` | `3` | Target segment length (one per layer, or single value for all) |
+| `--learnable-N` | off | Make N a learnable parameter |
+| `--num-shared-experts` | `2` | Shared experts (DeepSeek mode only) |
+
+### `finetune_moe.py` (experiment 4)
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--model` | `openai/gpt-oss-20b` | Pre-trained MoE model |
+| `--temporal` | off | Add temporal boundary routing |
+| `--lora-r` | `32` | LoRA rank |
+| `--lora-alpha` | `64` | LoRA alpha |
+| `--lora-dropout` | `0.05` | LoRA dropout |
+| `--lora-target-modules` | `q/k/v/o_proj` | Modules to apply LoRA to |
+
+## Checkpointing and preemption
+
+All scripts handle SLURM preemption via `SIGUSR1`/`SIGTERM` signal handlers. When preempted, the current training state is saved. On resubmission, training resumes from the latest complete checkpoint (`--resume-from auto`). Checkpoints use a rotation policy (`keep_last=1`) to save disk space. Incomplete checkpoints (missing `.complete` marker) are skipped on resume.
+
+W&B run IDs are persisted in checkpoint metadata for seamless run continuation across preemptions.
 
 ## Setup
 
@@ -43,64 +121,10 @@ Training uses the [nvidia/Nemotron-Post-Training-Dataset-v2](https://huggingface
 uv sync
 ```
 
-## Running
-
-**End-to-end (SLURM) — train + eval:**
+## Evaluate a checkpoint
 
 ```bash
-sbatch scripts/e2e_temporal.sh   # temporal MoE
-sbatch scripts/e2e_vanilla.sh    # vanilla MoE
+python scripts/eval_harness.py --checkpoint-dir checkpoints/vanilla_moe_64e_k8/step_1000
 ```
 
-**Evaluate the dense baseline (no MoE):**
-
-```bash
-sbatch scripts/eval_baseline.sh
-```
-
-**Evaluate a saved checkpoint:**
-
-```bash
-python scripts/eval_harness.py --checkpoint-dir checkpoints/temporal_12345/step_30000
-```
-
-**Hyperparameter sweep (ratio loss):**
-
-```bash
-bash scripts/sweep_ratio_loss.sh
-```
-
-**Single GPU (manual):**
-
-```bash
-python scripts/moe_mixin_poc.py --moe-type temporal
-```
-
-**Key arguments** (see `scripts/moe_mixin_poc.py --help`):
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--moe-type` | `temporal` | MoE variant: `vanilla` or `temporal` |
-| `--model` | `Qwen/Qwen3-0.6B` | HuggingFace model to convert |
-| `--num-experts` | `8` | Number of expert copies per MLP layer |
-| `--top-k` | `2` | Experts active per token |
-| `--ratio-loss-N` | `3` | N parameter(s) for temporal ratio loss — one per layer, or a single value broadcast to all |
-| `--ratio-loss-alpha` | `0.3` | Weight for temporal ratio loss |
-| `--entropy-threshold` | `0.1` | Floor for p_t entropy penalty (0 disables) |
-| `--entropy-alpha` | `1.0` | Weight for entropy penalty |
-| `--entropy-warmup-steps` | `0` | Steps before enabling the entropy penalty |
-| `--dataset-splits` | `code` | Nemotron SFT splits (multiple allowed) |
-| `--num-samples` | `100000` | Number of samples to load |
-| `--seq-len` | `256` | Sequence length |
-| `--batch-size` | `16` | Per-device batch size |
-| `--num-steps` | `100000` | Total training steps |
-| `--lr` | `1e-4` | Learning rate |
-| `--log-every` | `10` | Steps between W&B metric logs |
-| `--eval-every` | `1000` | Steps between perplexity, harness, and visualization evals |
-| `--harness-tasks` | MMLU math subset | lm-eval-harness tasks to run during eval |
-| `--harness-limit` | `8` | Samples per harness task (during training evals) |
-| `--save-dir` | — | Directory for model checkpoints |
-| `--save-every` | `0` | Checkpoint interval (0 = only at end) |
-| `--wandb-run-name` | auto | Custom W&B run name |
-
-Training logs (loss curves, boundary visualizations, expert assignment plots, switch rates) are sent to [Weights & Biases](https://wandb.ai) under the `moe-chunking-poc` project.
+Metrics are logged to W&B and optionally saved as JSON (`--output-dir`).

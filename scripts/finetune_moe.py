@@ -4,6 +4,7 @@ import math
 import random
 import signal
 import sys
+from dataclasses import asdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -11,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tqdm import tqdm
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import wandb
 from accelerate import Accelerator
@@ -25,10 +27,15 @@ if not hasattr(_gen_utils, "SampleOutput"):
     _gen_utils.SampleOutput = type("SampleOutput", (), {})
 
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_scheduler
+from peft import LoraConfig, get_peft_model, TaskType
+
+from src.temporal_moe_wrapper import TemporalWrapConfig, TemporalWrapMixin
 
 
 def count_params(model):
-    return sum(p.numel() for p in model.parameters())
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return total, trainable
 
 
 def get_nemotron_loaders(tokenizer, seq_len, batch_size, dataset_name):
@@ -67,16 +74,21 @@ def get_nemotron_loaders(tokenizer, seq_len, batch_size, dataset_name):
     return train_loader, test_loader
 
 
-def save_checkpoint(model, tokenizer, save_dir, step, epoch, args, accelerator,
-                    keep_last=1):
+def save_checkpoint(model, tokenizer, save_dir, step, epoch, args,
+                    temporal_config, accelerator, keep_last=1):
     save_path = Path(save_dir) / f"step_{step}"
     save_path.mkdir(parents=True, exist_ok=True)
     if accelerator.is_main_process:
         meta = {
             "base_model": args.model,
+            "temporal": args.temporal,
             "step": step,
             "epoch": epoch,
+            "lora_r": args.lora_r,
+            "lora_alpha": args.lora_alpha,
         }
+        if temporal_config is not None:
+            meta["temporal_config"] = asdict(temporal_config)
         if wandb.run is not None:
             meta["wandb_run_id"] = wandb.run.id
         (save_path / "meta.json").write_text(json.dumps(meta, indent=2))
@@ -115,13 +127,11 @@ def find_latest_checkpoint(save_dir):
 
 
 @torch.no_grad()
-def eval_perplexity(model, test_loader, step, accelerator, n_batches=4):
-    device = next(model.parameters()).device
+def evaluate(model, test_loader, step, accelerator, n_batches=4, has_temporal=False):
     batches = list(test_loader)
     subset = random.sample(batches, min(n_batches, len(batches)))
     total_loss, total_tokens = 0.0, 0
     for x, y in subset:
-        x, y = x.to(device), y.to(device)
         logits = model(input_ids=x).logits
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
         total_loss += loss.item() * y.numel()
@@ -129,13 +139,24 @@ def eval_perplexity(model, test_loader, step, accelerator, n_batches=4):
     avg_loss = total_loss / total_tokens
     ppl = math.exp(avg_loss)
     if accelerator.is_main_process:
-        wandb.log({"eval/perplexity": ppl, "eval/lm_loss": avg_loss}, step=step)
+        metrics = {"eval/perplexity": ppl, "eval/lm_loss": avg_loss}
+        if has_temporal:
+            raw = accelerator.unwrap_model(model)
+            base = raw.base_model.model if hasattr(raw, 'base_model') else raw
+            if hasattr(base, '_moe_layers'):
+                for i, layer in enumerate(base._moe_layers):
+                    metrics[f"eval/layer_{i}/G_value"] = layer._last_G.item()
+                    metrics[f"eval/layer_{i}/F_value"] = layer._last_F.item()
+                    metrics[f"eval/layer_{i}/learned_N"] = layer.learned_N
+        wandb.log(metrics, step=step)
         print(f"eval perplexity (step {step}): {ppl:.2f}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Fine-tune Qwen1.5-MoE-A2.7B")
-    parser.add_argument("--model", default="Qwen/Qwen1.5-MoE-A2.7B", help="HF model id")
+    parser = argparse.ArgumentParser(
+        description="Fine-tune a pre-trained MoE LLM with LoRA, optionally adding temporal boundary routing"
+    )
+    parser.add_argument("--model", default="openai/gpt-oss-20b", help="HF model id")
     parser.add_argument("--dataset", type=str, default="ddidacus/nemotron-moe-exam")
     parser.add_argument("--seq-len", type=int, default=4096)
     parser.add_argument("--batch-size", type=int, default=1)
@@ -150,16 +171,34 @@ def main():
                         choices=["cosine", "linear", "constant", "constant_with_warmup"])
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--log-every", type=int, default=10)
-    parser.add_argument("--eval-every", type=int, default=500)
+    parser.add_argument("--eval-every", type=int, default=250)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--wandb-project", default="moe-chunking-poc")
     parser.add_argument("--wandb-run-name", type=str, default=None)
     parser.add_argument("--save-dir", type=str, default=None)
     parser.add_argument("--save-every", type=int, default=0)
     parser.add_argument("--resume-from", type=str, default=None,
-                        help="Checkpoint dir to resume from, or 'auto' to find latest in --save-dir")
-    args = parser.parse_args()
+                        help="Checkpoint dir or 'auto' to find latest in --save-dir")
 
+    lora_group = parser.add_argument_group("LoRA")
+    lora_group.add_argument("--lora-r", type=int, default=32, help="LoRA rank")
+    lora_group.add_argument("--lora-alpha", type=int, default=64, help="LoRA alpha")
+    lora_group.add_argument("--lora-dropout", type=float, default=0.05)
+    lora_group.add_argument("--lora-target-modules", nargs="+",
+                            default=["q_proj", "k_proj", "v_proj", "o_proj"],
+                            help="Modules to apply LoRA to")
+
+    temporal_group = parser.add_argument_group("Temporal MoE (optional)")
+    temporal_group.add_argument("--temporal", action="store_true",
+                                help="Add temporal boundary routing on top of existing MoE experts")
+    temporal_group.add_argument("--ratio-loss-N", type=int, nargs="+", default=[8],
+                                help="Target segment length N per MoE layer (single value = same for all)")
+    temporal_group.add_argument("--ratio-loss-alpha", type=float, default=0.03)
+    temporal_group.add_argument("--entropy-threshold", type=float, default=0.1)
+    temporal_group.add_argument("--entropy-alpha", type=float, default=0.05)
+    temporal_group.add_argument("--entropy-warmup-steps", type=int, default=500)
+
+    args = parser.parse_args()
     torch.manual_seed(args.seed)
 
     resume_ckpt = None
@@ -204,13 +243,40 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, dtype=torch.bfloat16, trust_remote_code=True,
+        args.model, torch_dtype=torch.bfloat16, trust_remote_code=True,
         low_cpu_mem_usage=True,
     )
+
+    temporal_config = None
+    if args.temporal:
+        temporal_config = TemporalWrapConfig(
+            ratio_loss_N=args.ratio_loss_N,
+            ratio_loss_alpha=args.ratio_loss_alpha,
+            entropy_threshold=args.entropy_threshold,
+            entropy_alpha=args.entropy_alpha,
+        )
+        TemporalWrapMixin.apply(model, temporal_config)
+        accelerator.print("[temporal] Boundary routing applied to MoE layers")
+
+    lora_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        target_modules=args.lora_target_modules,
+    )
+    model = get_peft_model(model, lora_config)
+
+    if args.temporal:
+        for name, param in model.named_parameters():
+            if "term_proj" in name or "_log_N" in name:
+                param.requires_grad = True
+
     model.gradient_checkpointing_enable()
 
-    total_params = count_params(model)
-    accelerator.print(f"Model parameters: {total_params:,}")
+    total, trainable = count_params(model)
+    accelerator.print(f"Total parameters: {total:,}")
+    accelerator.print(f"Trainable parameters: {trainable:,} ({100*trainable/total:.2f}%)")
 
     accelerator.print(f"Loading dataset {args.dataset} ...")
     loader, test_loader = get_nemotron_loaders(
@@ -218,7 +284,8 @@ def main():
     )
 
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=args.lr, weight_decay=args.weight_decay,
+        [p for p in model.parameters() if p.requires_grad],
+        lr=args.lr, weight_decay=args.weight_decay,
     )
 
     total_steps = len(loader) * args.num_epochs // args.gradient_accumulation_steps
@@ -257,7 +324,10 @@ def main():
             start_epoch = 0
 
     if accelerator.is_main_process:
-        wandb.log({"total_params": total_params}, step=0)
+        wandb.log({"total_params": total, "trainable_params": trainable}, step=0)
+
+    entropy_alpha_target = args.entropy_alpha if args.temporal else 0.0
+    entropy_warmup = args.entropy_warmup_steps
 
     _preempt_state = {"step": start_step, "epoch": start_epoch}
 
@@ -267,7 +337,8 @@ def main():
             f"\n[preemption] Signal {signum} received at step {s}, saving checkpoint..."
         )
         if args.save_dir:
-            save_checkpoint(model, tokenizer, args.save_dir, s, e, args, accelerator)
+            save_checkpoint(model, tokenizer, args.save_dir, s, e, args,
+                            temporal_config, accelerator)
         accelerator.end_training()
         sys.exit(0)
 
@@ -297,6 +368,11 @@ def main():
                 outputs = model(input_ids=x, labels=y)
                 loss = outputs.loss
 
+                if args.temporal:
+                    base = raw_model.base_model.model if hasattr(raw_model, 'base_model') else raw_model
+                    moe_loss = base.get_moe_loss()
+                    loss = loss + moe_loss
+
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
@@ -311,23 +387,39 @@ def main():
             _preempt_state["step"] = step
             _preempt_state["epoch"] = epoch
 
+            if args.temporal and entropy_warmup > 0:
+                frac = min(1.0, step / entropy_warmup)
+                base = raw_model.base_model.model if hasattr(raw_model, 'base_model') else raw_model
+                for m in base._moe_layers:
+                    m._entropy_alpha = entropy_alpha_target * frac
+
             if accelerator.is_main_process:
                 pbar.set_postfix(loss=f"{loss.item():.4f}", step=step)
 
                 if step % args.log_every == 0:
-                    wandb.log({
+                    log_dict = {
                         "train/loss": loss.item(),
                         "train/lr": lr_scheduler.get_last_lr()[0],
                         "train/epoch": epoch,
-                    }, step=step)
+                    }
+                    if args.temporal:
+                        base = raw_model.base_model.model if hasattr(raw_model, 'base_model') else raw_model
+                        if hasattr(base, '_moe_layers'):
+                            log_dict["train/moe_loss"] = moe_loss.item()
+                            for i, m in enumerate(base._moe_layers):
+                                log_dict[f"train/layer_{i}/G_value"] = m._last_G.item()
+                                log_dict[f"train/layer_{i}/F_value"] = m._last_F.item()
+                                log_dict[f"train/layer_{i}/learned_N"] = m.learned_N
+                    wandb.log(log_dict, step=step)
 
             if args.save_dir and args.save_every > 0 and step % args.save_every == 0:
                 save_checkpoint(model, tokenizer, args.save_dir, step, epoch, args,
-                                accelerator)
+                                temporal_config, accelerator)
 
             if step % args.eval_every == 0:
                 raw_model.eval()
-                eval_perplexity(raw_model, test_loader, step, accelerator)
+                evaluate(model, test_loader, step, accelerator,
+                         has_temporal=args.temporal)
                 raw_model.train()
 
             if args.num_steps and step >= args.num_steps:
@@ -338,23 +430,10 @@ def main():
     accelerator.print(f"\nTraining done ({step} steps).")
 
     if args.save_dir:
-        save_checkpoint(model, tokenizer, args.save_dir, step, epoch, args, accelerator)
+        save_checkpoint(model, tokenizer, args.save_dir, step, epoch, args,
+                        temporal_config, accelerator)
         if accelerator.is_main_process:
             (Path(args.save_dir) / "COMPLETED").write_text(f"step={step}\n")
-
-    try:
-        raw_model.eval()
-        prompt = "The mixture of experts architecture"
-        inputs = tokenizer(prompt, return_tensors="pt").to(accelerator.device)
-        with torch.no_grad():
-            out = raw_model.generate(**inputs, max_new_tokens=50, do_sample=False)
-        if accelerator.is_main_process:
-            gen_text = tokenizer.decode(out[0], skip_special_tokens=True)
-            print(f"Prompt:     {prompt!r}")
-            print(f"Generation: {gen_text!r}")
-            wandb.log({"final/generation": wandb.Html(f"<pre>{gen_text}</pre>")}, step=step)
-    except RuntimeError as e:
-        accelerator.print(f"[WARNING] Generation failed (expected with FSDP): {e}")
 
     accelerator.end_training()
 

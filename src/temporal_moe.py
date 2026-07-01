@@ -15,6 +15,7 @@ class MoEConfig:
     entropy_alpha: float = 1.0
     expert_dim: int | None = None
     num_copies: int = 0
+    learnable_N: bool = False
 
     def __post_init__(self):
         if isinstance(self.ratio_loss_N, int):
@@ -149,16 +150,27 @@ class ChunkingMoELayer(nn.Module):
         self._ratio_loss_alpha = config.ratio_loss_alpha
         self._entropy_threshold = config.entropy_threshold
         self._entropy_alpha = config.entropy_alpha
-        self._N = N
+        self._learnable_N = config.learnable_N
+        if config.learnable_N:
+            raw = torch.log(torch.tensor(float(N) - 1.0).exp() - 1.0)
+            self._log_N = nn.Parameter(raw.to(device=device, dtype=torch.float32))
+        else:
+            self._N = N
         self._ratio_loss = torch.tensor(0.0, device=device, dtype=dtype)
         self._padding_mask = None
+
+    @property
+    def learned_N(self) -> float:
+        if self._learnable_N:
+            return 1.0 + F.softplus(self._log_N).item()
+        return float(self._N)
 
     @property
     def ratio_loss(self) -> torch.Tensor:
         return self._ratio_loss
 
     def _compute_ratio_loss(self, p_t, b_t) -> torch.Tensor:
-        N = self._N
+        N = 1.0 + F.softplus(self._log_N) if self._learnable_N else self._N
         mask = self._padding_mask
         F_val = b_t.float().detach()
         G = p_t

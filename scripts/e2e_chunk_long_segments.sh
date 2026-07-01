@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH --job-name=e2e_temporal_longseg
-#SBATCH --output=e2e_temporal_longseg_%j.out
+#SBATCH --job-name=e2e_chunk_longseg
+#SBATCH --output=e2e_chunk_longseg_%j.out
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
 #SBATCH --gres=gpu:80gb:4
@@ -12,14 +12,14 @@ export HF_HOME=/home/mila/d/diego.calanzone/scratch/cache
 export UV_CACHE_DIR=/home/mila/d/diego.calanzone/scratch/cache
 export PYTHONDONTWRITEBYTECODE=1
 
-SAVE_DIR="checkpoints/temporal_64e_k8_long_segments"
+SAVE_DIR="checkpoints/chunk_64e_k8_long_segments"
 
 # ── Training ──
-# Target segment lengths linearly spaced from 64 to 4096 across 28 layers
-# N = seq_len / seg_len (rounded), no regularizers (LM loss only)
+# Same hparams as temporal long segments, but with chunk MoE architecture
+# (bidirectional boundary detector + CLS-token router)
 
 accelerate launch --multi_gpu --num_processes=4 scripts/moe_mixin_poc.py \
-    --moe-type temporal \
+    --moe-type chunk \
     --model Qwen/Qwen3-0.6B \
     --num-experts 64 \
     --top-k 8 \
@@ -41,7 +41,7 @@ accelerate launch --multi_gpu --num_processes=4 scripts/moe_mixin_poc.py \
     --eval-every 500 \
     --seed 42 \
     --wandb-project moe-chunking-poc \
-    --wandb-run-name temporal-qwen0.6b-64e-k8-longseg \
+    --wandb-run-name chunk-qwen0.6b-64e-k8-longseg \
     --save-dir "$SAVE_DIR" \
     --save-every 500 \
     --resume-from auto

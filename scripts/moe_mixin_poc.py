@@ -33,6 +33,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, get_scheduler
 from src.chunk_moe import MoEConfig as ChunkMoEConfig, MoEMixin as ChunkMoEMixin
 from src.deepseek_moe import MoEConfig as DeepSeekMoEConfig, MoEMixin as DeepSeekMoEMixin
 from src.temporal_moe import MoEConfig as TemporalMoEConfig, MoEMixin as TemporalMoEMixin
+from src.temporal_moe_wrapper import TemporalWrapConfig, TemporalWrapMixin
 from src.vanilla_moe import MoEConfig as VanillaMoEConfig, MoEMixin as VanillaMoEMixin
 
 
@@ -232,14 +233,10 @@ def eval_expert_assignments(model, tokenizer, sub_x, step, layer_idx=0):
 
 
 def save_checkpoint(model, tokenizer, save_dir, step, epoch, args, moe_config,
-                    accelerator):
+                    accelerator, keep_last=1):
     save_path = Path(save_dir) / f"step_{step}"
     save_path.mkdir(parents=True, exist_ok=True)
-    accelerator.wait_for_everyone()
-    unwrapped = accelerator.unwrap_model(model)
     if accelerator.is_main_process:
-        unwrapped.save_pretrained(save_path)
-        tokenizer.save_pretrained(save_path)
         meta = {
             "base_model": args.model,
             "moe_type": args.moe_type,
@@ -247,12 +244,30 @@ def save_checkpoint(model, tokenizer, save_dir, step, epoch, args, moe_config,
             "step": step,
             "epoch": epoch,
         }
+        if wandb.run is not None:
+            meta["wandb_run_id"] = wandb.run.id
         (save_path / "moe_meta.json").write_text(json.dumps(meta, indent=2))
-    accelerator.save_state(str(save_path / "accelerator_state"))
     accelerator.wait_for_everyone()
+    accelerator.save_state(str(save_path / "accelerator_state"))
     if accelerator.is_main_process:
+        tokenizer.save_pretrained(save_path)
         (save_path / ".complete").write_text("")
+    accelerator.wait_for_everyone()
     accelerator.print(f"[checkpoint] Saved to {save_path}")
+    if accelerator.is_main_process:
+        _rotate_checkpoints(Path(save_dir), keep_last, accelerator)
+
+
+def _rotate_checkpoints(save_dir, keep_last, accelerator):
+    import shutil
+    ckpts = sorted(
+        [p for p in save_dir.glob("step_*") if (p / ".complete").exists()],
+        key=lambda p: int(p.name.split("_")[1]),
+    )
+    while len(ckpts) > keep_last:
+        old = ckpts.pop(0)
+        shutil.rmtree(old)
+        accelerator.print(f"[checkpoint] Rotated out {old}")
 
 
 def find_latest_checkpoint(save_dir):
@@ -267,7 +282,7 @@ def find_latest_checkpoint(save_dir):
 
 
 @torch.no_grad()
-def eval_perplexity(model, test_loader, step, n_batches=4):
+def eval_perplexity(model, test_loader, step, accelerator, n_batches=4):
     device = next(model.parameters()).device
     batches = list(test_loader)
     subset = random.sample(batches, min(n_batches, len(batches)))
@@ -280,14 +295,15 @@ def eval_perplexity(model, test_loader, step, n_batches=4):
         total_tokens += y.numel()
     avg_loss = total_loss / total_tokens
     ppl = math.exp(avg_loss)
-    wandb.log({"eval/perplexity": ppl, "eval/lm_loss": avg_loss}, step=step)
-    print(f"eval perplexity (step {step}): {ppl:.2f}")
+    if accelerator.is_main_process:
+        wandb.log({"eval/perplexity": ppl, "eval/lm_loss": avg_loss}, step=step)
+        print(f"eval perplexity (step {step}): {ppl:.2f}")
 
 
 @torch.no_grad()
-def evaluate(model, test_loader, step):
+def evaluate(model, test_loader, step, accelerator):
     model.eval()
-    eval_perplexity(model, test_loader, step)
+    eval_perplexity(model, test_loader, step, accelerator)
     model.train()
 
 
@@ -311,8 +327,8 @@ def _unwrap(model):
 
 def main():
     parser = argparse.ArgumentParser(description="MoE Mixin PoC")
-    parser.add_argument("--moe-type", choices=["vanilla", "temporal", "deepseek", "chunk"], default="temporal",
-                        help="MoE variant: vanilla (plain top-k), deepseek (shared + routed), temporal (chunking), or chunk (CLS-token router)")
+    parser.add_argument("--moe-type", choices=["vanilla", "temporal", "deepseek", "chunk", "temporal-wrap"], default="temporal",
+                        help="MoE variant: vanilla (plain top-k), deepseek (shared + routed), temporal (chunking), chunk (CLS-token router), or temporal-wrap (boundary routing over existing MoE experts)")
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B", help="HF model id")
     parser.add_argument("--num-experts", type=int, default=8)
     parser.add_argument("--top-k", type=int, default=2)
@@ -334,6 +350,8 @@ def main():
                         help="Weight for entropy penalty")
     parser.add_argument("--entropy-warmup-steps", type=int, default=0,
                         help="Steps to keep entropy alpha at zero before enabling")
+    parser.add_argument("--learnable-N", action="store_true",
+                        help="Make ratio_loss_N a learnable parameter (initial value from --ratio-loss-N)")
     parser.add_argument("--seq-len", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1,
@@ -397,7 +415,13 @@ def main():
     if args.wandb_run_name:
         wandb_kwargs["name"] = args.wandb_run_name
     if resume_ckpt:
-        wandb_kwargs["resume"] = "allow"
+        try:
+            meta = json.loads((resume_ckpt / "moe_meta.json").read_text())
+            if "wandb_run_id" in meta:
+                wandb_kwargs["id"] = meta["wandb_run_id"]
+                wandb_kwargs["resume"] = "must"
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
     accelerator.init_trackers(
         args.wandb_project, config=vars(args),
         init_kwargs={"wandb": wandb_kwargs},
@@ -412,7 +436,8 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, dtype=torch.bfloat16, trust_remote_code=True
+        args.model, dtype=torch.bfloat16, trust_remote_code=True,
+        low_cpu_mem_usage=True,
     )
     dense_params = count_params(model)
     accelerator.print(f"Dense model parameters: {dense_params:,}")
@@ -429,6 +454,7 @@ def main():
             entropy_alpha=args.entropy_alpha,
             expert_dim=args.expert_dim,
             num_copies=args.num_copies,
+            learnable_N=args.learnable_N,
         )
         TemporalMoEMixin.apply(model, moe_config)
     elif args.moe_type == "chunk":
@@ -441,6 +467,7 @@ def main():
             entropy_alpha=args.entropy_alpha,
             expert_dim=args.expert_dim,
             num_copies=args.num_copies,
+            learnable_N=args.learnable_N,
         )
         ChunkMoEMixin.apply(model, moe_config)
     elif args.moe_type == "deepseek":
@@ -453,6 +480,15 @@ def main():
             num_copies=args.num_copies,
         )
         DeepSeekMoEMixin.apply(model, moe_config)
+    elif args.moe_type == "temporal-wrap":
+        moe_config = TemporalWrapConfig(
+            ratio_loss_N=args.ratio_loss_N,
+            ratio_loss_alpha=args.ratio_loss_alpha,
+            entropy_threshold=args.entropy_threshold,
+            entropy_alpha=args.entropy_alpha,
+            learnable_N=args.learnable_N,
+        )
+        TemporalWrapMixin.apply(model, moe_config)
     else:
         moe_config = VanillaMoEConfig(
             num_experts=args.num_experts,
@@ -496,12 +532,18 @@ def main():
     start_epoch = 0
     start_step = 0
     if resume_ckpt:
-        accelerator.print(f"Restoring training state from {resume_ckpt} ...")
-        accelerator.load_state(str(resume_ckpt / "accelerator_state"))
-        meta = json.loads((resume_ckpt / "moe_meta.json").read_text())
-        start_step = meta["step"]
-        start_epoch = meta.get("epoch", 0)
-        accelerator.print(f"Resumed at step={start_step}, epoch={start_epoch}")
+        try:
+            accelerator.print(f"Restoring training state from {resume_ckpt} ...")
+            accelerator.load_state(str(resume_ckpt / "accelerator_state"))
+            meta = json.loads((resume_ckpt / "moe_meta.json").read_text())
+            start_step = meta["step"]
+            start_epoch = meta.get("epoch", 0)
+            accelerator.print(f"Resumed at step={start_step}, epoch={start_epoch}")
+        except (RuntimeError, FileNotFoundError) as e:
+            accelerator.print(f"[WARNING] Failed to load checkpoint {resume_ckpt}: {e}")
+            accelerator.print("Starting training from scratch.")
+            start_step = 0
+            start_epoch = 0
 
     if accelerator.is_main_process:
         wandb.log({"dense_params": dense_params, "moe_params": moe_params}, step=0)
@@ -525,12 +567,12 @@ def main():
     model.train()
     raw_model = _unwrap(model)
     num_moe_layers = len(raw_model._moe_layers)
-    if args.moe_type in ("temporal", "chunk"):
+    if args.moe_type in ("temporal", "chunk", "temporal-wrap"):
         ratio_loss_alpha = raw_model._moe_layers[0]._ratio_loss_alpha
     else:
         ratio_loss_alpha = None
 
-    entropy_alpha_target = args.entropy_alpha if args.moe_type in ("temporal", "chunk") else 0.0
+    entropy_alpha_target = args.entropy_alpha if args.moe_type in ("temporal", "chunk", "temporal-wrap") else 0.0
 
     step = start_step
     batches_per_step = args.gradient_accumulation_steps
@@ -551,7 +593,7 @@ def main():
         # iterate dataloader
         for x, y in pbar:
             with accelerator.accumulate(model):
-                if args.moe_type in ("temporal", "chunk"):
+                if args.moe_type in ("temporal", "chunk", "temporal-wrap"):
                     ea = entropy_alpha_target if step >= args.entropy_warmup_steps else 0.0
                     for m in raw_model._moe_layers:
                         m._entropy_alpha = ea
@@ -559,7 +601,7 @@ def main():
                 outputs = model(input_ids=x, labels=y)
                 aux_loss = raw_model.get_moe_loss()
 
-                if args.moe_type in ("temporal", "chunk"):
+                if args.moe_type in ("temporal", "chunk", "temporal-wrap"):
                     total_loss = outputs.loss
                     lm_loss = (total_loss - aux_loss).detach()
                 else:
@@ -607,6 +649,12 @@ def main():
                         metrics["train/G_value"] = avg_G
                         metrics["train/F_value"] = avg_F
                         metrics["train/pt_entropy"] = avg_pt_entropy
+                    if args.learnable_N:
+                        for li, m in enumerate(raw_model._moe_layers):
+                            metrics[f"train/learned_N_layer_{li}"] = m.learned_N
+                        metrics["train/learned_N_avg"] = sum(
+                            m.learned_N for m in raw_model._moe_layers
+                        ) / num_moe_layers
                     wandb.log(metrics, step=step)
 
             # save checkpoint (before eval so OOM in eval doesn't lose progress)
@@ -615,23 +663,24 @@ def main():
                                 moe_config, accelerator)
 
             # evaluation plots
-            if accelerator.is_main_process and step % args.eval_every == 0:
+            if step % args.eval_every == 0:
                 raw_model.eval()
 
-                # perplexity
-                evaluate(raw_model, test_loader, step)
+                # perplexity (all ranks participate in forward pass)
+                evaluate(model, test_loader, step, accelerator)
 
                 # plot boundaries for random batch
                 n_eval = min(16, x.shape[0])
                 sub_x = x[random.sample(range(x.shape[0]), n_eval)]
-                raw_model(input_ids=sub_x)
-                for li in _pick_eval_layers(num_moe_layers):
-                    if args.moe_type in ("temporal", "chunk"):
-                        eval_boundaries(raw_model, tokenizer, sub_x, step,
-                                        layer_idx=li, num_samples=n_eval)
-                    else:
-                        eval_expert_assignments(raw_model, tokenizer, sub_x,
-                                                step, layer_idx=li)
+                model(input_ids=sub_x)
+                if accelerator.is_main_process:
+                    for li in _pick_eval_layers(num_moe_layers):
+                        if args.moe_type in ("temporal", "chunk", "temporal-wrap"):
+                            eval_boundaries(raw_model, tokenizer, sub_x, step,
+                                            layer_idx=li, num_samples=n_eval)
+                        else:
+                            eval_expert_assignments(raw_model, tokenizer, sub_x,
+                                                    step, layer_idx=li)
                 raw_model.train()
 
             if args.num_steps and step >= args.num_steps:
@@ -648,16 +697,19 @@ def main():
             (Path(args.save_dir) / "COMPLETED").write_text(f"step={step}\n")
 
     # final inspection
-    if accelerator.is_main_process:
+    try:
         raw_model.eval()
         prompt = "The mixture of experts architecture"
         inputs = tokenizer(prompt, return_tensors="pt").to(accelerator.device)
         with torch.no_grad():
             out = raw_model.generate(**inputs, max_new_tokens=50, do_sample=False)
-        gen_text = tokenizer.decode(out[0], skip_special_tokens=True)
-        print(f"Prompt:     {prompt!r}")
-        print(f"Generation: {gen_text!r}")
-        wandb.log({"final/generation": wandb.Html(f"<pre>{gen_text}</pre>")}, step=step)
+        if accelerator.is_main_process:
+            gen_text = tokenizer.decode(out[0], skip_special_tokens=True)
+            print(f"Prompt:     {prompt!r}")
+            print(f"Generation: {gen_text!r}")
+            wandb.log({"final/generation": wandb.Html(f"<pre>{gen_text}</pre>")}, step=step)
+    except RuntimeError as e:
+        accelerator.print(f"[WARNING] Generation failed (expected with FSDP): {e}")
 
     accelerator.end_training()
 

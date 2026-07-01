@@ -11,3 +11,4 @@ eval_results
 data/
 results/
 .job_monitor_state.json
+logs

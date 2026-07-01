@@ -8,10 +8,11 @@
 #SBATCH --time=12:00:00
 
 source .venv/bin/activate
-export HF_HOME=/home/mila/d/diego.calanzone/scratch/cache
-export UV_CACHE_DIR=/home/mila/d/diego.calanzone/scratch/cache
-export PYTHONDONTWRITEBYTECODE=1
+#export HF_HOME=/home/mila/d/diego.calanzone/scratch/cache
+#export UV_CACHE_DIR=/home/mila/d/diego.calanzone/scratch/cache
+#export PYTHONDONTWRITEBYTECODE=1
 
+mkdir -p checkpoints
 SAVE_DIR="checkpoints/temporal_64e_k8_long_segments"
 
 # ── Training ──

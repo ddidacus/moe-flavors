@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=ft_gptoss
 #SBATCH --output=ft_gptoss_%j.out
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=0
-#SBATCH --gres=gpu:80gb:4
+#SBATCH --cpus-per-task=24
+#SBATCH --mem=200G
+#SBATCH --gres=gpu:a100l:4
 #SBATCH --partition=short-unkillable
 #SBATCH --time=3:00:00
 #SBATCH --signal=B:USR1@120
@@ -28,19 +28,9 @@ else
     EXTRA_ARGS=""
 fi
 
-FSDP_FLAGS="--use_fsdp \
-    --fsdp_sharding_strategy FULL_SHARD \
-    --fsdp_auto_wrap_policy TRANSFORMER_BASED_WRAP \
-    --fsdp_transformer_layer_cls_to_wrap GptOssDecoderLayer \
-    --fsdp_backward_prefetch BACKWARD_PRE \
-    --fsdp_state_dict_type FULL_STATE_DICT \
-    --fsdp_offload_params true \
-    --fsdp_use_orig_params true"
-
 accelerate launch \
-    $FSDP_FLAGS \
+    --multi_gpu \
     --num_processes 4 \
-    --mixed_precision bf16 \
     scripts/finetune_moe.py \
     --model openai/gpt-oss-20b \
     --dataset ddidacus/nemotron-moe-exam \

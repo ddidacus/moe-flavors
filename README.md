@@ -65,11 +65,13 @@ scripts/
 
 ## How it works
 
-### MoE from scratch (experiments 1-3)
+### MoE upcycling (experiments 1-3)
 
-1. A dense pretrained LM (Qwen3-0.6B) is loaded.
-2. Every FFN/MLP layer is replaced with an MoE layer: N expert MLPs + a router.
-3. The model is trained on nemotron-moe-exam with the MoE routing and any auxiliary losses.
+Experiments 1-3 **upcycle** a dense pretrained LM (Qwen3-0.6B) into an MoE model via expert segmentation — they do **not** reinitialize FFN weights from scratch.
+
+1. A dense pretrained LM is loaded.
+2. Every FFN/MLP layer is replaced with an MoE layer using **segmented experts**: the original FFN weight matrices (`gate_proj`, `up_proj`, `down_proj`) are replicated N times (with small noise perturbation) and then carved into virtual experts along the intermediate dimension. Each virtual expert is a contiguous slice of `expert_dim` neurons from the concatenated weight matrices, preserving the original gated MLP pattern. This means expert weights start from the pretrained FFN — not random initialization.
+3. A learned router selects top-k experts per token. The model is then trained on nemotron-moe-exam with the MoE routing and any auxiliary losses.
 
 **Vanilla:** Per-token top-k routing with load-balancing auxiliary loss.
 

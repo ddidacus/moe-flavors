@@ -45,6 +45,11 @@ class TemporalMoEWrapper(nn.Module):
         dtype = gate.weight.dtype
         device = gate.weight.device
 
+        with torch.no_grad():
+            dummy = torch.zeros(1, 1, hidden_dim, dtype=dtype, device=device)
+            result = original_moe_block(dummy)
+            self._returns_tuple = isinstance(result, tuple)
+
         self.term_proj1 = nn.Linear(hidden_dim, hidden_dim, dtype=dtype, device=device)
         self.term_proj2 = nn.Linear(hidden_dim, 1, dtype=dtype, device=device)
         self._boundary_threshold = 0.5
@@ -158,6 +163,8 @@ class TemporalMoEWrapper(nn.Module):
         pt_f32 = pt.detach().float().clamp(1e-6, 1 - 1e-6)
         self._last_pt_entropy = -(pt_f32 * pt_f32.log() + (1 - pt_f32) * (1 - pt_f32).log()).mean()
 
+        if self._returns_tuple:
+            return output, routing_weights
         return output
 
 

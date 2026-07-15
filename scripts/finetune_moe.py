@@ -75,7 +75,8 @@ def get_nemotron_loaders(tokenizer, seq_len, batch_size, dataset_name):
 
 
 def save_checkpoint(model, tokenizer, save_dir, step, epoch, args,
-                    temporal_config, accelerator, keep_last=1):
+                    temporal_config, accelerator, optimizer=None,
+                    lr_scheduler=None, keep_last=1):
     save_path = Path(save_dir) / f"step_{step}"
     save_path.mkdir(parents=True, exist_ok=True)
     if accelerator.is_main_process:
@@ -93,8 +94,16 @@ def save_checkpoint(model, tokenizer, save_dir, step, epoch, args,
             meta["wandb_run_id"] = wandb.run.id
         (save_path / "meta.json").write_text(json.dumps(meta, indent=2))
     accelerator.wait_for_everyone()
-    accelerator.save_state(str(save_path / "accelerator_state"))
     if accelerator.is_main_process:
+        raw = accelerator.unwrap_model(model)
+        raw.save_pretrained(save_path / "adapter")
+        # Save temporal params separately if present
+        temporal_state = {k: v.cpu() for k, v in raw.state_dict().items()
+                         if "term_proj" in k or "_log_N" in k}
+        if temporal_state:
+            torch.save(temporal_state, save_path / "temporal_params.pt")
+        torch.save(optimizer.state_dict(), save_path / "optimizer.pt")
+        torch.save(lr_scheduler.state_dict(), save_path / "scheduler.pt")
         tokenizer.save_pretrained(save_path)
         (save_path / ".complete").write_text("")
     accelerator.wait_for_everyone()
@@ -121,7 +130,9 @@ def find_latest_checkpoint(save_dir):
         return None
     ckpts = sorted(save_dir.glob("step_*"), key=lambda p: int(p.name.split("_")[1]))
     for ckpt in reversed(ckpts):
-        if (ckpt / ".complete").exists() and (ckpt / "accelerator_state").exists():
+        has_new = (ckpt / ".complete").exists() and (ckpt / "adapter").exists()
+        has_old = (ckpt / ".complete").exists() and (ckpt / "accelerator_state").exists()
+        if has_new or has_old:
             return ckpt
     return None
 
@@ -217,6 +228,7 @@ def main():
     accelerator = Accelerator(
         log_with="wandb",
         gradient_accumulation_steps=args.gradient_accumulation_steps,
+        mixed_precision="bf16",
     )
 
     wandb_kwargs = {}
@@ -311,11 +323,41 @@ def main():
     start_step = 0
     if resume_ckpt:
         try:
-            accelerator.print(f"Restoring training state from {resume_ckpt} ...")
-            accelerator.load_state(str(resume_ckpt / "accelerator_state"))
             meta = json.loads((resume_ckpt / "meta.json").read_text())
             start_step = meta["step"]
             start_epoch = meta.get("epoch", 0)
+            if (resume_ckpt / "adapter").exists():
+                accelerator.print(f"Restoring adapter weights from {resume_ckpt} ...")
+                raw = accelerator.unwrap_model(model)
+                from peft import set_peft_model_state_dict
+                from safetensors.torch import load_file
+                sf_path = resume_ckpt / "adapter" / "adapter_model.safetensors"
+                if sf_path.exists():
+                    adapter_state = load_file(str(sf_path))
+                else:
+                    adapter_state = torch.load(
+                        resume_ckpt / "adapter" / "adapter_model.bin",
+                        map_location="cpu", weights_only=True)
+                set_peft_model_state_dict(raw, adapter_state)
+                if (resume_ckpt / "temporal_params.pt").exists():
+                    temporal_state = torch.load(
+                        resume_ckpt / "temporal_params.pt", map_location="cpu",
+                        weights_only=True)
+                    raw.load_state_dict(temporal_state, strict=False)
+                    accelerator.print(f"  Loaded {len(temporal_state)} temporal params")
+                if (resume_ckpt / "optimizer.pt").exists():
+                    opt_state = torch.load(
+                        resume_ckpt / "optimizer.pt", map_location="cpu",
+                        weights_only=True)
+                    optimizer.load_state_dict(opt_state)
+                if (resume_ckpt / "scheduler.pt").exists():
+                    sched_state = torch.load(
+                        resume_ckpt / "scheduler.pt", map_location="cpu",
+                        weights_only=True)
+                    lr_scheduler.load_state_dict(sched_state)
+            else:
+                accelerator.print(f"Restoring from legacy accelerator state ...")
+                accelerator.load_state(str(resume_ckpt / "accelerator_state"))
             accelerator.print(f"Resumed at step={start_step}, epoch={start_epoch}")
         except (RuntimeError, FileNotFoundError) as e:
             accelerator.print(f"[WARNING] Failed to load checkpoint {resume_ckpt}: {e}")
@@ -338,7 +380,8 @@ def main():
         )
         if args.save_dir:
             save_checkpoint(model, tokenizer, args.save_dir, s, e, args,
-                            temporal_config, accelerator)
+                            temporal_config, accelerator,
+                            optimizer=optimizer, lr_scheduler=lr_scheduler)
         accelerator.end_training()
         sys.exit(0)
 
@@ -414,7 +457,8 @@ def main():
 
             if args.save_dir and args.save_every > 0 and step % args.save_every == 0:
                 save_checkpoint(model, tokenizer, args.save_dir, step, epoch, args,
-                                temporal_config, accelerator)
+                                temporal_config, accelerator,
+                                optimizer=optimizer, lr_scheduler=lr_scheduler)
 
             if step % args.eval_every == 0:
                 raw_model.eval()
@@ -431,7 +475,8 @@ def main():
 
     if args.save_dir:
         save_checkpoint(model, tokenizer, args.save_dir, step, epoch, args,
-                        temporal_config, accelerator)
+                        temporal_config, accelerator,
+                        optimizer=optimizer, lr_scheduler=lr_scheduler)
         if accelerator.is_main_process:
             (Path(args.save_dir) / "COMPLETED").write_text(f"step={step}\n")
 

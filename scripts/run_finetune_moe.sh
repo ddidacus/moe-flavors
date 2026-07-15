@@ -32,11 +32,11 @@ accelerate launch \
     --multi_gpu \
     --num_processes 4 \
     scripts/finetune_moe.py \
-    --model openai/gpt-oss-20b \
+    --model allenai/OLMoE-1B-7B-0924 \
     --dataset ddidacus/nemotron-moe-exam \
     --seq-len 4096 \
-    --batch-size 1 \
-    --gradient-accumulation-steps 16 \
+    --batch-size 4 \
+    --gradient-accumulation-steps 4 \
     --num-epochs 1 \
     --num-steps 500 \
     --lr 2e-5 \

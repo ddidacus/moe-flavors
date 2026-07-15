@@ -12,6 +12,8 @@ class TemporalWrapConfig:
     entropy_threshold: float = 0.1
     entropy_alpha: float = 1.0
     learnable_N: bool = False
+    ste: bool = False  # straight-through boundary: no ratio/entropy losses;
+                       # gradients reach term_proj through the mixed output
 
     def __post_init__(self):
         if isinstance(self.ratio_loss_N, int):
@@ -39,8 +41,10 @@ class TemporalMoEWrapper(nn.Module):
 
         gate = getattr(original_moe_block, 'gate', None) or original_moe_block.router
         self._gate_attr = 'gate' if hasattr(original_moe_block, 'gate') else 'router'
-        hidden_dim = gate.hidden_dim
-        num_experts = gate.num_experts
+        # OlmoeTopKRouter exposes hidden_dim/num_experts; PhimoeTopKRouter is
+        # a plain nn.Linear(hidden, num_experts) -> fall back to Linear attrs.
+        hidden_dim = getattr(gate, 'hidden_dim', None) or gate.in_features
+        num_experts = getattr(gate, 'num_experts', None) or gate.out_features
         top_k = gate.top_k
         dtype = gate.weight.dtype
         device = gate.weight.device
@@ -61,6 +65,7 @@ class TemporalMoEWrapper(nn.Module):
         self._entropy_threshold = config.entropy_threshold
         self._entropy_alpha = config.entropy_alpha
         self._learnable_N = config.learnable_N
+        self._ste = config.ste
         if config.learnable_N:
             raw = torch.log(torch.tensor(float(N) - 1.0).exp() - 1.0)
             self._log_N = nn.Parameter(raw.to(device=device, dtype=torch.float32))
@@ -109,6 +114,11 @@ class TemporalMoEWrapper(nn.Module):
     def _compute_ratio_loss(self, p_t, b_t):
         N = 1.0 + F.softplus(self._log_N) if self._learnable_N else self._N
         mask = self._padding_mask
+        # Incremental decoding passes 1-token windows while the captured
+        # attention mask spans the full sequence; skip masking when unaligned
+        # (these transient values are recomputed by the full-length forward).
+        if mask is not None and mask.shape[-1] != p_t.shape[-1]:
+            mask = None
         F_val = b_t.float().detach()
         G = p_t
         if mask is not None:
@@ -136,13 +146,24 @@ class TemporalMoEWrapper(nn.Module):
         flat = hidden_states.view(-1, D)
 
         gate = getattr(self.moe_block, self._gate_attr)
-        _, routing_weights, selected_experts = gate(flat)
+        _, rw_fresh, se_fresh = gate(flat)
 
         routing_weights, selected_experts = self._forward_fill(
-            routing_weights, selected_experts, bt, B, L,
+            rw_fresh, se_fresh, bt, B, L,
         )
 
-        expert_output = self.moe_block.experts(flat, selected_experts, routing_weights)
+        if self._ste:
+            # Straight-through boundary: forward uses the hard hold/switch
+            # decision exactly; backward sees d(output)/d(p_t) =
+            # y_fresh - y_held, so the boundary predictor learns from the
+            # task (GRPO) objective alone -- no ratio/entropy losses.
+            y_held = self.moe_block.experts(flat, selected_experts, routing_weights)
+            y_fresh = self.moe_block.experts(flat, se_fresh, rw_fresh)
+            b_ste = bt.to(pt.dtype) + pt - pt.detach()
+            b_ste = b_ste.reshape(-1, 1)
+            expert_output = b_ste * y_fresh + (1.0 - b_ste) * y_held
+        else:
+            expert_output = self.moe_block.experts(flat, selected_experts, routing_weights)
 
         if hasattr(self.moe_block, 'shared_expert') and self.moe_block.shared_expert is not None:
             shared_output = self.moe_block.shared_expert(flat)
@@ -152,7 +173,7 @@ class TemporalMoEWrapper(nn.Module):
 
         output = expert_output.view(B, L, D)
 
-        if self.training:
+        if self.training and not self._ste:
             self._ratio_loss = self._compute_ratio_loss(pt, bt)
 
         self._last_pt = pt.detach()
@@ -225,9 +246,10 @@ class TemporalWrapMixin:
         model.register_forward_hook(_inject_moe_loss)
 
         gate = getattr(moe_layers[0].moe_block, moe_layers[0]._gate_attr)
+        n_experts = getattr(gate, 'num_experts', None) or gate.out_features
         print(
             f"[TemporalWrapMixin] Wrapped {num_moe} MoE layers "
-            f"(experts={gate.num_experts}, top_k={gate.top_k})"
+            f"(experts={n_experts}, top_k={gate.top_k})"
         )
         return model
 

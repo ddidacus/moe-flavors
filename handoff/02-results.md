@@ -64,3 +64,31 @@ expected and harmless.
   module-wrapped (returns tuple) → param-wrap its weight.
 - TRL enables the MoE **load-balancing aux loss by default** — directly opposes
   cache consolidation; we set `router_aux_loss_coef=0`.
+
+## Update 2026-07-15 (afternoon): exact reward balancing + ppl eval
+
+- **Held-out perplexity eval added** (`eval/ppl`, 256 reserved Nemotron math/code
+  conversations, every 10 steps, vs one-time `eval/ppl_base`=2.661). Two NCCL
+  watchdog crashes on the way: (a) rank-0-only eval stalls other ranks at a
+  collective; (b) calling trainer.log() mid-step triggers TRL's completions
+  upload on rank 0 (minutes). Fixes: all ranks run the eval synchronously,
+  eval logs go straight to wandb without explicit step, ddp_timeout=3600.
+- **normalize_then_sum aggregation** (TRL): per-component group z-scoring makes
+  reward_weights exact influence ratios; kd_scale becomes a no-op.
+- **50-50 run (α=0.5)**: 165 steps, cache 0.563→0.596 (+4 pts, slow), kd −0.002,
+  KL 0.018, entropy flat, eval/ppl 2.655 (slightly BETTER than base). Cleanest
+  run so far; quality fully preserved.
+- **Why 50-50 is slow (measured, 1184 groups)**: within-group corr(cache, kd)
+  = −0.14 (mild real trade-off), and the kd component's raw group-std is only
+  ~0.006 nats at KL 0.018 — z-scoring amplifies near-noise to 50% of the
+  advantage. Net cache learning pressure ~¼ of the α=0 run; slopes match.
+- **Paper recheck (Shen & Henderson)**: their return contains ONLY the KD
+  reward (nats, unscaled); switching pressure enters as deliberation cost η
+  (0.02–0.04, advantage-units margin) in the termination gradient — never a
+  reward sum, so no scale-balancing problem exists there. Our reward-mix is a
+  deliberate departure. Their anti-hacking is mixture sampling (τ=0.2), which
+  our GRPO path lacks — likely why our α=0/β=0.04 run hacked.
+- **DAPO**: TRL 1.8's loss_type default is already 'dapo' — all runs used it;
+  now explicit.
+- Current: α=0.3 (70/30) fresh run — reproduces the historically productive
+  effective ratio under exact control, with eval/ppl as the quality guardrail.

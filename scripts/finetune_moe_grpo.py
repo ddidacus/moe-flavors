@@ -33,7 +33,7 @@ import torch
 import torch.nn.functional as F
 
 from datasets import Dataset
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, TrainerCallback
 from peft import LoraConfig, TaskType
 from trl import GRPOConfig, GRPOTrainer
 
@@ -61,10 +61,14 @@ def _convert_only_if_legacy(model, peft_config, adapter_state_dict, adapter_name
 _pwc.convert_peft_adapter_state_dict_for_transformers = _convert_only_if_legacy
 
 
+EVAL_POOL_PER_SPLIT = 1000  # first rows of each split reserved for eval
+
+
 def build_prompt_dataset(tokenizer, dataset_name, split, max_samples,
-                         prompt_len, seed):
+                         prompt_len, seed, skip_first=EVAL_POOL_PER_SPLIT):
     """Nemotron rows -> Dataset({'prompt'}) with prompts pre-truncated to
-    prompt_len tokens (TRL 1.8 has no max_prompt_length)."""
+    prompt_len tokens (TRL 1.8 has no max_prompt_length). The first
+    `skip_first` rows of each split are reserved for the perplexity eval."""
     from datasets import load_dataset
 
     splits = [s.strip() for s in split.split(",") if s.strip()]
@@ -74,7 +78,9 @@ def build_prompt_dataset(tokenizer, dataset_name, split, max_samples,
     for sp in splits:
         ds = load_dataset(dataset_name, split=sp, streaming=True)
         n = 0
-        for row in ds:
+        for r_idx, row in enumerate(ds):
+            if r_idx < skip_first:
+                continue
             parts = []
             for m in row["messages"]:
                 if m["role"] == "assistant":
@@ -93,6 +99,109 @@ def build_prompt_dataset(tokenizer, dataset_name, split, max_samples,
             if n >= per_split:
                 break
     return Dataset.from_dict({"prompt": prompts}).shuffle(seed=seed)
+
+
+def build_eval_sequences(tokenizer, dataset_name, split, n_total, max_len,
+                         seed, pool_per_split=EVAL_POOL_PER_SPLIT):
+    """Held-out full conversations (chat template incl. reference answer),
+    truncated to max_len tokens, sampled from the reserved eval pool."""
+    import random
+    from datasets import load_dataset
+
+    splits = [s.strip() for s in split.split(",") if s.strip()]
+    per_split = n_total // len(splits)
+    rng = random.Random(seed)
+    use_chat = tokenizer.chat_template is not None
+    eval_ids = []
+    for sp in splits:
+        ds = load_dataset(dataset_name, split=sp, streaming=True)
+        pool = []
+        for row in ds:
+            msgs = [m for m in row["messages"] if m["content"].strip()]
+            if any(m["role"] == "assistant" for m in msgs):
+                pool.append(msgs)
+            if len(pool) >= pool_per_split:
+                break
+        for msgs in rng.sample(pool, min(per_split, len(pool))):
+            if use_chat:
+                text = tokenizer.apply_chat_template(msgs, tokenize=False)
+            else:
+                text = "\n".join(m["content"] for m in msgs)
+            ids = tokenizer(text, truncation=True, max_length=max_len,
+                            add_special_tokens=False)["input_ids"]
+            eval_ids.append(ids)
+    return eval_ids
+
+
+class PerplexityCallback(TrainerCallback):
+    """Every `every` optimizer steps, computes teacher-forced perplexity of
+    the policy on the held-out sequences (rank 0 only) and logs eval/ppl.
+    The frozen base's perplexity is logged once as eval/ppl_base."""
+
+    def __init__(self, eval_ids, pad_id, every=25, batch_size=16):
+        self.eval_ids = eval_ids
+        self.pad_id = pad_id
+        self.every = every
+        self.bs = batch_size
+        self.trainer = None
+        self._base_ppl = None
+
+    def attach(self, trainer):
+        self.trainer = trainer
+
+    @torch.no_grad()
+    def _ppl(self, model):
+        was_training = model.training
+        model.eval()
+        device = next(model.parameters()).device
+        total_nll, total_tok = 0.0, 0
+        for i in range(0, len(self.eval_ids), self.bs):
+            chunk = self.eval_ids[i:i + self.bs]
+            L = max(len(x) for x in chunk)
+            ids = torch.full((len(chunk), L), self.pad_id, dtype=torch.long)
+            mask = torch.zeros((len(chunk), L), dtype=torch.long)
+            for j, x in enumerate(chunk):
+                ids[j, :len(x)] = torch.tensor(x, dtype=torch.long)
+                mask[j, :len(x)] = 1
+            ids, mask = ids.to(device), mask.to(device)
+            logits = model(input_ids=ids, attention_mask=mask,
+                           use_cache=False).logits
+            lp = F.log_softmax(logits[:, :-1].float(), -1) \
+                .gather(-1, ids[:, 1:].unsqueeze(-1)).squeeze(-1)
+            m = mask[:, 1:].bool()
+            total_nll += -lp[m].sum().item()
+            total_tok += int(m.sum())
+        if was_training:
+            model.train()
+        import math
+        return math.exp(total_nll / max(total_tok, 1))
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step % self.every != 0:
+            return
+        tr = self.trainer
+        if tr is None:
+            return
+        # ALL ranks run the (identical) eval so no rank lags the others into
+        # an NCCL collective timeout; only rank 0 logs. Redundant compute,
+        # but rank-divergent multi-minute work deadlocks DDP.
+        model = tr.accelerator.unwrap_model(tr.model)
+        logs = {"eval/ppl": self._ppl(model)}
+        if self._base_ppl is None:
+            with model.disable_adapter():
+                self._base_ppl = self._ppl(model)
+        logs["eval/ppl_base"] = self._base_ppl
+        if tr.accelerator.is_main_process:
+            # Log straight to wandb: trainer.log() would trigger TRL's
+            # completions-table upload mid-step (rank-0 stall -> NCCL
+            # timeout), and wandb.log(step=...) with a backdated step is
+            # silently dropped. No explicit step; global_step goes along as
+            # a field for the x-axis.
+            import wandb
+            if wandb.run is not None:
+                wandb.log({**logs, "train/global_step": state.global_step})
+            print(f"[eval] step {state.global_step}: ppl {logs['eval/ppl']:.3f} "
+                  f"(base {self._base_ppl:.3f})", flush=True)
 
 
 class RewardEngine:
@@ -163,7 +272,7 @@ class RewardEngine:
             r_cache_tok, _, hit_rate = cache_emulation_rewards(
                 router_logits, valid, action, cache_size=args.cache_size,
                 experts_per_token=args.cache_experts_per_token,
-                use_topk=args.cache_topk,
+                use_topk=args.cache_topk, soft=args.soft_cache,
             )
         cache_rewards = r_cache_tok.sum(-1)  # per-seq hit fraction in [0, 1]
 
@@ -243,6 +352,10 @@ def main():
     parser.add_argument("--save-every", type=int, default=50)
     parser.add_argument("--resume", action="store_true",
                         help="Resume from last checkpoint in --save-dir")
+    parser.add_argument("--eval-ppl-seqs", type=int, default=256,
+                        help="Held-out sequences for the perplexity eval")
+    parser.add_argument("--eval-ppl-every", type=int, default=25,
+                        help="Optimizer steps between perplexity evals")
 
     rl_group = parser.add_argument_group("Rewards")
     rl_group.add_argument("--alpha", type=float, default=0.0,
@@ -251,6 +364,14 @@ def main():
     rl_group.add_argument("--beta", type=float, default=0.04,
                           help="TRL KL(policy||ref) coefficient (ref = "
                                "adapters disabled = frozen base)")
+    rl_group.add_argument("--multi-objective-aggregation", type=str,
+                          default="normalize_then_sum",
+                          choices=["sum_then_normalize", "normalize_then_sum"],
+                          help="normalize_then_sum z-scores each reward per "
+                               "group before weighting -> weights are true "
+                               "influence ratios (kd-scale becomes a no-op)")
+    rl_group.add_argument("--loss-type", type=str, default="dapo",
+                          help="TRL GRPO loss variant (dapo = TRL 1.8 default)")
     rl_group.add_argument("--kd-scale", type=float, default=1.0,
                           help="Multiplier on the KD reward (KLReward reward_scale in rl_moe): reward = kd_scale * mean_t(log p_ref - log p_policy). Use to match the cache reward's within-group std (measured ~4x)")
     rl_group.add_argument("--router-aux-loss-coef", type=float, default=0.0,
@@ -264,6 +385,12 @@ def main():
                              help="-1 = middle layer")
     cache_group.add_argument("--cache-experts-per-token", type=int, default=1)
     cache_group.add_argument("--cache-topk", action="store_true")
+    cache_group.add_argument("--soft-cache", action="store_true",
+                             help="Dense routing at the cache layer (K = all "
+                                  "experts, full-softmax weights) + soft cache "
+                                  "reward: router probability mass on the "
+                                  "cached experts. LRU still touched by the "
+                                  "top-k (--cache-experts-per-token) experts")
 
     temporal_group = parser.add_argument_group("Temporal MoE (optional)")
     temporal_group.add_argument("--temporal", action="store_true",
@@ -295,9 +422,37 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     print(f"Building prompt dataset {args.dataset} [{args.dataset_split}] ...")
-    train_dataset = build_prompt_dataset(
-        tokenizer, args.dataset, args.dataset_split, args.max_samples,
-        args.prompt_len, args.seed)
+    # Serialize dataset streaming across ranks: concurrent access to the
+    # shared HF cache can fail with "[Errno 16] Device or resource busy".
+    # Additionally cache the built prompts on disk so concurrent sweep jobs
+    # don't all re-stream from HF (observed 504s killing sibling jobs).
+    import hashlib, pickle
+    key = hashlib.md5(str((args.dataset, args.dataset_split, args.max_samples,
+                           args.prompt_len, args.completion_len,
+                           args.eval_ppl_seqs, args.seed, args.model)).encode()
+                      ).hexdigest()[:12]
+    cache_file = Path("data") / f"prompt_cache_{key}.pkl"
+    from accelerate import PartialState
+    with PartialState().main_process_first():
+        if cache_file.exists():
+            with open(cache_file, "rb") as f:
+                prompts_list, eval_ids = pickle.load(f)
+            train_dataset = Dataset.from_dict({"prompt": prompts_list})
+            print(f"[data] loaded cached prompts from {cache_file}")
+        else:
+            train_dataset = build_prompt_dataset(
+                tokenizer, args.dataset, args.dataset_split, args.max_samples,
+                args.prompt_len, args.seed)
+            eval_ids = build_eval_sequences(
+                tokenizer, args.dataset, args.dataset_split, args.eval_ppl_seqs,
+                args.prompt_len + args.completion_len, args.seed)
+            if PartialState().is_main_process:
+                cache_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(cache_file, "wb") as f:
+                    pickle.dump((list(train_dataset["prompt"]), eval_ids), f)
+                print(f"[data] cached prompts to {cache_file}")
+    print(f"[eval] {len(eval_ids)} held-out sequences "
+          f"(<= {args.prompt_len + args.completion_len} tokens each)")
 
     # peft auto-converts classic expert names (gate_proj/up_proj/down_proj) to
     # fused target_parameters for registered archs (olmoe->qwen2_moe pattern),
@@ -358,6 +513,7 @@ def main():
         run_name=args.wandb_run_name,
         report_to=["wandb"],
         seed=args.seed,
+        ddp_timeout=3600,  # headroom for the synchronized perplexity eval
         bf16=True,
         # Gradient checkpointing's no-grad first pass would detach the
         # temporal ratio/entropy loss (computed as a forward side effect),
@@ -379,6 +535,8 @@ def main():
         max_completion_length=args.completion_len,
         temperature=args.temperature,
         beta=args.beta,
+        loss_type=args.loss_type,
+        multi_objective_aggregation=args.multi_objective_aggregation,
         router_aux_loss_coef=args.router_aux_loss_coef,
         reward_weights=reward_weights,
         # No trust_remote_code: use transformers' native classes (Phi-tiny's
@@ -397,12 +555,52 @@ def main():
     )
     engine.attach(trainer)
 
+    ppl_cb = PerplexityCallback(eval_ids, tokenizer.pad_token_id,
+                                every=args.eval_ppl_every)
+    ppl_cb.attach(trainer)
+    trainer.add_callback(ppl_cb)
+
     model = trainer.accelerator.unwrap_model(trainer.model)
     num_layers = model.config.num_hidden_layers
     if args.cache_layer < 0:
         args.cache_layer = num_layers // 2
     print(f"[cache] LRU size={args.cache_size} on router of layer "
           f"{args.cache_layer}/{num_layers}")
+
+    if args.soft_cache:
+        # Dense routing at the cache layer: every expert is active with its
+        # full-softmax weight (sparsemixer only supports iterative top-1/2).
+        # Patched on the instance post-peft, so it applies to rollouts, the
+        # scoring pass, and the adapter-disabled ref/teacher forwards alike.
+        # self.weight is the LoRA-merged router weight inside ParamWrapper's
+        # forward, and full softmax keeps routing differentiable end-to-end.
+        if model.config.model_type != "phimoe":
+            raise ValueError("--soft-cache is only wired up for phimoe")
+        if args.temporal:
+            raise ValueError("--soft-cache is incompatible with --temporal")
+        import types
+
+        def _dense_router_forward(self, hidden_states):
+            router_logits = F.linear(hidden_states, self.weight, self.bias)
+            routing_weights = torch.softmax(router_logits.float(), dim=-1) \
+                .to(hidden_states.dtype)
+            selected = torch.arange(router_logits.shape[-1],
+                                    device=router_logits.device) \
+                .expand(router_logits.shape[0], -1)
+            return router_logits, routing_weights, selected
+
+        patched = []
+        for name, mod in model.named_modules():
+            if (type(mod).__name__ == "PhimoeTopKRouter"
+                    and f"layers.{args.cache_layer}.mlp" in name):
+                mod.forward = types.MethodType(_dense_router_forward, mod)
+                patched.append(name)
+        if len(patched) != 1:
+            raise RuntimeError(
+                f"expected exactly 1 router at layer {args.cache_layer}, "
+                f"patched {patched}")
+        print(f"[cache] dense routing (K=all experts) patched on {patched[0]}; "
+              f"soft cache reward = router prob mass on cached experts")
 
     resume_ckpt = None
     if args.resume and Path(args.save_dir).is_dir():

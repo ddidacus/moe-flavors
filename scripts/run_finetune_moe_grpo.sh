@@ -25,17 +25,26 @@ RATIO_N="${RATIO_N:-8}"      # temporal target segment length
 CACHE_SIZE="${CACHE_SIZE:-4}"    # of 16 experts (Phi-tiny); OLMoE: use 16 of 64
 CACHE_LAYER="${CACHE_LAYER:--1}"   # -1 = middle layer
 NUM_GEN="${NUM_GEN:-8}"      # G: group size (completions per prompt)
+LR="${LR:-3e-5}"             # learning rate (non-default gets its own save dir)
 CACHE_TOPK="${CACHE_TOPK:-1}"    # 1: deterministic top-k expert reward (deployment-faithful)
 CACHE_EXPERTS="${CACHE_EXPERTS:-2}"  # experts scored per token (= router top-k)
+SOFT_CACHE="${SOFT_CACHE:-0}"    # 1: dense router at cache layer + soft (weighted) hit reward
 
 REWARD_TAG=$([ "$CACHE_TOPK" = "1" ] && echo "topk${CACHE_EXPERTS}" || echo "sampled${CACHE_EXPERTS}")
+if [ "$SOFT_CACHE" = "1" ]; then REWARD_TAG="softall"; fi
 if [ "$TEMPORAL" = "1" ]; then REWARD_TAG="${REWARD_TAG}_tmoeN${RATIO_N}"; fi
+if [ "$LR" != "3e-5" ]; then REWARD_TAG="${REWARD_TAG}_lr${LR}"; fi
 SAVE_DIR="checkpoints/grpo_${MODEL_TAG}_cache_mathcode_a${ALPHA}_b${BETA}_kds${KD_SCALE}_c${CACHE_SIZE}_${REWARD_TAG}"
 RUN_NAME="grpo-${MODEL_TAG}-cache-mathcode-a${ALPHA}-b${BETA}-kds${KD_SCALE}-c${CACHE_SIZE}-${REWARD_TAG}"
 EXTRA_ARGS=$([ "$CACHE_TOPK" = "1" ] && echo "--cache-topk")
+if [ "$SOFT_CACHE" = "1" ]; then EXTRA_ARGS="$EXTRA_ARGS --soft-cache"; fi
 if [ "$TEMPORAL" = "1" ]; then EXTRA_ARGS="$EXTRA_ARGS --temporal --ratio-loss-N $RATIO_N"; fi
 
-accelerate launch \
+# Retry fast startup failures (shared-FS flakiness: triton JIT getsource
+# errors, HF cache lock contention). A failure after >10 min is real.
+for ATTEMPT in 1 2 3; do
+    START=$(date +%s)
+    accelerate launch \
     --multi_gpu \
     --num_processes 4 \
     scripts/finetune_moe_grpo.py \
@@ -50,7 +59,7 @@ accelerate launch \
     --gradient-accumulation-steps 1 \
     --num-steps 500 \
     --num-epochs 10 \
-    --lr 3e-5 \
+    --lr "$LR" \
     --temperature 1.0 \
     --alpha "$ALPHA" \
     --beta "$BETA" \
@@ -65,5 +74,11 @@ accelerate launch \
     --wandb-run-name "$RUN_NAME" \
     --save-dir "$SAVE_DIR" \
     --save-every 50 \
+    --eval-ppl-every 10 \
     --resume \
-    $EXTRA_ARGS
+    $EXTRA_ARGS && break
+    ELAPSED=$(( $(date +%s) - START ))
+    if [ $ELAPSED -gt 600 ]; then echo "[retry] failure after ${ELAPSED}s, not retrying"; break; fi
+    echo "[retry] fast startup failure (attempt $ATTEMPT, ${ELAPSED}s), retrying in 60s..."
+    sleep 60
+done

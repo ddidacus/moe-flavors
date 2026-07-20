@@ -66,7 +66,7 @@ class LRUExpertCache:
 @torch.no_grad()
 def cache_emulation_rewards(router_logits, valid_mask, action_mask, cache_size,
                             experts_per_token=1, use_topk=False, generator=None,
-                            experts=None):
+                            experts=None, soft=False):
     """Simulate one LRU cache per sequence and emit per-token cache rewards.
 
     Args:
@@ -84,13 +84,21 @@ def cache_emulation_rewards(router_logits, valid_mask, action_mask, cache_size,
         experts: optional (B, S, k) long, precomputed per-token expert
             decisions (e.g. the effective held decisions of a temporal
             routing wrapper); overrides sampling/topk from router_logits.
+        soft: if True the per-token reward is the router probability mass
+            (full softmax over ALL experts) on the experts currently in the
+            cache — a soft hit rate in [0, 1]. The LRU is still touched by
+            the top-`experts_per_token` experts, so cache dynamics match the
+            hard variant. Intended for a dense router (K = all experts) at
+            the cached layer.
 
     Returns:
         rewards: (B, S) float32, r_t^cache = (hits_t / experts_per_token) / T
-            on action positions, 0 elsewhere.
+            on action positions (soft: cached probability mass / T), 0 elsewhere.
         experts: (B, S, experts_per_token) long, experts drawn at every position.
-        hit_rate: float, hits / accesses over action positions (for logging).
+        hit_rate: float, hits / accesses over action positions (for logging;
+            soft: mean cached probability mass per action token).
     """
+    probs_cpu = None
     if experts is not None:
         B, S, experts_per_token = experts.shape
         device = experts.device
@@ -98,7 +106,10 @@ def cache_emulation_rewards(router_logits, valid_mask, action_mask, cache_size,
         B, S, E = router_logits.shape
         device = router_logits.device
         probs = torch.softmax(router_logits.float(), dim=-1)
-        if use_topk:
+        if soft:
+            probs_cpu = probs.cpu()
+            experts = probs.topk(experts_per_token, dim=-1).indices
+        elif use_topk:
             experts = probs.topk(experts_per_token, dim=-1).indices
         else:
             experts = torch.multinomial(
@@ -116,14 +127,25 @@ def cache_emulation_rewards(router_logits, valid_mask, action_mask, cache_size,
         for s in range(S):
             if not valid_cpu[b, s]:
                 continue
-            token_hits = 0
-            for e in experts_cpu[b, s].tolist():
-                if cache.access(e):
-                    token_hits += 1
-            if action_cpu[b, s]:
-                rewards[b, s] = (token_hits / experts_per_token) / T
-                hits += token_hits
-                accesses += experts_per_token
+            if probs_cpu is not None:
+                # soft: probability mass on the cache as-of the previous token
+                if action_cpu[b, s]:
+                    cached = cache.experts
+                    mass = float(probs_cpu[b, s, cached].sum()) if cached else 0.0
+                    rewards[b, s] = mass / T
+                    hits += mass
+                    accesses += 1
+                for e in experts_cpu[b, s].tolist():
+                    cache.access(e)
+            else:
+                token_hits = 0
+                for e in experts_cpu[b, s].tolist():
+                    if cache.access(e):
+                        token_hits += 1
+                if action_cpu[b, s]:
+                    rewards[b, s] = (token_hits / experts_per_token) / T
+                    hits += token_hits
+                    accesses += experts_per_token
     hit_rate = hits / max(accesses, 1)
     return rewards.to(device), experts, hit_rate
 

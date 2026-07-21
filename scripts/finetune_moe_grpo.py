@@ -10,12 +10,16 @@ GRPOTrainer:
     of the REINFORCE cache reward. Computed by a custom reward function that
     runs one no-grad forward with output_router_logits and simulates the LRU
     working set (src.cache_reinforce.cache_emulation_rewards).
-  * KD/BC anchor to the frozen base model, two equivalent knobs:
-      --alpha  weights a sequence-level r^BC reward (mean per-token
-               log p_ref - log p_policy) against the cache reward,
-               mirroring r = alpha*r^BC + (1-alpha)*r^cache;
-      --beta   TRL's native per-token KL(policy || ref) penalty in the loss
-               (ref = adapters disabled). Prefer beta; keep alpha=0.
+  * SFT NLL loss (--sft-coef), added directly to the loss, NOT mixed in as a
+    reward: total_loss = policy_loss (GRPO/DAPO) + sft_coef * NLL(target),
+    where NLL(target) is the standard teacher-forced cross-entropy of the
+    policy on the dataset's own ground-truth completion (GRPOTrainerWithSFT).
+    This replaces the former KD/BC reward (log p_ref - log p_policy on the
+    target), which only anchored p_policy(target) to the frozen base model's
+    *original* value; it never pushed the likelihood of the target sequence
+    up. Directly minimizing NLL(target) does.
+  * TRL's native --beta: per-token KL(policy || ref) penalty in the loss
+    (ref = adapters disabled), independent of the SFT term above.
   * On-policy generation replaces mixture sampling: the anti-hacking role of
     p_mix is covered by GRPO's clipped importance ratio and the beta-KL.
 
@@ -24,6 +28,7 @@ Not ported from the REINFORCE version: the router log-prob REINFORCE term
 """
 
 import argparse
+import signal
 import sys
 from pathlib import Path
 
@@ -65,16 +70,23 @@ EVAL_POOL_PER_SPLIT = 1000  # first rows of each split reserved for eval
 
 
 def build_prompt_dataset(tokenizer, dataset_name, split, max_samples,
-                         prompt_len, seed, skip_first=EVAL_POOL_PER_SPLIT):
-    """Nemotron rows -> Dataset({'prompt'}) with prompts pre-truncated to
-    prompt_len tokens (TRL 1.8 has no max_prompt_length). The first
-    `skip_first` rows of each split are reserved for the perplexity eval."""
+                         prompt_len, completion_len, seed,
+                         skip_first=EVAL_POOL_PER_SPLIT):
+    """Nemotron rows -> Dataset({'prompt', 'target_ids'}).
+
+    'prompt' is pre-truncated to prompt_len tokens (TRL 1.8 has no
+    max_prompt_length). 'target_ids' is the dataset's own ground-truth
+    assistant response, tokenized and truncated to completion_len tokens --
+    used only for the SFT NLL loss term (GRPOTrainerWithSFT), never for
+    reward computation or generation. The first `skip_first` rows of each
+    split are reserved for the perplexity eval.
+    """
     from datasets import load_dataset
 
     splits = [s.strip() for s in split.split(",") if s.strip()]
     per_split = max_samples // len(splits)
     use_chat = tokenizer.chat_template is not None
-    prompts = []
+    prompts, targets = [], []
     for sp in splits:
         ds = load_dataset(dataset_name, split=sp, streaming=True)
         n = 0
@@ -82,23 +94,30 @@ def build_prompt_dataset(tokenizer, dataset_name, split, max_samples,
             if r_idx < skip_first:
                 continue
             parts = []
+            target_text = None
             for m in row["messages"]:
                 if m["role"] == "assistant":
+                    target_text = m["content"]
                     break
                 if m["content"].strip():
                     parts.append(m["content"])
             text = "\n".join(parts).strip()
-            if text:
+            if text and target_text and target_text.strip():
                 ids = tokenizer(text, truncation=True,
                                 max_length=prompt_len)["input_ids"]
                 text = tokenizer.decode(ids)
                 # conversational format -> TRL applies the chat template
                 prompts.append([{"role": "user", "content": text}]
                                if use_chat else text)
+                targets.append(tokenizer(
+                    target_text.strip(), truncation=True,
+                    max_length=completion_len,
+                    add_special_tokens=False)["input_ids"])
                 n += 1
             if n >= per_split:
                 break
-    return Dataset.from_dict({"prompt": prompts}).shuffle(seed=seed)
+    return Dataset.from_dict({"prompt": prompts, "target_ids": targets}) \
+        .shuffle(seed=seed)
 
 
 def build_eval_sequences(tokenizer, dataset_name, split, n_total, max_len,
@@ -204,6 +223,33 @@ class PerplexityCallback(TrainerCallback):
                   f"(base {self._base_ppl:.3f})", flush=True)
 
 
+class PreemptionCallback(TrainerCallback):
+    """SLURM preemption/requeue: SIGUSR1 (sent --signal seconds before the
+    time limit, or on preemption of a --requeue job) and SIGTERM just set a
+    flag; the Trainer's own callback loop -- not the signal handler itself,
+    which must stay async-signal-safe -- checkpoints (optimizer/scheduler/
+    RNG state included, so --resume restores exactly) and stops training at
+    the next step boundary. Pairs with --resume + a fixed --save-dir: SLURM
+    requeues the same job, which reruns this script and picks the latest
+    checkpoint back up via get_last_checkpoint()."""
+
+    def __init__(self):
+        self._triggered = False
+        signal.signal(signal.SIGUSR1, self._handle)
+        signal.signal(signal.SIGTERM, self._handle)
+
+    def _handle(self, signum, frame):
+        print(f"[preemption] signal {signum} received -- checkpointing and "
+              f"stopping at the next step boundary", flush=True)
+        self._triggered = True
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if self._triggered:
+            control.should_save = True
+            control.should_training_stop = True
+        return control
+
+
 class RewardEngine:
     """Computes cache and KD rewards for a batch of GRPO completions.
 
@@ -276,27 +322,9 @@ class RewardEngine:
             )
         cache_rewards = r_cache_tok.sum(-1)  # per-seq hit fraction in [0, 1]
 
-        kd_rewards = torch.zeros(B)
-        if args.alpha > 0:
-            act_t = action[:, 1:]  # target grid: logits at i predict token i+1
-            targets = full_ids[:, 1:]
-            lp_pol = F.log_softmax(out.logits[:, :-1].float(), -1) \
-                .gather(-1, targets.unsqueeze(-1)).squeeze(-1)
-            with model.disable_adapter():
-                ref_logits = model(input_ids=full_ids, attention_mask=valid.long(),
-                                   use_cache=False).logits
-            lp_ref = F.log_softmax(ref_logits[:, :-1].float(), -1) \
-                .gather(-1, targets.unsqueeze(-1)).squeeze(-1)
-            # mean per-token r^BC (length-invariant sequence reward)
-            n_act = act_t.sum(-1).clamp(min=1)
-            kd_rewards = (((lp_ref - lp_pol) * act_t).sum(-1) / n_act).cpu()
-            kd_rewards = kd_rewards * args.kd_scale
-
         if was_training:
             model.train()
-        return {"cache": cache_rewards.cpu().tolist(),
-                "kd": kd_rewards.tolist(),
-                "hit_rate": hit_rate}
+        return {"cache": cache_rewards.cpu().tolist(), "hit_rate": hit_rate}
 
     def _scores(self, prompts, completion_ids):
         key = (id(completion_ids), len(completion_ids),
@@ -318,8 +346,76 @@ class RewardEngine:
                 log_metric("boundary_rate", float(w._last_F))
         return scores["cache"]
 
-    def kd_reward(self, prompts, completions, completion_ids, **kwargs):
-        return self._scores(prompts, completion_ids)["kd"]
+
+class GRPOTrainerWithSFT(GRPOTrainer):
+    """GRPOTrainer + a standard teacher-forced NLL loss on the dataset's own
+    ground-truth completion ('target_ids', see build_prompt_dataset), added
+    directly to the total loss:
+
+        total_loss = rl_coef * policy_loss (GRPO/DAPO) + sft_coef * NLL(target)
+
+    This replaces the KD/BC reward (log p_ref - log p_policy on the target,
+    mixed into the group-relative reward): that term only anchored
+    p_policy(target) to the frozen base model's *original* likelihood, it
+    never increased it. Directly minimizing NLL(target) does, independent of
+    the cache reward's advantage signal. rl_coef lets the policy loss be
+    scaled relative to the SFT term (e.g. up-weighted if SFT dominates the
+    gradient and drives KL/entropy drift without cache-reward gains).
+    """
+
+    def __init__(self, *args, sft_coef=0.0, rl_coef=1.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.sft_coef = sft_coef
+        self.rl_coef = rl_coef
+
+    def _generate_and_score_completions(self, inputs):
+        output = super()._generate_and_score_completions(inputs)
+        if self.sft_coef <= 0:
+            return output
+        pad_id = self.processing_class.pad_token_id
+        target_ids_list = [x["target_ids"] for x in inputs]
+        L = max((len(t) for t in target_ids_list), default=1) or 1
+        B = len(target_ids_list)
+        target_ids = torch.full((B, L), pad_id, dtype=torch.long)
+        target_mask = torch.zeros((B, L), dtype=torch.long)
+        for i, t in enumerate(target_ids_list):
+            if t:
+                target_ids[i, :len(t)] = torch.tensor(t, dtype=torch.long)
+                target_mask[i, :len(t)] = 1
+        output["target_ids"] = target_ids
+        output["target_mask"] = target_mask
+        return output
+
+    def _sft_nll_loss(self, model, inputs):
+        prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
+        device = prompt_ids.device
+        target_ids = inputs["target_ids"].to(device)
+        target_mask = inputs["target_mask"].to(device)
+        # prompt_ids: left-padded (TRL generation convention); target_ids:
+        # right-padded. Concatenating them mirrors exactly how GRPOTrainer
+        # itself scores prompt+completion, so the same attention-mask-derived
+        # position handling applies.
+        full_ids = torch.cat([prompt_ids, target_ids], dim=1)
+        full_mask = torch.cat([prompt_mask, target_mask], dim=1)
+        logits = model(input_ids=full_ids, attention_mask=full_mask,
+                      use_cache=False).logits
+        P = prompt_ids.size(1)
+        pred_logits = logits[:, P - 1:-1]  # predict target_ids[:, t] from position P-1+t
+        logp = F.log_softmax(pred_logits.float(), dim=-1) \
+            .gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
+        mask = target_mask.float()
+        return -(logp * mask).sum() / mask.sum().clamp(min=1)
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        loss = super().compute_loss(model, inputs, return_outputs=return_outputs,
+                                    num_items_in_batch=num_items_in_batch)
+        total = self.rl_coef * loss
+        if self.sft_coef > 0 and "target_ids" in inputs:
+            sft_loss = self._sft_nll_loss(model, inputs)
+            mode = "train" if model.training else "eval"
+            self._metrics[mode]["sft_nll"].append(sft_loss.item())
+            total = total + self.sft_coef * sft_loss
+        return total
 
 
 def main():
@@ -358,9 +454,20 @@ def main():
                         help="Optimizer steps between perplexity evals")
 
     rl_group = parser.add_argument_group("Rewards")
-    rl_group.add_argument("--alpha", type=float, default=0.0,
-                          help="Weight of the r^BC reward; (1-alpha) weights "
-                               "the cache reward. Prefer --beta and alpha=0.")
+    rl_group.add_argument("--rl-coef", type=float, default=1.0,
+                          help="Weight of the GRPO/DAPO policy loss: "
+                               "total_loss = rl_coef * policy_loss + "
+                               "sft_coef * NLL(target). Raise this (or lower "
+                               "--sft-coef) if the SFT term dominates the "
+                               "gradient and the policy drifts (rising KL/"
+                               "entropy) without cache-reward gains.")
+    rl_group.add_argument("--sft-coef", type=float, default=1.0,
+                          help="Weight of the SFT NLL loss, added directly to "
+                               "the policy loss (NOT mixed into the reward): "
+                               "total_loss = rl_coef * policy_loss + sft_coef "
+                               "* NLL(target), target = the dataset's own "
+                               "ground-truth completion. 0 disables it. "
+                               "Replaces the old KD/BC reward.")
     rl_group.add_argument("--beta", type=float, default=0.04,
                           help="TRL KL(policy||ref) coefficient (ref = "
                                "adapters disabled = frozen base)")
@@ -369,11 +476,9 @@ def main():
                           choices=["sum_then_normalize", "normalize_then_sum"],
                           help="normalize_then_sum z-scores each reward per "
                                "group before weighting -> weights are true "
-                               "influence ratios (kd-scale becomes a no-op)")
+                               "influence ratios")
     rl_group.add_argument("--loss-type", type=str, default="dapo",
                           help="TRL GRPO loss variant (dapo = TRL 1.8 default)")
-    rl_group.add_argument("--kd-scale", type=float, default=1.0,
-                          help="Multiplier on the KD reward (KLReward reward_scale in rl_moe): reward = kd_scale * mean_t(log p_ref - log p_policy). Use to match the cache reward's within-group std (measured ~4x)")
     rl_group.add_argument("--router-aux-loss-coef", type=float, default=0.0,
                           help="MoE load-balancing aux loss coef. Keep 0: "
                                "balancing pushes uniform expert usage, the "
@@ -429,27 +534,30 @@ def main():
     import hashlib, pickle
     key = hashlib.md5(str((args.dataset, args.dataset_split, args.max_samples,
                            args.prompt_len, args.completion_len,
-                           args.eval_ppl_seqs, args.seed, args.model)).encode()
+                           args.eval_ppl_seqs, args.seed, args.model,
+                           "v2_target_ids")).encode()  # bump on cache schema changes
                       ).hexdigest()[:12]
     cache_file = Path("data") / f"prompt_cache_{key}.pkl"
     from accelerate import PartialState
     with PartialState().main_process_first():
         if cache_file.exists():
             with open(cache_file, "rb") as f:
-                prompts_list, eval_ids = pickle.load(f)
-            train_dataset = Dataset.from_dict({"prompt": prompts_list})
+                prompts_list, targets_list, eval_ids = pickle.load(f)
+            train_dataset = Dataset.from_dict(
+                {"prompt": prompts_list, "target_ids": targets_list})
             print(f"[data] loaded cached prompts from {cache_file}")
         else:
             train_dataset = build_prompt_dataset(
                 tokenizer, args.dataset, args.dataset_split, args.max_samples,
-                args.prompt_len, args.seed)
+                args.prompt_len, args.completion_len, args.seed)
             eval_ids = build_eval_sequences(
                 tokenizer, args.dataset, args.dataset_split, args.eval_ppl_seqs,
                 args.prompt_len + args.completion_len, args.seed)
             if PartialState().is_main_process:
                 cache_file.parent.mkdir(parents=True, exist_ok=True)
                 with open(cache_file, "wb") as f:
-                    pickle.dump((list(train_dataset["prompt"]), eval_ids), f)
+                    pickle.dump((list(train_dataset["prompt"]),
+                                list(train_dataset["target_ids"]), eval_ids), f)
                 print(f"[data] cached prompts to {cache_file}")
     print(f"[eval] {len(eval_ids)} held-out sequences "
           f"(<= {args.prompt_len + args.completion_len} tokens each)")
@@ -503,10 +611,7 @@ def main():
 
     engine = RewardEngine(args, temporal_wrappers=temporal_wrappers)
     reward_funcs = [engine.cache_reward]
-    reward_weights = [1.0 - args.alpha]
-    if args.alpha > 0:
-        reward_funcs.append(engine.kd_reward)
-        reward_weights.append(args.alpha)
+    reward_weights = [1.0]
 
     grpo_config = GRPOConfig(
         output_dir=args.save_dir,
@@ -545,13 +650,15 @@ def main():
         model_init_kwargs=None if args.temporal else {"dtype": torch.bfloat16},
     )
 
-    trainer = GRPOTrainer(
+    trainer = GRPOTrainerWithSFT(
         model=model_or_id,
         reward_funcs=reward_funcs,
         args=grpo_config,
         train_dataset=train_dataset,
         processing_class=tokenizer,
         peft_config=lora_config,
+        sft_coef=args.sft_coef,
+        rl_coef=args.rl_coef,
     )
     engine.attach(trainer)
 
@@ -559,6 +666,7 @@ def main():
                                 every=args.eval_ppl_every)
     ppl_cb.attach(trainer)
     trainer.add_callback(ppl_cb)
+    trainer.add_callback(PreemptionCallback())
 
     model = trainer.accelerator.unwrap_model(trainer.model)
     num_layers = model.config.num_hidden_layers

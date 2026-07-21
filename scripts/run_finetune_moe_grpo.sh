@@ -17,9 +17,9 @@ export TRITON_CACHE_DIR=/tmp/triton_cache_${SLURM_JOB_ID}
 # --- Configuration ---
 MODEL="${MODEL:-microsoft/Phi-tiny-MoE-instruct}"
 MODEL_TAG=$(basename "$MODEL" | tr '[:upper:]' '[:lower:]')
-ALPHA="${ALPHA:-0}"          # weight of the r^BC reward func; prefer BETA
+RL_COEF="${RL_COEF:-1.0}"    # weight of the GRPO/DAPO policy loss
+SFT_COEF="${SFT_COEF:-1.0}"  # weight of the SFT NLL loss added to the policy loss (0 disables)
 BETA="${BETA:-0.04}"         # TRL KL(policy||frozen base) coefficient
-KD_SCALE="${KD_SCALE:-1.0}"  # multiplier on the KD reward (rl_moe reward_scale)
 TEMPORAL="${TEMPORAL:-0}"    # 1: boundary-prediction + hold/switch routing mixin
 RATIO_N="${RATIO_N:-8}"      # temporal target segment length
 CACHE_SIZE="${CACHE_SIZE:-4}"    # of 16 experts (Phi-tiny); OLMoE: use 16 of 64
@@ -29,13 +29,16 @@ LR="${LR:-3e-5}"             # learning rate (non-default gets its own save dir)
 CACHE_TOPK="${CACHE_TOPK:-1}"    # 1: deterministic top-k expert reward (deployment-faithful)
 CACHE_EXPERTS="${CACHE_EXPERTS:-2}"  # experts scored per token (= router top-k)
 SOFT_CACHE="${SOFT_CACHE:-0}"    # 1: dense router at cache layer + soft (weighted) hit reward
+NUM_STEPS="${NUM_STEPS:-500}"    # override for short debug runs
 
 REWARD_TAG=$([ "$CACHE_TOPK" = "1" ] && echo "topk${CACHE_EXPERTS}" || echo "sampled${CACHE_EXPERTS}")
 if [ "$SOFT_CACHE" = "1" ]; then REWARD_TAG="softall"; fi
 if [ "$TEMPORAL" = "1" ]; then REWARD_TAG="${REWARD_TAG}_tmoeN${RATIO_N}"; fi
 if [ "$LR" != "3e-5" ]; then REWARD_TAG="${REWARD_TAG}_lr${LR}"; fi
-SAVE_DIR="checkpoints/grpo_${MODEL_TAG}_cache_mathcode_a${ALPHA}_b${BETA}_kds${KD_SCALE}_c${CACHE_SIZE}_${REWARD_TAG}"
-RUN_NAME="grpo-${MODEL_TAG}-cache-mathcode-a${ALPHA}-b${BETA}-kds${KD_SCALE}-c${CACHE_SIZE}-${REWARD_TAG}"
+if [ "$NUM_STEPS" != "500" ]; then REWARD_TAG="${REWARD_TAG}_dbg${NUM_STEPS}"; fi
+if [ "$RL_COEF" != "1.0" ]; then REWARD_TAG="${REWARD_TAG}_rl${RL_COEF}"; fi
+SAVE_DIR="checkpoints/grpo_${MODEL_TAG}_cache_mathcode_sft${SFT_COEF}_b${BETA}_c${CACHE_SIZE}_${REWARD_TAG}"
+RUN_NAME="grpo-${MODEL_TAG}-cache-mathcode-sft${SFT_COEF}-b${BETA}-c${CACHE_SIZE}-${REWARD_TAG}"
 EXTRA_ARGS=$([ "$CACHE_TOPK" = "1" ] && echo "--cache-topk")
 if [ "$SOFT_CACHE" = "1" ]; then EXTRA_ARGS="$EXTRA_ARGS --soft-cache"; fi
 if [ "$TEMPORAL" = "1" ]; then EXTRA_ARGS="$EXTRA_ARGS --temporal --ratio-loss-N $RATIO_N"; fi
@@ -57,13 +60,13 @@ for ATTEMPT in 1 2 3; do
     --num-generations "$NUM_GEN" \
     --batch-size 16 \
     --gradient-accumulation-steps 1 \
-    --num-steps 500 \
+    --num-steps "$NUM_STEPS" \
     --num-epochs 10 \
     --lr "$LR" \
     --temperature 1.0 \
-    --alpha "$ALPHA" \
+    --rl-coef "$RL_COEF" \
+    --sft-coef "$SFT_COEF" \
     --beta "$BETA" \
-    --kd-scale "$KD_SCALE" \
     --cache-size "$CACHE_SIZE" \
     --cache-layer "$CACHE_LAYER" \
     --cache-experts-per-token "$CACHE_EXPERTS" \

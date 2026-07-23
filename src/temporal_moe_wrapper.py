@@ -146,7 +146,8 @@ class TemporalMoEWrapper(nn.Module):
         flat = hidden_states.view(-1, D)
 
         gate = getattr(self.moe_block, self._gate_attr)
-        _, rw_fresh, se_fresh = gate(flat)
+        router_logits_fresh, rw_fresh, se_fresh = gate(flat)
+        self._last_router_logits = router_logits_fresh.detach().view(B, L, -1)
 
         routing_weights, selected_experts = self._forward_fill(
             rw_fresh, se_fresh, bt, B, L,
@@ -179,6 +180,19 @@ class TemporalMoEWrapper(nn.Module):
         self._last_pt = pt.detach()
         self._last_bt = bt.detach()
         self._last_top_k_indices = selected_experts.view(B, L, -1).detach()
+        # Full-E softmax actually driving each token's computation: the
+        # fresh per-token logits forward-filled the same way as the top-k
+        # selection/weights above (held from the last boundary token), not
+        # each token's own (possibly stale, un-acted-upon) logits. Eval-only:
+        # cheap enough to not bother threading through the training path.
+        with torch.no_grad():
+            positions = torch.arange(L, device=bt.device).unsqueeze(0).expand(B, -1)
+            boundary_pos = torch.where(bt, positions, torch.zeros_like(positions) - 1)
+            last_boundary = boundary_pos.cummax(dim=1)[0]
+            gather_idx = last_boundary.unsqueeze(-1).expand(
+                B, L, self._last_router_logits.shape[-1])
+            self._last_held_router_logits = torch.gather(
+                self._last_router_logits, 1, gather_idx)
         self._last_G = pt.detach().mean()
         self._last_F = bt.float().detach().mean()
         pt_f32 = pt.detach().float().clamp(1e-6, 1 - 1e-6)

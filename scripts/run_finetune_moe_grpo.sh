@@ -30,6 +30,12 @@ CACHE_TOPK="${CACHE_TOPK:-1}"    # 1: deterministic top-k expert reward (deploym
 CACHE_EXPERTS="${CACHE_EXPERTS:-2}"  # experts scored per token (= router top-k)
 SOFT_CACHE="${SOFT_CACHE:-0}"    # 1: dense router at cache layer + soft (weighted) hit reward
 NUM_STEPS="${NUM_STEPS:-500}"    # override for short debug runs
+BATCH_SIZE="${BATCH_SIZE:-16}"   # per-device batch; lower for --temporal (no grad checkpointing -> more activation mem)
+GRAD_ACCUM="${GRAD_ACCUM:-1}"    # raise to compensate when BATCH_SIZE is lowered
+PROMPT_LEN="${PROMPT_LEN:-512}"
+COMPLETION_LEN="${COMPLETION_LEN:-512}"
+DATASET_SPLIT="${DATASET_SPLIT:-math,code}"
+MAX_SAMPLES="${MAX_SAMPLES:-20000}"
 
 REWARD_TAG=$([ "$CACHE_TOPK" = "1" ] && echo "topk${CACHE_EXPERTS}" || echo "sampled${CACHE_EXPERTS}")
 if [ "$SOFT_CACHE" = "1" ]; then REWARD_TAG="softall"; fi
@@ -37,8 +43,13 @@ if [ "$TEMPORAL" = "1" ]; then REWARD_TAG="${REWARD_TAG}_tmoeN${RATIO_N}"; fi
 if [ "$LR" != "3e-5" ]; then REWARD_TAG="${REWARD_TAG}_lr${LR}"; fi
 if [ "$NUM_STEPS" != "500" ]; then REWARD_TAG="${REWARD_TAG}_dbg${NUM_STEPS}"; fi
 if [ "$RL_COEF" != "1.0" ]; then REWARD_TAG="${REWARD_TAG}_rl${RL_COEF}"; fi
-SAVE_DIR="checkpoints/grpo_${MODEL_TAG}_cache_mathcode_sft${SFT_COEF}_b${BETA}_c${CACHE_SIZE}_${REWARD_TAG}"
-RUN_NAME="grpo-${MODEL_TAG}-cache-mathcode-sft${SFT_COEF}-b${BETA}-c${CACHE_SIZE}-${REWARD_TAG}"
+if [ "$PROMPT_LEN" != "512" ] || [ "$COMPLETION_LEN" != "512" ]; then
+    REWARD_TAG="${REWARD_TAG}_seq${PROMPT_LEN}-${COMPLETION_LEN}"
+fi
+if [ "$MAX_SAMPLES" != "20000" ]; then REWARD_TAG="${REWARD_TAG}_n${MAX_SAMPLES}"; fi
+DATA_TAG=$([ "$DATASET_SPLIT" = "math,code" ] && echo "mathcode" || echo "allsplits")
+SAVE_DIR="checkpoints/grpo_${MODEL_TAG}_cache_${DATA_TAG}_sft${SFT_COEF}_b${BETA}_c${CACHE_SIZE}_${REWARD_TAG}"
+RUN_NAME="grpo-${MODEL_TAG}-cache-${DATA_TAG}-sft${SFT_COEF}-b${BETA}-c${CACHE_SIZE}-${REWARD_TAG}"
 EXTRA_ARGS=$([ "$CACHE_TOPK" = "1" ] && echo "--cache-topk")
 if [ "$SOFT_CACHE" = "1" ]; then EXTRA_ARGS="$EXTRA_ARGS --soft-cache"; fi
 if [ "$TEMPORAL" = "1" ]; then EXTRA_ARGS="$EXTRA_ARGS --temporal --ratio-loss-N $RATIO_N"; fi
@@ -53,13 +64,13 @@ for ATTEMPT in 1 2 3; do
     scripts/finetune_moe_grpo.py \
     --model "$MODEL" \
     --dataset nvidia/Nemotron-Post-Training-Dataset-v2 \
-    --dataset-split "math,code" \
-    --max-samples 20000 \
-    --prompt-len 512 \
-    --completion-len 512 \
+    --dataset-split "$DATASET_SPLIT" \
+    --max-samples "$MAX_SAMPLES" \
+    --prompt-len "$PROMPT_LEN" \
+    --completion-len "$COMPLETION_LEN" \
     --num-generations "$NUM_GEN" \
-    --batch-size 16 \
-    --gradient-accumulation-steps 1 \
+    --batch-size "$BATCH_SIZE" \
+    --gradient-accumulation-steps "$GRAD_ACCUM" \
     --num-steps "$NUM_STEPS" \
     --num-epochs 10 \
     --lr "$LR" \

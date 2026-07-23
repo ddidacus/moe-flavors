@@ -80,19 +80,32 @@ def build_prompt_dataset(tokenizer, dataset_name, split, max_samples,
     used only for the SFT NLL loss term (GRPOTrainerWithSFT), never for
     reward computation or generation. The first `skip_first` rows of each
     split are reserved for the perplexity eval.
+
+    Uses reservoir sampling (Algorithm R) within each split so the result is
+    a genuine random sample, not a fixed prefix -- capped at a scan window
+    (see MAX_SCAN_PER_SPLIT) so very large splits (e.g. "chat") don't have to
+    be streamed to completion just to draw a few hundred rows from them.
     """
     from datasets import load_dataset
+    import random
 
+    MAX_SCAN_PER_SPLIT = 50_000  # bounds streaming cost on large splits
+    rng = random.Random(seed)
     splits = [s.strip() for s in split.split(",") if s.strip()]
     per_split = max_samples // len(splits)
     use_chat = tokenizer.chat_template is not None
     prompts, targets = [], []
     for sp in splits:
         ds = load_dataset(dataset_name, split=sp, streaming=True)
-        n = 0
+        reservoir = []  # list of (prompt_repr, target_ids)
+        seen = 0
+        scanned = 0
         for r_idx, row in enumerate(ds):
             if r_idx < skip_first:
                 continue
+            if scanned >= max(MAX_SCAN_PER_SPLIT, per_split):
+                break
+            scanned += 1
             parts = []
             target_text = None
             for m in row["messages"]:
@@ -102,20 +115,26 @@ def build_prompt_dataset(tokenizer, dataset_name, split, max_samples,
                 if m["content"].strip():
                     parts.append(m["content"])
             text = "\n".join(parts).strip()
-            if text and target_text and target_text.strip():
-                ids = tokenizer(text, truncation=True,
-                                max_length=prompt_len)["input_ids"]
-                text = tokenizer.decode(ids)
-                # conversational format -> TRL applies the chat template
-                prompts.append([{"role": "user", "content": text}]
-                               if use_chat else text)
-                targets.append(tokenizer(
-                    target_text.strip(), truncation=True,
-                    max_length=completion_len,
-                    add_special_tokens=False)["input_ids"])
-                n += 1
-            if n >= per_split:
-                break
+            if not (text and target_text and target_text.strip()):
+                continue
+            ids = tokenizer(text, truncation=True,
+                            max_length=prompt_len)["input_ids"]
+            text = tokenizer.decode(ids)
+            # conversational format -> TRL applies the chat template
+            item = ([{"role": "user", "content": text}] if use_chat else text,
+                    tokenizer(target_text.strip(), truncation=True,
+                             max_length=completion_len,
+                             add_special_tokens=False)["input_ids"])
+            if len(reservoir) < per_split:
+                reservoir.append(item)
+            else:
+                j = rng.randint(0, seen)
+                if j < per_split:
+                    reservoir[j] = item
+            seen += 1
+        for p, t in reservoir:
+            prompts.append(p)
+            targets.append(t)
     return Dataset.from_dict({"prompt": prompts, "target_ids": targets}) \
         .shuffle(seed=seed)
 
@@ -599,6 +618,8 @@ def main():
         TemporalWrapMixin.apply(model_or_id, temporal_config)
         temporal_wrappers = model_or_id._moe_layers
         lora_kwargs["modules_to_save"] = ["term_proj1", "term_proj2"]
+    use_grad_checkpointing = not (args.temporal and not temporal_config.ste) \
+        if args.temporal else True
 
     lora_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
@@ -621,9 +642,14 @@ def main():
         ddp_timeout=3600,  # headroom for the synchronized perplexity eval
         bf16=True,
         # Gradient checkpointing's no-grad first pass would detach the
-        # temporal ratio/entropy loss (computed as a forward side effect),
-        # zeroing the boundary predictor's gradient -> disable when temporal.
-        gradient_checkpointing=not args.temporal,
+        # temporal ratio/entropy loss (computed as a forward side effect,
+        # only present when not ste) -> only disable for the non-STE
+        # boundary variant. The STE path is checkpointing-safe; leaving
+        # checkpointing off unconditionally OOMs regardless of batch size,
+        # since the fused-expert LoRA weight (W + delta_weight) is
+        # materialized per MoE layer and stays resident across all layers
+        # in one forward pass without it.
+        gradient_checkpointing=use_grad_checkpointing,
         learning_rate=args.lr,
         lr_scheduler_type="constant_with_warmup",
         warmup_steps=args.warmup_steps,

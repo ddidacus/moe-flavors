@@ -61,7 +61,13 @@ def build_sft_dataset(tokenizer, dataset_name, split, max_samples, prompt_len,
     Uses reservoir sampling (Algorithm R) within each split so the result is
     a genuine random sample, not a fixed prefix -- capped at a scan window
     (see MAX_SCAN_PER_SPLIT) so very large splits don't have to be streamed
-    to completion just to draw a few hundred rows from them."""
+    to completion just to draw a few hundred rows from them. Tokenization
+    happens AFTER the reservoir is finalized, not during the scan: doing it
+    eagerly per scanned row cost up to MAX_SCAN_PER_SPLIT x num_splits BPE
+    calls for a result that only keeps per_split x num_splits of them --
+    with 9 splits x 50k that's ~450k wasted tokenizer calls, which single-
+    handedly blew well past accelerate's 600s multi-GPU rendezvous timeout
+    (rank 0 stuck tokenizing while ranks 1-3 waited and gave up)."""
     from datasets import Dataset, load_dataset
     import random
 
@@ -72,7 +78,7 @@ def build_sft_dataset(tokenizer, dataset_name, split, max_samples, prompt_len,
     prompts, completions = [], []
     for sp in splits:
         ds = load_dataset(dataset_name, split=sp, streaming=True)
-        reservoir = []
+        reservoir = []  # raw (text, target_text) strings, untokenized
         seen = 0
         scanned = 0
         for r_idx, row in enumerate(ds):
@@ -92,15 +98,7 @@ def build_sft_dataset(tokenizer, dataset_name, split, max_samples, prompt_len,
             text = "\n".join(parts).strip()
             if not (text and target_text and target_text.strip()):
                 continue
-            ids = tokenizer(text, truncation=True,
-                            max_length=prompt_len)["input_ids"]
-            text = tokenizer.decode(ids)
-            c_ids = tokenizer(target_text.strip(), truncation=True,
-                              max_length=completion_len,
-                              add_special_tokens=False)["input_ids"]
-            completion_text = tokenizer.decode(c_ids)
-            item = ([{"role": "user", "content": text}],
-                    [{"role": "assistant", "content": completion_text}])
+            item = (text, target_text.strip())
             if len(reservoir) < per_split:
                 reservoir.append(item)
             else:
@@ -108,9 +106,16 @@ def build_sft_dataset(tokenizer, dataset_name, split, max_samples, prompt_len,
                 if j < per_split:
                     reservoir[j] = item
             seen += 1
-        for p, c in reservoir:
-            prompts.append(p)
-            completions.append(c)
+        for text, target_text in reservoir:
+            ids = tokenizer(text, truncation=True,
+                            max_length=prompt_len)["input_ids"]
+            text = tokenizer.decode(ids)
+            c_ids = tokenizer(target_text, truncation=True,
+                              max_length=completion_len,
+                              add_special_tokens=False)["input_ids"]
+            completion_text = tokenizer.decode(c_ids)
+            prompts.append([{"role": "user", "content": text}])
+            completions.append([{"role": "assistant", "content": completion_text}])
     return Dataset.from_dict(
         {"prompt": prompts, "completion": completions}).shuffle(seed=seed)
 

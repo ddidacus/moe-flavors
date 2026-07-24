@@ -7,12 +7,29 @@
 #SBATCH --partition=short-unkillable
 #SBATCH --time=3:00:00
 #SBATCH --signal=B:USR1@120
+#SBATCH --requeue
 
 source .venv/bin/activate
 export HF_HOME=/home/mila/d/diego.calanzone/scratch/cache
 export UV_CACHE_DIR=/home/mila/d/diego.calanzone/scratch/cache
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export TRITON_CACHE_DIR=/tmp/triton_cache_${SLURM_JOB_ID}
+
+# Pin the wandb run id once (persisted to a file keyed by SLURM job ID, on
+# the shared filesystem -- NOT /tmp, since --requeue can land the same job
+# ID on a different node with its own local /tmp) so a preemption +
+# automatic requeue continues the same wandb run instead of starting a new
+# one. WANDB_RESUME=allow lets wandb attach to an existing run id or create
+# it if this is the first attempt.
+mkdir -p .wandb_run_ids
+WANDB_ID_FILE=".wandb_run_ids/${SLURM_JOB_ID}"
+if [ -f "$WANDB_ID_FILE" ]; then
+    export WANDB_RUN_ID=$(cat "$WANDB_ID_FILE")
+else
+    export WANDB_RUN_ID=$(python3 -c "import wandb; print(wandb.util.generate_id())")
+    echo "$WANDB_RUN_ID" > "$WANDB_ID_FILE"
+fi
+export WANDB_RESUME=allow
 
 # --- Configuration ---
 MODEL="${MODEL:-microsoft/Phi-tiny-MoE-instruct}"
@@ -96,3 +113,5 @@ for ATTEMPT in 1 2 3; do
     echo "[retry] fast startup failure (attempt $ATTEMPT, ${ELAPSED}s), retrying in 60s..."
     sleep 60
 done
+[ "$ATTEMPT" = "3" ] && [ ! -d "$SAVE_DIR" ] && { echo "[retry] all attempts failed, no checkpoint saved"; exit 1; }
+exit 0

@@ -170,9 +170,13 @@ Aggregated as mean/median/min/max/std across all tokens+sequences, plus an
 | `expert_trace/sequences.txt` | the same sequences as plain text, with a `\|` inserted between tokens exactly where the top-1 expert changes -- text-mode equivalent of the color-segment plot |
 | `perplexity.png` | standard teacher-forced perplexity on held-out ground-truth completions, base vs tuned (independent of the routing analysis, checks LM quality wasn't traded away) |
 
-### Derived stat (not a raw metric)
+### Derived stats (not raw per-token metrics, reported alongside perplexity in `metrics.json`)
 
-`expert_run_length`: mean contiguous run length of the top-1 expert per
-sequence (`run_lengths()` on `expert_id`) -- the direct operationalization
-of "does the cache/temporal objective make the policy hold experts across
-consecutive tokens," reported alongside perplexity in `metrics.json`.
+| stat | definition |
+| --- | --- |
+| `expert_run_length` | mean contiguous run length of the top-1 expert per sequence (`run_lengths()` on `expert_id`) -- direct operationalization of "does the policy hold the same expert across consecutive tokens" |
+| `switch_rate` | fraction of adjacent action-token pairs where the top-1 expert changes, averaged per sequence then across sequences -- same definition as Table 1 of Shen & Henderson 2026 (Sec. 2.2), computed per analyzed layer here rather than also averaged across layers |
+
+These two are inversely related (`switch_rate` ~= `1/expert_run_length` for
+long sequences) but both are reported since `expert_run_length` also
+carries distributional info (min/max/std) that `switch_rate` alone doesn't.

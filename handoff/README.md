@@ -15,6 +15,7 @@ while a knowledge-distillation signal anchors text quality to the frozen base.
 | [06-training-setup.md](06-training-setup.md) | **large-scale** training spec: 10k sequences, 4-model, 4x80GB (models, dataset, lengths, batch/lr, steps, GPU-hour estimates) |
 | [07-eval-setup.md](07-eval-setup.md) | quantitative (lm-eval-harness: MMLU/MMMLU/GSM8K/HumanEval/MATH) + qualitative (routing/cache-metric) eval methodology |
 | [08-training-setup-small.md](08-training-setup-small.md) | **small-scale** companion to 06: same models/hyperparameters, ~2k sequences -- run this first |
+| [09-loss-math.md](09-loss-math.md) | `cache_sft`'s loss math: soft-cache reward, GRPO/DAPO policy loss, SFT NLL, how they combine + gradient, with code excerpts |
 
 Code entry points:
 - `scripts/finetune_moe_grpo.py` + `scripts/run_finetune_moe_grpo.sh` — current main path (TRL GRPO)

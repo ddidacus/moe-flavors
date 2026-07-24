@@ -85,6 +85,13 @@ def build_prompt_dataset(tokenizer, dataset_name, split, max_samples,
     a genuine random sample, not a fixed prefix -- capped at a scan window
     (see MAX_SCAN_PER_SPLIT) so very large splits (e.g. "chat") don't have to
     be streamed to completion just to draw a few hundred rows from them.
+    Tokenization happens AFTER the reservoir is finalized, not during the
+    scan: doing it eagerly per scanned row cost up to MAX_SCAN_PER_SPLIT x
+    num_splits BPE calls for a result that only keeps per_split x num_splits
+    of them -- with 9 splits x 50k that's ~450k wasted tokenizer calls,
+    which single-handedly blew well past accelerate's 600s multi-GPU
+    rendezvous timeout (rank 0 stuck tokenizing while other ranks waited and
+    gave up).
     """
     from datasets import load_dataset
     import random
@@ -97,7 +104,7 @@ def build_prompt_dataset(tokenizer, dataset_name, split, max_samples,
     prompts, targets = [], []
     for sp in splits:
         ds = load_dataset(dataset_name, split=sp, streaming=True)
-        reservoir = []  # list of (prompt_repr, target_ids)
+        reservoir = []  # raw (text, target_text) strings, untokenized
         seen = 0
         scanned = 0
         for r_idx, row in enumerate(ds):
@@ -117,14 +124,7 @@ def build_prompt_dataset(tokenizer, dataset_name, split, max_samples,
             text = "\n".join(parts).strip()
             if not (text and target_text and target_text.strip()):
                 continue
-            ids = tokenizer(text, truncation=True,
-                            max_length=prompt_len)["input_ids"]
-            text = tokenizer.decode(ids)
-            # conversational format -> TRL applies the chat template
-            item = ([{"role": "user", "content": text}] if use_chat else text,
-                    tokenizer(target_text.strip(), truncation=True,
-                             max_length=completion_len,
-                             add_special_tokens=False)["input_ids"])
+            item = (text, target_text.strip())
             if len(reservoir) < per_split:
                 reservoir.append(item)
             else:
@@ -132,9 +132,17 @@ def build_prompt_dataset(tokenizer, dataset_name, split, max_samples,
                 if j < per_split:
                     reservoir[j] = item
             seen += 1
-        for p, t in reservoir:
-            prompts.append(p)
-            targets.append(t)
+        for text, target_text in reservoir:
+            ids = tokenizer(text, truncation=True,
+                            max_length=prompt_len)["input_ids"]
+            text = tokenizer.decode(ids)
+            # conversational format -> TRL applies the chat template
+            prompt_repr = [{"role": "user", "content": text}] if use_chat else text
+            target_ids = tokenizer(target_text, truncation=True,
+                                   max_length=completion_len,
+                                   add_special_tokens=False)["input_ids"]
+            prompts.append(prompt_repr)
+            targets.append(target_ids)
     return Dataset.from_dict({"prompt": prompts, "target_ids": targets}) \
         .shuffle(seed=seed)
 

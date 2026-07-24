@@ -12,6 +12,7 @@ dependencies = [
     "peft>=0.15.0",
     "torch>=2.11.0",
     "transformers>=5.8.0",
+    "trl>=1.9.0",
     "wandb>=0.18.0",
 ]
 
@@ -42,6 +43,8 @@ WANDB_MODE="offline"
 env = {UV_OFFLINE="0", WANDB_MODE="online"}
 
 [tool.cluv.clusters.tamia]
+# H100 80GB (H200 also available), whole-node-only, 4 GPUs/node.
+job_script_path = "scripts/cluv/tamia_job.sh"
 
 [tool.cluv.clusters.killarney]
 # For example, you might not have a $SCRATCH on Killarney. This can be overwritten here.
@@ -49,15 +52,23 @@ results_path = "$HOME/logs/cluv"
 # datasets_path = "$HOME/datasets/cifar10"
 
 [tool.cluv.clusters.vulcan]
+# L40S 48GB, 4 GPUs/node.
+job_script_path = "scripts/cluv/vulcan_job.sh"
 
 [tool.cluv.clusters.rorqual]
 env = {SBATCH_ACCOUNT="rrg-bengioy-ad"}
+# H100 80GB, 4 GPUs/node.
+job_script_path = "scripts/cluv/rorqual_job.sh"
 
 [tool.cluv.clusters.fir]
 env = {UV_OFFLINE="0", WANDB_MODE="online", SBATCH_ACCOUNT="rrg-bengioy-ad"}
+# H100 80GB, 4 GPUs/node.
+job_script_path = "scripts/cluv/fir_job.sh"
 
 [tool.cluv.clusters.nibi]
 env = {UV_OFFLINE="0", WANDB_MODE="online", SBATCH_ACCOUNT="rrg-bengioy-ad"}
+# H100 80GB, 4 GPUs/node.
+job_script_path = "scripts/cluv/nibi_job.sh"
 
 [tool.cluv.clusters.trillium]
 env = {SBATCH_ACCOUNT="rrg-bengioy-ad"}
@@ -68,3 +79,5 @@ env = {SBATCH_ACCOUNT="rrg-bengioy-ad"}
 [tool.cluv.clusters.narval]
 # Mila doesn't have an allocation on Narval anymore.
 env = {SBATCH_ACCOUNT="def-bengioy"}
+# A100 40GB, 4 GPUs/node.
+job_script_path = "scripts/cluv/narval_job.sh"

@@ -17,6 +17,9 @@ dependencies = [
 ]
 
 [tool.cluv]
+# Default sbatch job script, used by any cluster that doesn't set its own
+# job_script_path below (mila, killarney, trillium, trillium-gpu).
+job_script_path = "scripts/job.sh"
 # Where to store job results by default. Can be overridden per cluster.
 results_path = "$SCRATCH/logs/cluv"
 # On clusters, Cluv creates a symlink (a shortcut) in your project folder to the results_path dir.

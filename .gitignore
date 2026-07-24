@@ -12,6 +12,6 @@ data/
 results/
 .job_monitor_state.json
 logs
-eval_*
+eval_*/
 archive/
 .wandb_run_ids/

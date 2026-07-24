@@ -12,4 +12,4 @@
 # at exact CPU/mem-per-node figures. No internet on compute nodes (matches
 # the UV_OFFLINE=1 default in pyproject.toml).
 
-source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
+source scripts/cluv/common.sh

@@ -11,4 +11,4 @@
 # Add a dedicated scripts/cluv/<cluster>_job.sh + job_script_path entry
 # for any cluster you actually run on -- see scripts/cluv/README.md.
 
-source "$(dirname "${BASH_SOURCE[0]}")/cluv/common.sh"
+source scripts/cluv/common.sh

@@ -12,4 +12,4 @@
 # (matches the UV_OFFLINE=0 override in pyproject.toml) -- wandb is still
 # forced off for cluv jobs regardless, see common.sh.
 
-source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
+source scripts/cluv/common.sh

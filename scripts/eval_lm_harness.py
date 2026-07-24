@@ -224,12 +224,17 @@ def load_adapter(peft_model, ckpt_dir):
     print(f"[eval] loaded {len(remapped)} adapter tensors from {ckpt_dir}")
 
 
-def build_variant_model(variant, base_model_name, device):
+def build_variant_model(variant, base_model_name, device, checkpoint_dir=None):
     """Returns a ready-to-eval nn.Module for one variant -- no dense-router
     patching here (unlike eval_soft_cache.py): this is a downstream task
     eval, so every variant runs with its actual deployment-time routing
     (native sparse top-k, or the temporal mixin's real hold/switch forward),
-    not an analysis-only monkeypatch."""
+    not an analysis-only monkeypatch.
+
+    checkpoint_dir: overrides VARIANT_CHECKPOINTS[variant] when given --
+    for evaluating a checkpoint trained elsewhere (e.g. via cluv on a
+    non-mila cluster, where the SAVE_DIR naming differs from the mila
+    run_finetune_moe_*.sh convention baked into VARIANT_CHECKPOINTS)."""
     from transformers import AutoModelForCausalLM
 
     if variant == "base":
@@ -238,7 +243,7 @@ def build_variant_model(variant, base_model_name, device):
         ).to(device)
 
     from peft import LoraConfig, get_peft_model
-    ckpt = VARIANT_CHECKPOINTS[variant]
+    ckpt = checkpoint_dir or VARIANT_CHECKPOINTS[variant]
     from transformers.trainer_utils import get_last_checkpoint
     ckpt_dir = get_last_checkpoint(ckpt) or ckpt
     assert Path(ckpt_dir, "adapter_config.json").exists(), \
@@ -286,7 +291,7 @@ def _aggregate_stochastic(per_seed, tasks):
     return agg
 
 
-def run_variant(variant, base_model_name, batch_size, limit, out_dir):
+def run_variant(variant, base_model_name, batch_size, limit, out_dir, checkpoint_dir=None):
     import lm_eval
     from lm_eval.models.huggingface import HFLM
     from transformers import AutoTokenizer
@@ -296,7 +301,7 @@ def run_variant(variant, base_model_name, batch_size, limit, out_dir):
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
-    model = build_variant_model(variant, base_model_name, device)
+    model = build_variant_model(variant, base_model_name, device, checkpoint_dir)
     model.eval()
 
     # Wrap the already-instantiated (and, for cache_sft/temporal_moe,
@@ -405,7 +410,7 @@ def run_variant(variant, base_model_name, batch_size, limit, out_dir):
     print(f"[eval] wrote {out_path}")
 
 
-def run_math_only(variant, base_model_name, batch_size, limit, out_dir):
+def run_math_only(variant, base_model_name, batch_size, limit, out_dir, checkpoint_dir=None):
     """Rerun ONLY hendrycks_math (with the few-shot + build_qa_turn fixes)
     and patch the result into an existing results_<variant>.json, leaving
     every other task's numbers untouched. For variants evaluated before
@@ -424,7 +429,7 @@ def run_math_only(variant, base_model_name, batch_size, limit, out_dir):
     tok = AutoTokenizer.from_pretrained(base_model_name, trust_remote_code=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
-    model = build_variant_model(variant, base_model_name, device)
+    model = build_variant_model(variant, base_model_name, device, checkpoint_dir)
     model.eval()
     lm = HFLM(pretrained=model, tokenizer=tok, batch_size=batch_size, device=device)
 
@@ -530,6 +535,13 @@ def main():
                          "existing results_<variant>.json -- for variants "
                          "evaluated before the few-shot/build_qa_turn MATH "
                          "fixes landed, without re-running everything else")
+    ap.add_argument("--checkpoint-dir", default=None,
+                    help="override VARIANT_CHECKPOINTS[variant] with an "
+                         "explicit adapter checkpoint dir -- for evaluating "
+                         "a checkpoint trained elsewhere (e.g. via cluv on "
+                         "a non-mila cluster) whose SAVE_DIR doesn't match "
+                         "the mila run_finetune_moe_*.sh naming convention. "
+                         "Ignored for --variant base.")
     args = ap.parse_args()
 
     if args.variant == "merge":
@@ -541,10 +553,10 @@ def main():
 
     if args.math_only:
         run_math_only(args.variant, args.model, args.batch_size, args.limit,
-                      args.out_dir)
+                      args.out_dir, args.checkpoint_dir)
         return
     run_variant(args.variant, args.model, args.batch_size, args.limit,
-               args.out_dir)
+               args.out_dir, args.checkpoint_dir)
 
 
 if __name__ == "__main__":

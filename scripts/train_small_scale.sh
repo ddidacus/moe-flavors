@@ -66,7 +66,7 @@ COMMON_ARGS=(--dataset nvidia/Nemotron-Post-Training-Dataset-v2
              --lr "$LR" --lora-r 16 --lora-alpha 32 --seed 42
              --wandb-project moe-cache-reinforce --save-every 50 --resume)
 
-cluv submit "$CLUSTER" -- accelerate launch --multi_gpu --num_processes 4 \
+cluv submit --autocommit "$CLUSTER" -- accelerate launch --multi_gpu --num_processes 4 \
     scripts/finetune_moe_sft.py "${COMMON_ARGS[@]}" \
     --batch-size 4 --gradient-accumulation-steps 4 --num-steps 32 --num-epochs 10 \
     --wandb-run-name "sft-baseline-${CLUSTER}" --save-dir "checkpoints/sft_baseline_${CLUSTER}"
@@ -74,7 +74,7 @@ echo "sft_baseline        -> submitted to $CLUSTER (32 steps, batch=4/accum=4)"
 
 # cache_sft/temporal_moe: ~9.9h/~16.3h wall-clock on 4 GPUs estimated (see
 # mila branch above) -- override walltime past the 3h pyproject.toml default.
-cluv submit "$CLUSTER" --time=1-00:00:00 -- accelerate launch --multi_gpu --num_processes 4 \
+cluv submit --autocommit "$CLUSTER" --time=1-00:00:00 -- accelerate launch --multi_gpu --num_processes 4 \
     scripts/finetune_moe_grpo.py "${COMMON_ARGS[@]}" \
     --batch-size 8 --gradient-accumulation-steps 2 --num-steps 250 --num-epochs 10 \
     --num-generations 8 --temperature 1.0 --rl-coef 2.0 --sft-coef 0.5 --beta 0.08 \
@@ -83,7 +83,7 @@ cluv submit "$CLUSTER" --time=1-00:00:00 -- accelerate launch --multi_gpu --num_
     --wandb-run-name "cache-sft-${CLUSTER}" --save-dir "checkpoints/cache_sft_${CLUSTER}"
 echo "cache_sft           -> submitted to $CLUSTER (250 steps, batch=8/accum=2, ~9.9h est.)"
 
-cluv submit "$CLUSTER" --time=1-00:00:00 -- accelerate launch --multi_gpu --num_processes 4 \
+cluv submit --autocommit "$CLUSTER" --time=1-00:00:00 -- accelerate launch --multi_gpu --num_processes 4 \
     scripts/finetune_moe_grpo.py "${COMMON_ARGS[@]}" \
     --batch-size 8 --gradient-accumulation-steps 2 --num-steps 250 --num-epochs 10 \
     --num-generations 8 --temperature 1.0 --rl-coef 2.0 --sft-coef 0.5 --beta 0.08 \
@@ -92,7 +92,7 @@ cluv submit "$CLUSTER" --time=1-00:00:00 -- accelerate launch --multi_gpu --num_
     --wandb-run-name "temporal-moe-${CLUSTER}" --save-dir "checkpoints/temporal_moe_${CLUSTER}"
 echo "temporal_moe        -> submitted to $CLUSTER (250 steps, batch=8/accum=2, ~16.3h est.)"
 
-cluv submit "$CLUSTER" -- accelerate launch --multi_gpu --num_processes 4 \
+cluv submit --autocommit "$CLUSTER" -- accelerate launch --multi_gpu --num_processes 4 \
     scripts/finetune_moe_controller.py "${COMMON_ARGS[@]}" \
     --batch-size 4 --gradient-accumulation-steps 4 --num-steps 32 \
     --cache-size 4 --cache-layer -1 --deliberation-cost 0.02 \

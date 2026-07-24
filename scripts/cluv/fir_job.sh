@@ -1,6 +1,5 @@
 #!/bin/bash
 #SBATCH --job-name=moe-flavors
-#SBATCH --output=%x_%j.out
 #SBATCH --nodes=1
 #SBATCH --exclusive
 #SBATCH --gpus-per-node=h100:4
@@ -9,7 +8,8 @@
 #
 # Fir (successor to Cedar) -- H100 80GB nodes, liquid-cooled. Requested
 # exclusively (whole node) rather than guess at exact CPU/mem-per-node
-# figures. Unrestricted internet on compute nodes (matches
-# UV_OFFLINE=0/WANDB_MODE=online override in pyproject.toml).
+# figures. Unrestricted internet on compute nodes (matches the
+# UV_OFFLINE=0 override in pyproject.toml) -- wandb is still forced off
+# for cluv jobs regardless, see common.sh.
 
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"

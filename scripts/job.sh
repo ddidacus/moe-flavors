@@ -1,6 +1,5 @@
 #!/bin/bash
 #SBATCH --job-name=moe-flavors
-#SBATCH --output=%x_%j.out
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=4
 #SBATCH --signal=B:USR1@120

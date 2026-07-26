@@ -200,8 +200,9 @@ def build_prompt_dataset(tokenizer, dataset_name, split, max_samples, prompt_len
     with 9 splits x 50k that's ~450k wasted tokenizer calls, which single-
     handedly blew well past accelerate's 600s multi-GPU rendezvous timeout
     (rank 0 stuck tokenizing while other ranks waited and gave up)."""
-    from datasets import Dataset, load_dataset
+    from datasets import Dataset
     import random
+    from src.nemotron_data import load_split_stream
 
     MAX_SCAN_PER_SPLIT = 50_000
     rng = random.Random(seed)
@@ -209,7 +210,7 @@ def build_prompt_dataset(tokenizer, dataset_name, split, max_samples, prompt_len
     per_split = max_samples // len(splits)
     prompts, targets = [], []
     for sp in splits:
-        ds = load_dataset(dataset_name, split=sp, streaming=True)
+        ds = load_split_stream(dataset_name, sp)
         reservoir = []  # raw (text, target_text) strings, untokenized
         seen = 0
         scanned = 0

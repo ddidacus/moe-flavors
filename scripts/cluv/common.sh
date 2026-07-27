@@ -12,6 +12,19 @@ export UV_CACHE_DIR="${UV_CACHE_DIR:-${SCRATCH:-$HOME}/cache}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export TRITON_CACHE_DIR=/tmp/triton_cache_${SLURM_JOB_ID}
 
+# UV_OFFLINE=1 (set per-cluster in pyproject.toml's [tool.cluv.env]) already
+# marks "this cluster has no internet" -- reuse that same signal here.
+# Without this, `from_pretrained("microsoft/Phi-tiny-MoE-instruct")` retries
+# HEAD requests to huggingface.co for ~10+ min before giving up (not gated,
+# but still needs a network round-trip to resolve). datasets_path/hf_cache
+# is a synced mirror of $HF_HOME/hub for that one model (see pyproject.toml
+# [tool.cluv] comment) -- HF_HUB_OFFLINE=1 makes from_pretrained resolve
+# from it with zero network calls.
+if [ "${UV_OFFLINE:-0}" = "1" ] && [ -d "${SCRATCH:-}/datasets/hf_cache" ]; then
+    export HF_HOME="${SCRATCH}/datasets/hf_cache"
+    export HF_HUB_OFFLINE=1
+fi
+
 # Compute nodes on these clusters have no internet access, so wandb (even
 # in "offline" mode) is more trouble than it's worth -- force it off and
 # rely on the SLURM stdout log (%x_%j.out) instead. Overrides any

@@ -744,7 +744,8 @@ def main():
     if args.temporal:
         from transformers import AutoModelForCausalLM
         model_or_id = AutoModelForCausalLM.from_pretrained(
-            args.model, dtype=torch.bfloat16, low_cpu_mem_usage=True)
+            args.model, dtype=torch.bfloat16, low_cpu_mem_usage=True,
+            attn_implementation="eager")
         # STE boundary: no ratio/entropy regularizers -- the boundary
         # predictor learns from the GRPO objective alone, with gradients
         # flowing through the straight-through hold/switch decision.
@@ -807,7 +808,7 @@ def main():
         # No trust_remote_code: use transformers' native classes (Phi-tiny's
         # bundled remote code requires flash_attn and bypasses the peft/TRL
         # integration we rely on). Not allowed when passing a model instance.
-        model_init_kwargs=None if args.temporal else {"dtype": torch.bfloat16},
+        model_init_kwargs=None if args.temporal else {"dtype": torch.bfloat16, "attn_implementation": "eager"},
     )
 
     trainer = GRPOTrainerWithSFT(

@@ -537,7 +537,8 @@ def main():
     )
 
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, dtype=torch.bfloat16, low_cpu_mem_usage=True)
+        args.model, dtype=torch.bfloat16, low_cpu_mem_usage=True,
+        attn_implementation="eager")
     num_layers = model.config.num_hidden_layers
     if args.cache_layer < 0:
         args.cache_layer = num_layers // 2

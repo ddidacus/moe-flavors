@@ -12,7 +12,11 @@ data/
 results/
 .job_monitor_state.json
 logs
+<<<<<<< HEAD
 /eval_*
+=======
+eval_*/
+>>>>>>> 20b5cfc90ca6031a0e330c4c345249e979700d72
 archive/
 .wandb_run_ids/
 evals/

@@ -127,8 +127,8 @@ def build_prompt_dataset(tokenizer, dataset_name, split, max_samples,
     rendezvous timeout (rank 0 stuck tokenizing while other ranks waited and
     gave up).
     """
-    from datasets import load_dataset
     import random
+    from src.nemotron_data import load_split_stream
 
     MAX_SCAN_PER_SPLIT = 50_000  # bounds streaming cost on large splits
     rng = random.Random(seed)
@@ -137,7 +137,7 @@ def build_prompt_dataset(tokenizer, dataset_name, split, max_samples,
     use_chat = tokenizer.chat_template is not None
     prompts, targets = [], []
     for sp in splits:
-        ds = load_dataset(dataset_name, split=sp, streaming=True)
+        ds = load_split_stream(dataset_name, sp)
         reservoir = []  # raw (text, target_text) strings, untokenized
         seen = 0
         scanned = 0
@@ -186,7 +186,7 @@ def build_eval_sequences(tokenizer, dataset_name, split, n_total, max_len,
     """Held-out full conversations (chat template incl. reference answer),
     truncated to max_len tokens, sampled from the reserved eval pool."""
     import random
-    from datasets import load_dataset
+    from src.nemotron_data import load_split_stream
 
     splits = [s.strip() for s in split.split(",") if s.strip()]
     per_split = n_total // len(splits)
@@ -194,7 +194,7 @@ def build_eval_sequences(tokenizer, dataset_name, split, n_total, max_len,
     use_chat = tokenizer.chat_template is not None
     eval_ids = []
     for sp in splits:
-        ds = load_dataset(dataset_name, split=sp, streaming=True)
+        ds = load_split_stream(dataset_name, sp)
         pool = []
         for row in ds:
             msgs = [m for m in row["messages"] if m["content"].strip()]

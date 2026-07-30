@@ -25,10 +25,21 @@ results_path = "$SCRATCH/logs/cluv"
 # On clusters, Cluv creates a symlink (a shortcut) in your project folder to the results_path dir.
 # This makes it easier to keep your project in $HOME and to see the results which are on $SCRATCH.
 results_symlink = "logs"
-## Where to read the data from when synchronizing data to all clusters.
-#data_source = "mila:/network/datasets/cifar10.var/cifar10_torchvision"
-## Where the dataset should be replicated on all clusters.
-#datasets_path = "$SCRATCH/datasets/cifar10"
+# Synced to every cluster via `cluv sync` (rsync, outside git -- too big for
+# that). Two things live under here, both needed because compute nodes on
+# tamia/rorqual/narval/vulcan have no internet at all:
+#   nemotron_v2/  -- gated HF dataset, streamed by default (even mila can't
+#                    without a valid HF_TOKEN). scripts/prepare_local_
+#                    dataset.py materializes a compact local copy (up to
+#                    50k rows/split, only 'messages'). src/nemotron_data.py
+#                    loads from here when present, else streams from the Hub.
+#   hf_cache/     -- mirrors $HF_HOME/hub for microsoft/Phi-tiny-MoE-instruct
+#                    (not gated, but still needs internet to download) --
+#                    common.sh points HF_HOME here + sets HF_HUB_OFFLINE=1
+#                    on clusters with no internet, so `from_pretrained(...)`
+#                    resolves locally with zero network calls.
+data_source = "mila:/network/scratch/d/diego.calanzone/datasets"
+datasets_path = "$SCRATCH/datasets"
 
 [tool.cluv.env]
 # Environment variables applied when using Slurm commands on all clusters.

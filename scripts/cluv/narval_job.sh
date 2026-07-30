@@ -13,4 +13,4 @@
 # before relying on this. Requested exclusively (whole node, 4 GPUs).
 # No internet on compute nodes.
 
-source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
+source scripts/cluv/common.sh

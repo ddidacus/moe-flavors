@@ -56,10 +56,46 @@ particular mandates whole-node allocation anyway.
 cluv submit tamia -- accelerate launch --multi_gpu --num_processes 4 \
     scripts/finetune_moe_sft.py --model microsoft/Phi-tiny-MoE-instruct ...
 
-# override sbatch flags (e.g. walltime) before the `--`
-cluv submit rorqual --time=1-00:00:00 -- accelerate launch ...
+# --autocommit must come BEFORE the cluster name -- cluv's own sbatch_args
+# parser (argparse.REMAINDER) silently swallows it if placed after, see
+# train_/eval_ scripts below for the correct order.
+cluv submit --autocommit rorqual --time=1-00:00:00 -- accelerate launch ...
 
 # see scripts/train_small_scale.sh for the CLUSTER=<name> wrapper used
-# to fan the 4 small-scale training jobs out to any of these clusters
+# to fan all 4 small-scale training jobs out to any of these clusters at once
 CLUSTER=fir bash scripts/train_small_scale.sh
 ```
+
+## train_/eval_ scripts (one variant/job at a time)
+
+Standalone, per-variant alternative to `scripts/train_small_scale.sh` --
+useful for resubmitting a single failed variant, or running eval without
+retraining everything. Each takes `CLUSTER` as a required env var.
+
+| Script | What it submits | Saves / reads |
+|---|---|---|
+| `train_sft_baseline.sh` | `finetune_moe_sft.py` | `checkpoints/sft_baseline_<CLUSTER>` |
+| `train_cache_sft.sh` | `finetune_moe_grpo.py` (soft cache reward) | `checkpoints/cache_sft_<CLUSTER>` |
+| `train_temporal_moe.sh` | `finetune_moe_grpo.py` (+ `--temporal`) | `checkpoints/temporal_moe_<CLUSTER>` |
+| `train_controller_baseline.sh` | `finetune_moe_controller.py` | `checkpoints/controller_baseline_<CLUSTER>` |
+| `eval_lm_harness.sh [variant...]` | `scripts/eval_lm_harness.py` (lm-eval-harness: MMLU/MMMLU/GSM8K/HumanEval/MATH) | reads `checkpoints/<variant>_<CLUSTER>`, writes `evals/<CLUSTER>/<date>/` |
+| `eval_soft_cache.sh [variant...]` | `scripts/eval_soft_cache.py` (LRU cache-hit-rate; **stub**, see its docstring) | reads `checkpoints/<variant>_<CLUSTER>`, writes `evals/<CLUSTER>/soft_cache_<date>/` |
+
+The two `eval_*.sh` scripts default to all 5 variants (`base`,
+`sft_baseline`, `cache_sft`, `temporal_moe`, `controller_baseline`) run in
+parallel, GPU-pinned, within one job (`_eval_lm_harness_run.sh` /
+`_eval_soft_cache_run.sh` are the actual remote drivers -- not meant to be
+invoked directly; kept as real files rather than inline shell strings
+because `cluv submit` breaks on nested quotes/parens passed as program args).
+
+```bash
+CLUSTER=fir bash scripts/cluv/train_cache_sft.sh
+CLUSTER=fir bash scripts/cluv/eval_lm_harness.sh cache_sft temporal_moe
+CLUSTER=fir bash scripts/cluv/eval_soft_cache.sh cache_sft temporal_moe
+```
+
+`eval_lm_harness.py` and `eval_soft_cache.py` both accept a
+`--checkpoint-dir` override (added specifically for cluv checkpoints, whose
+`<variant>_<CLUSTER>` naming differs from the mila `run_finetune_moe_*.sh`
+`VARIANT_CHECKPOINTS` convention) -- the `eval_*.sh` wrappers pass it
+automatically, you shouldn't need to set it by hand.

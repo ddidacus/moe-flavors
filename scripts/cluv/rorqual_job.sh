@@ -12,4 +12,4 @@
 # nodes -- use `module load httpproxy` if you need live wandb/CometML
 # instead of the offline default set in pyproject.toml.
 
-source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
+source scripts/cluv/common.sh

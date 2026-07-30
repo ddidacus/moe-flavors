@@ -12,4 +12,4 @@
 # (48GB vs 80GB) -- lower --batch-size / raise --gradient-accumulation-steps
 # if a job OOMs here.
 
-source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
+source scripts/cluv/common.sh

@@ -48,6 +48,7 @@ PROMPT_LEN="${PROMPT_LEN:-512}"
 COMPLETION_LEN="${COMPLETION_LEN:-512}"
 DATASET_SPLIT="${DATASET_SPLIT:-math,code}"
 MAX_SAMPLES="${MAX_SAMPLES:-20000}"
+INIT_ADAPTER="${INIT_ADAPTER:-}"   # e.g. a completed sft_baseline checkpoint
 
 DATA_TAG=$([ "$DATASET_SPLIT" = "math,code" ] && echo "mathcode" || echo "allsplits")
 SEQ_TAG=""
@@ -55,8 +56,12 @@ if [ "$PROMPT_LEN" != "512" ] || [ "$COMPLETION_LEN" != "512" ]; then
     SEQ_TAG="_seq${PROMPT_LEN}-${COMPLETION_LEN}"
 fi
 if [ "$MAX_SAMPLES" != "20000" ]; then SEQ_TAG="${SEQ_TAG}_n${MAX_SAMPLES}"; fi
+if [ -n "$INIT_ADAPTER" ]; then SEQ_TAG="${SEQ_TAG}_initsft"; fi
 SAVE_DIR="checkpoints/controller_${MODEL_TAG}_${DATA_TAG}_c${CACHE_SIZE}_eta${DELIBERATION_COST}${SEQ_TAG}"
 RUN_NAME="controller-${MODEL_TAG}-${DATA_TAG}-c${CACHE_SIZE}-eta${DELIBERATION_COST}${SEQ_TAG}"
+
+INIT_ARGS=""
+if [ -n "$INIT_ADAPTER" ]; then INIT_ARGS="--init-adapter $INIT_ADAPTER"; fi
 
 # Retry fast startup failures (shared-FS flakiness: triton JIT getsource
 # errors, NCCL rendezvous timeouts, HF cache lock contention). A failure
@@ -87,7 +92,8 @@ for ATTEMPT in 1 2 3; do
     --wandb-run-name "$RUN_NAME" \
     --save-dir "$SAVE_DIR" \
     --save-every 50 \
-    --resume && break
+    --resume \
+    $INIT_ARGS && break
     ELAPSED=$(( $(date +%s) - START ))
     if [ $ELAPSED -gt 600 ]; then echo "[retry] failure after ${ELAPSED}s, not retrying"; break; fi
     echo "[retry] fast startup failure (attempt $ATTEMPT, ${ELAPSED}s), retrying in 60s..."

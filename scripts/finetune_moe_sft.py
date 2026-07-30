@@ -171,6 +171,14 @@ def main():
     parser.add_argument("--save-every", type=int, default=50)
     parser.add_argument("--resume", action="store_true",
                         help="Resume from last checkpoint in --save-dir")
+    parser.add_argument("--temporal", action="store_true",
+                        help="Wrap MoE blocks with boundary prediction + "
+                             "hold/switch routing (TemporalWrapMixin, STE "
+                             "variant) before SFT, matching the mixin used "
+                             "downstream by finetune_moe_grpo.py --temporal "
+                             "-- so a later DAPO stage can --init-adapter "
+                             "from this checkpoint and keep training the "
+                             "same wrapped architecture.")
 
     lora_group = parser.add_argument_group("LoRA")
     lora_group.add_argument("--lora-r", type=int, default=16)
@@ -236,6 +244,19 @@ def main():
             alpha_pattern={r".*\.gate_up_proj": args.lora_alpha * 2},
         )
 
+    # Temporal MoE: load the model ourselves and wrap the MoE blocks before
+    # peft sees it, exactly like finetune_moe_grpo.py --temporal. The
+    # boundary-prediction layers (term_proj1/2) are new non-LoRA params ->
+    # trained + checkpointed via peft modules_to_save.
+    model_or_id = args.model
+    if args.temporal:
+        from transformers import AutoModelForCausalLM
+        from src.temporal_moe_wrapper import TemporalWrapConfig, TemporalWrapMixin
+        model_or_id = AutoModelForCausalLM.from_pretrained(
+            args.model, dtype=torch.bfloat16, low_cpu_mem_usage=True)
+        TemporalWrapMixin.apply(model_or_id, TemporalWrapConfig(ste=True))
+        lora_kwargs["modules_to_save"] = ["term_proj1", "term_proj2"]
+
     lora_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
         r=args.lora_r,
@@ -261,10 +282,19 @@ def main():
         max_steps=args.num_steps,
         logging_steps=1,
         save_steps=args.save_every,
-        save_total_limit=3,
+        # No pruning: earlier checkpoints (e.g. checkpoint-32) are load-
+        # bearing anchors for other scripts' --init-adapter (controller_
+        # baseline, sft_then_dapo, melinoe all init from a specific SFT
+        # step-count) -- save_total_limit=3 silently deleted checkpoint-32
+        # out from under them the moment this run was resumed past step 32,
+        # breaking every downstream --init-adapter load with a bare
+        # FileNotFoundError.
+        save_total_limit=None,
         max_length=args.prompt_len + args.completion_len,
         packing=False,  # keep prompt/completion loss masking exact per-row
-        model_init_kwargs={"dtype": torch.bfloat16},
+        # No trust_remote_code / model_init_kwargs when --temporal already
+        # loaded + wrapped a model instance (matches finetune_moe_grpo.py).
+        model_init_kwargs=None if args.temporal else {"dtype": torch.bfloat16},
         # TRL's default (0.001) enables its chunked-CE MoE aux-loss path,
         # which reads text_config.num_experts -- a Mixtral-style attribute
         # name PhimoeConfig doesn't have (it uses num_local_experts),
@@ -276,7 +306,7 @@ def main():
     )
 
     trainer = SFTTrainer(
-        model=args.model,
+        model=model_or_id,
         args=sft_config,
         train_dataset=train_dataset,
         processing_class=tokenizer,
@@ -305,6 +335,13 @@ def main():
             for k, v in sd.items():
                 nk = k.replace(".lora_A.weight", f".lora_A.{adapter_name}.weight") \
                       .replace(".lora_B.weight", f".lora_B.{adapter_name}.weight")
+                if nk not in model_keys:
+                    # modules_to_save entries (e.g. term_proj*, --temporal
+                    # only): saved without the wrapper infix.
+                    head, _, tail = nk.rpartition(".")
+                    cand = f"{head}.modules_to_save.{adapter_name}.{tail}"
+                    if cand in model_keys:
+                        nk = cand
                 remapped[nk] = v
             res = peft_model.load_state_dict(remapped, strict=False)
             if res.unexpected_keys:

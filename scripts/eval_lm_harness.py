@@ -113,15 +113,18 @@ _lm_task.ConfigurableTask.build_qa_turn = _build_qa_turn_str_safe
 
 
 VARIANT_CHECKPOINTS = {
-    "cache_sft": "checkpoints/grpo_phi-tiny-moe-instruct_cache_mathcode_"
-                "sft0.5_b0.08_c4_softall_lr1e-4_dbg150_rl2.0",
-    "temporal_moe": "checkpoints/grpo_phi-tiny-moe-instruct_cache_mathcode_"
-                   "sft0.5_b0.08_c4_topk2_tmoeN8_lr1e-4_dbg150_rl2.0",
-    "sft_baseline": "checkpoints/sft_phi-tiny-moe-instruct_mathcode_lr1e-4",
-    "sft_baseline_seq1024": "checkpoints/sft_phi-tiny-moe-instruct_mathcode_"
-                            "lr1e-4_seq1024-1024",
+    "cache_sft": "checkpoints/grpo_phi-tiny-moe-instruct_cache_allsplits_"
+                "sft0.5_b0.08_c4_softall_lr1e-4_dbg250_rl2.0_seq1024-1024_n2000",
+    "temporal_moe": "checkpoints/grpo_phi-tiny-moe-instruct_cache_allsplits_"
+                   "sft0.5_b0.08_c4_topk2_tmoeN8_lr1e-4_dbg250_rl2.0_seq1024-1024_n2000",
+    "sft_baseline": "checkpoints/sft_phi-tiny-moe-instruct_allsplits_"
+                    "lr1e-4_seq1024-1024_n2000",
     "controller_baseline": "checkpoints/controller_phi-tiny-moe-instruct_"
-                           "mathcode_c4_eta0.02",
+                           "allsplits_c4_eta0.02_seq1024-1024_n2000_initsft",
+    "sft_then_dapo": "checkpoints/grpo_phi-tiny-moe-instruct_cache_allsplits_"
+                     "sft0.5_b0.1_c4_softall_initsft_lr1e-4_dbg250_rl2.0_seq1024-1024_n2000",
+    "melinoe": "checkpoints/melinoe_phi-tiny-moe-instruct_allsplits_"
+              "c4_lcs0.5_lrm0.1_seq1024-1024_n2000_initsft",
 }
 # mmlu/mmmlu_<lang>: multiple_choice, loglikelihood-scored -- deterministic,
 # unaffected by temperature/top_p/seed. gsm8k/humaneval/hendrycks_math:
@@ -456,8 +459,8 @@ def run_math_only(variant, base_model_name, batch_size, limit, out_dir):
 
 def merge(out_dir):
     out_dir = Path(out_dir)
-    all_variants = ["base", "cache_sft", "temporal_moe", "sft_baseline",
-                   "sft_baseline_seq1024", "controller_baseline"]
+    all_variants = ["base", "sft_baseline", "controller_baseline",
+                   "cache_sft", "temporal_moe", "sft_then_dapo", "melinoe"]
     summary = {}
     for variant in all_variants:
         p = out_dir / f"results_{variant}.json"
@@ -506,8 +509,8 @@ def main():
     ap.add_argument("--model", default="microsoft/Phi-tiny-MoE-instruct")
     ap.add_argument("--variant",
                     choices=["base", "cache_sft", "temporal_moe",
-                             "sft_baseline", "sft_baseline_seq1024",
-                             "controller_baseline", "merge"],
+                             "sft_baseline", "controller_baseline",
+                             "sft_then_dapo", "melinoe", "merge"],
                     required=True)
     ap.add_argument("--batch-size", default="auto")
     ap.add_argument("--limit", type=float, default=200,

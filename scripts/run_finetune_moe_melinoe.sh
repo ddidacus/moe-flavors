@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH --job-name=sft_baseline
-#SBATCH --output=sft_baseline_%j.out
+#SBATCH --job-name=melinoe_baseline
+#SBATCH --output=melinoe_baseline_%j.out
 #SBATCH --cpus-per-task=24
 #SBATCH --mem=200G
 #SBATCH --gres=gpu:a100l:4
@@ -9,15 +9,18 @@
 #SBATCH --signal=B:USR1@120
 #SBATCH --requeue
 
+# MELINOE baseline (Raje, Nayak & Joshi 2026, arXiv:2602.11192) -- same base
+# model + fine-tuning dataset as our other small-scale runs (sft_baseline,
+# cache_sft, temporal_moe, controller_baseline), see
+# scripts/finetune_moe_melinoe.py's own docstring for the method and the
+# deviations from the paper.
+
 source .venv/bin/activate
 export HF_HOME=/home/mila/d/diego.calanzone/scratch/cache
 export UV_CACHE_DIR=/home/mila/d/diego.calanzone/scratch/cache
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export TRITON_CACHE_DIR=/tmp/triton_cache_${SLURM_JOB_ID}
 
-# Pin the wandb run id (shared-filesystem file keyed by SLURM job ID, not
-# /tmp -- --requeue can land the same job ID on a different node) so a
-# preemption + automatic requeue continues the same wandb run.
 mkdir -p .wandb_run_ids
 WANDB_ID_FILE=".wandb_run_ids/${SLURM_JOB_ID}"
 if [ -f "$WANDB_ID_FILE" ]; then
@@ -30,15 +33,27 @@ export WANDB_RESUME=allow
 
 MODEL="${MODEL:-microsoft/Phi-tiny-MoE-instruct}"
 MODEL_TAG=$(basename "$MODEL" | tr '[:upper:]' '[:lower:]')
-LR="${LR:-1e-4}"
 NUM_STEPS="${NUM_STEPS:-150}"
+CACHE_SIZE="${CACHE_SIZE:-4}"
+LAMBDA_CS="${LAMBDA_CS:-0.5}"
+LAMBDA_RM="${LAMBDA_RM:-0.1}"
+GAMMA="${GAMMA:-0.9}"
+RHO="${RHO:-0.1}"
+BATCH_SIZE="${BATCH_SIZE:-4}"
+GRAD_ACCUM="${GRAD_ACCUM:-4}"
+LR="${LR:-1e-4}"
 PROMPT_LEN="${PROMPT_LEN:-512}"
 COMPLETION_LEN="${COMPLETION_LEN:-512}"
-BATCH_SIZE="${BATCH_SIZE:-16}"
-GRAD_ACCUM="${GRAD_ACCUM:-1}"
 DATASET_SPLIT="${DATASET_SPLIT:-math,code}"
 MAX_SAMPLES="${MAX_SAMPLES:-20000}"
-TEMPORAL="${TEMPORAL:-0}"    # 1: boundary-prediction + hold/switch routing mixin
+# Paper's own default (r=32/alpha=16); if --init-adapter'ing from an SFT
+# checkpoint trained with this repo's shared r=16/alpha=32 convention
+# (finetune_moe_grpo.py/finetune_moe_controller.py), OVERRIDE these to
+# LORA_R=16 LORA_ALPHA=32 to match -- otherwise the adapter load fails with
+# a LoRA-rank shape mismatch (state_dict copy needs identical A/B shapes).
+LORA_R="${LORA_R:-32}"
+LORA_ALPHA="${LORA_ALPHA:-16}"
+INIT_ADAPTER="${INIT_ADAPTER:-}"   # e.g. a completed sft_baseline checkpoint
 
 DATA_TAG=$([ "$DATASET_SPLIT" = "math,code" ] && echo "mathcode" || echo "allsplits")
 SEQ_TAG=""
@@ -46,11 +61,12 @@ if [ "$PROMPT_LEN" != "512" ] || [ "$COMPLETION_LEN" != "512" ]; then
     SEQ_TAG="_seq${PROMPT_LEN}-${COMPLETION_LEN}"
 fi
 if [ "$MAX_SAMPLES" != "20000" ]; then SEQ_TAG="${SEQ_TAG}_n${MAX_SAMPLES}"; fi
-if [ "$TEMPORAL" = "1" ]; then SEQ_TAG="${SEQ_TAG}_tmoe"; fi
-SAVE_DIR="checkpoints/sft_${MODEL_TAG}_${DATA_TAG}_lr${LR}${SEQ_TAG}"
-RUN_NAME="sft-${MODEL_TAG}-${DATA_TAG}-lr${LR}${SEQ_TAG}"
-TEMPORAL_FLAG=""
-if [ "$TEMPORAL" = "1" ]; then TEMPORAL_FLAG="--temporal"; fi
+if [ -n "$INIT_ADAPTER" ]; then SEQ_TAG="${SEQ_TAG}_initsft"; fi
+SAVE_DIR="checkpoints/melinoe_${MODEL_TAG}_${DATA_TAG}_c${CACHE_SIZE}_lcs${LAMBDA_CS}_lrm${LAMBDA_RM}${SEQ_TAG}"
+RUN_NAME="melinoe-${MODEL_TAG}-${DATA_TAG}-c${CACHE_SIZE}-lcs${LAMBDA_CS}-lrm${LAMBDA_RM}${SEQ_TAG}"
+
+INIT_ARGS=""
+if [ -n "$INIT_ADAPTER" ]; then INIT_ARGS="--init-adapter $INIT_ADAPTER"; fi
 
 # Retry fast startup failures (shared-FS flakiness: triton JIT getsource
 # errors, NCCL rendezvous timeouts, HF cache lock contention). A failure
@@ -60,7 +76,7 @@ for ATTEMPT in 1 2 3; do
     accelerate launch \
     --multi_gpu \
     --num_processes 4 \
-    scripts/finetune_moe_sft.py \
+    scripts/finetune_moe_melinoe.py \
     --model "$MODEL" \
     --dataset nvidia/Nemotron-Post-Training-Dataset-v2 \
     --dataset-split "$DATASET_SPLIT" \
@@ -70,17 +86,22 @@ for ATTEMPT in 1 2 3; do
     --batch-size "$BATCH_SIZE" \
     --gradient-accumulation-steps "$GRAD_ACCUM" \
     --num-steps "$NUM_STEPS" \
-    --num-epochs 10 \
     --lr "$LR" \
-    --lora-r 16 \
-    --lora-alpha 32 \
+    --cache-size "$CACHE_SIZE" \
+    --cache-layer -1 \
+    --gamma "$GAMMA" \
+    --rho "$RHO" \
+    --lambda-cs "$LAMBDA_CS" \
+    --lambda-rm "$LAMBDA_RM" \
+    --lora-r "$LORA_R" \
+    --lora-alpha "$LORA_ALPHA" \
     --seed 42 \
     --wandb-project moe-cache-reinforce \
     --wandb-run-name "$RUN_NAME" \
     --save-dir "$SAVE_DIR" \
     --save-every 50 \
     --resume \
-    $TEMPORAL_FLAG && break
+    $INIT_ARGS && break
     ELAPSED=$(( $(date +%s) - START ))
     if [ $ELAPSED -gt 600 ]; then echo "[retry] failure after ${ELAPSED}s, not retrying"; break; fi
     echo "[retry] fast startup failure (attempt $ATTEMPT, ${ELAPSED}s), retrying in 60s..."

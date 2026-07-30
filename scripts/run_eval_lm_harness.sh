@@ -2,7 +2,7 @@
 #SBATCH --job-name=eval_lm_harness
 #SBATCH --output=eval_lm_harness_%j.out
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=16G
+#SBATCH --mem=96G
 #SBATCH --gres=gpu:a100l:4
 #SBATCH --partition=short-unkillable
 #SBATCH --time=3:00:00

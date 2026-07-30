@@ -87,6 +87,37 @@ def _convert_only_if_legacy(model, peft_config, adapter_state_dict, adapter_name
 _pwc.convert_peft_adapter_state_dict_for_transformers = _convert_only_if_legacy
 
 
+def _load_adapter_tensors(peft_model, ckpt_dir, adapter_name="default"):
+    """Load LoRA (+ modules_to_save) tensors from ckpt_dir's
+    adapter_model.safetensors directly via load_state_dict, bypassing peft's
+    set_peft_model_state_dict / load_adapter (broken for target_parameters/
+    ParamWrapper adapters in peft 0.19 -- 'PhimoeExperts' has no attribute
+    'weight' -- see finetune_moe_grpo.py, same helper). Shared by --resume
+    (own save-dir) and --init-adapter (a different checkpoint, weights only)."""
+    from safetensors.torch import load_file
+    sd = load_file(str(Path(ckpt_dir) / "adapter_model.safetensors"))
+    model_keys = set(peft_model.state_dict().keys())
+    remapped = {}
+    for k, v in sd.items():
+        nk = k.replace(".lora_A.weight", f".lora_A.{adapter_name}.weight") \
+              .replace(".lora_B.weight", f".lora_B.{adapter_name}.weight")
+        if nk not in model_keys:
+            head, _, tail = nk.rpartition(".")
+            cand = f"{head}.modules_to_save.{adapter_name}.{tail}"
+            if cand in model_keys:
+                nk = cand
+        remapped[nk] = v
+    res = peft_model.load_state_dict(remapped, strict=False)
+    if res.unexpected_keys:
+        raise RuntimeError(
+            f"adapter load failed, unexpected keys: {res.unexpected_keys[:5]}")
+    missing_lora = [k for k in res.missing_keys if "lora" in k]
+    if missing_lora:
+        raise RuntimeError(
+            f"adapter load failed, missing lora keys: {missing_lora[:5]}")
+    return len(remapped)
+
+
 EVAL_POOL_PER_SPLIT = 1000  # matches finetune_moe_grpo.py -- same held-out rows
 
 
@@ -411,6 +442,14 @@ def main():
     parser.add_argument("--save-dir", type=str, default="checkpoints/controller_baseline")
     parser.add_argument("--save-every", type=int, default=50)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--init-adapter", type=str, default=None,
+                        help="Initialize the LoRA adapter's weights from a "
+                             "different checkpoint's adapter (e.g. a "
+                             "completed SFT run) before controller training "
+                             "starts -- weights only, no optimizer/controller/"
+                             "step state. Ignored when --resume finds a "
+                             "checkpoint already in --save-dir (that run "
+                             "continues instead).")
 
     cache_group = parser.add_argument_group("Cache layer / option size")
     cache_group.add_argument("--cache-layer", type=int, default=-1, help="-1 = middle layer")
@@ -550,17 +589,21 @@ def main():
 
     save_dir = Path(args.save_dir)
     start_step = 0
+    ckpt = None
     if args.resume and save_dir.is_dir():
         from transformers.trainer_utils import get_last_checkpoint
         ckpt = get_last_checkpoint(save_dir)
-        if ckpt:
-            print(f"Resuming from {ckpt}")
-            unwrapped = accelerator.unwrap_model(peft_model)
-            unwrapped.load_adapter(ckpt, adapter_name="default", is_trainable=True)
-            ctrl_state = torch.load(Path(ckpt) / "controller.pt", map_location="cpu")
-            accelerator.unwrap_model(controller).load_state_dict(ctrl_state["controller"])
-            optimizer.load_state_dict(ctrl_state["optimizer"])
-            start_step = ctrl_state["step"]
+    if ckpt:
+        print(f"Resuming from {ckpt}")
+        n = _load_adapter_tensors(accelerator.unwrap_model(peft_model), ckpt)
+        print(f"[resume] manually loaded {n} adapter tensors")
+        ctrl_state = torch.load(Path(ckpt) / "controller.pt", map_location="cpu")
+        accelerator.unwrap_model(controller).load_state_dict(ctrl_state["controller"])
+        optimizer.load_state_dict(ctrl_state["optimizer"])
+        start_step = ctrl_state["step"]
+    elif args.init_adapter:
+        n = _load_adapter_tensors(accelerator.unwrap_model(peft_model), args.init_adapter)
+        print(f"[init] loaded {n} adapter tensors from {args.init_adapter}")
 
     preemption = Preemption()
     step = start_step

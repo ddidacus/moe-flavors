@@ -28,6 +28,7 @@ Not ported from the REINFORCE version: the router log-prob REINFORCE term
 """
 
 import argparse
+import math
 import signal
 import sys
 from pathlib import Path
@@ -43,6 +44,39 @@ from peft import LoraConfig, TaskType
 from trl import GRPOConfig, GRPOTrainer
 
 from src.cache_reinforce import cache_emulation_rewards
+
+
+def _load_adapter_tensors(peft_model, ckpt_dir, adapter_name="default"):
+    """Load LoRA (+ modules_to_save) tensors from ckpt_dir's
+    adapter_model.safetensors directly via load_state_dict, bypassing
+    peft's set_peft_model_state_dict (broken for target_parameters/
+    ParamWrapper adapters in peft 0.19 -- 'PhimoeExperts' has no attribute
+    'weight'). Shared by --resume (own save-dir, full trainer state) and
+    --init-adapter (a different checkpoint, weights only)."""
+    from safetensors.torch import load_file
+    sd = load_file(str(Path(ckpt_dir) / "adapter_model.safetensors"))
+    model_keys = set(peft_model.state_dict().keys())
+    remapped = {}
+    for k, v in sd.items():
+        nk = k.replace(".lora_A.weight", f".lora_A.{adapter_name}.weight") \
+              .replace(".lora_B.weight", f".lora_B.{adapter_name}.weight")
+        if nk not in model_keys:
+            # modules_to_save entries (e.g. term_proj*): saved without
+            # the wrapper infix -> '...modules_to_save.default.weight'
+            head, _, tail = nk.rpartition(".")
+            cand = f"{head}.modules_to_save.{adapter_name}.{tail}"
+            if cand in model_keys:
+                nk = cand
+        remapped[nk] = v
+    res = peft_model.load_state_dict(remapped, strict=False)
+    if res.unexpected_keys:
+        raise RuntimeError(
+            f"adapter load failed, unexpected keys: {res.unexpected_keys[:5]}")
+    missing_lora = [k for k in res.missing_keys if "lora" in k]
+    if missing_lora:
+        raise RuntimeError(
+            f"adapter load failed, missing lora keys: {missing_lora[:5]}")
+    return len(remapped)
 from src.temporal_moe_wrapper import TemporalWrapConfig, TemporalWrapMixin
 
 # peft 0.19 x transformers 5.8 bug: on adapter-checkpoint load, peft's v4->v5
@@ -277,6 +311,62 @@ class PreemptionCallback(TrainerCallback):
         return control
 
 
+def _sinusoidal_cache_embedding(cache_size, dim, device, dtype):
+    """Standard Transformer positional-encoding formula (Vaswani et al.),
+    treating the scalar cache_size as a 'position' instead of a token index
+    -- so distinct cache sizes get distinguishable but structurally related
+    conditioning vectors (same inductive bias used for token positions:
+    smoothly varying frequencies across the embedding dimension), added
+    directly to the router's input hidden states."""
+    half = dim // 2
+    freqs = torch.exp(
+        -math.log(10000.0) * torch.arange(half, device=device, dtype=torch.float32) / half)
+    ang = float(cache_size) * freqs
+    emb = torch.cat([torch.sin(ang), torch.cos(ang)])
+    if dim % 2 == 1:
+        emb = torch.cat([emb, torch.zeros(1, device=device)])
+    return emb.to(dtype)
+
+
+class CacheSizeConditionState:
+    """Holds the CURRENT training step's target cache size (for router
+    conditioning) and its precomputed sinusoidal embedding. Set once per
+    step by CacheSizeScheduleCallback.on_step_begin (before that step's
+    rollout generation begins), read by both the router's monkeypatched
+    forward (adds the embedding to its input) and RewardEngine._compute
+    (simulates an LRU of exactly this capacity) -- so the reward always
+    matches whichever size the router was just conditioned to target."""
+
+    def __init__(self, sizes, dim, device, dtype):
+        self.sizes = list(sizes)
+        self.embeddings = {c: _sinusoidal_cache_embedding(c, dim, device, dtype)
+                          for c in self.sizes}
+        self.current_size = self.sizes[0]
+
+    @property
+    def embedding(self):
+        return self.embeddings[self.current_size]
+
+
+class CacheSizeScheduleCallback(TrainerCallback):
+    """Round-robin cache-size curriculum: cycles through --conditioned-
+    cache-sizes every SINGLE step (not blocked into phases), so every
+    candidate size gets equal, INTERLEAVED exposure across training (e.g.
+    180 steps / 3 sizes = 60 steps = 3840 samples each at effective batch
+    64). Interleaving (rather than training size A to completion, then B,
+    then C) avoids the router drifting away from earlier sizes' learned
+    behavior by the time training ends -- the classic catastrophic-
+    forgetting risk of a blocked curriculum."""
+
+    def __init__(self, state):
+        self.state = state
+
+    def on_step_begin(self, args, state, control, **kwargs):
+        sizes = self.state.sizes
+        self.state.current_size = sizes[state.global_step % len(sizes)]
+        return control
+
+
 class RewardEngine:
     """Computes cache and KD rewards for a batch of GRPO completions.
 
@@ -285,13 +375,18 @@ class RewardEngine:
     log-probs), plus an adapter-disabled ref forward when KD is needed.
     """
 
-    def __init__(self, args, temporal_wrappers=None):
+    def __init__(self, args, temporal_wrappers=None, cache_size_state=None):
         self.args = args
         self.trainer = None
         # With temporal routing, the cache reward reads each token's
         # *effective held* expert decisions from the wrapper at the cache
         # layer (stored by its forward), not the raw router logits.
         self.temporal_wrappers = temporal_wrappers
+        # When set (--conditioned-cache-sizes), the LRU capacity simulated
+        # for the reward each step is state.current_size, not args.cache_size
+        # -- kept in lockstep with whatever size the router was just
+        # conditioned on for that step's rollout.
+        self.cache_size_state = cache_size_state
         self._memo_key = None
         self._memo = None
 
@@ -342,8 +437,10 @@ class RewardEngine:
             )
         else:
             router_logits = out.router_logits[args.cache_layer].view(B, S, -1)
+            cache_size = (self.cache_size_state.current_size
+                         if self.cache_size_state is not None else args.cache_size)
             r_cache_tok, _, hit_rate = cache_emulation_rewards(
-                router_logits, valid, action, cache_size=args.cache_size,
+                router_logits, valid, action, cache_size=cache_size,
                 experts_per_token=args.cache_experts_per_token,
                 use_topk=args.cache_topk, soft=args.soft_cache,
             )
@@ -371,6 +468,8 @@ class RewardEngine:
             if self.temporal_wrappers is not None:
                 w = self.temporal_wrappers[self.args.cache_layer]
                 log_metric("boundary_rate", float(w._last_F))
+            if self.cache_size_state is not None:
+                log_metric("cond_cache_size", float(self.cache_size_state.current_size))
         return scores["cache"]
 
 
@@ -475,6 +574,13 @@ def main():
     parser.add_argument("--save-every", type=int, default=50)
     parser.add_argument("--resume", action="store_true",
                         help="Resume from last checkpoint in --save-dir")
+    parser.add_argument("--init-adapter", type=str, default=None,
+                        help="Initialize the LoRA adapter's weights from a "
+                             "different checkpoint's adapter_model.safetensors "
+                             "(e.g. a completed SFT run) before RL training "
+                             "starts -- weights only, no optimizer/step state. "
+                             "Ignored when --resume finds a checkpoint already "
+                             "in --save-dir (that run continues instead).")
     parser.add_argument("--eval-ppl-seqs", type=int, default=256,
                         help="Held-out sequences for the perplexity eval")
     parser.add_argument("--eval-ppl-every", type=int, default=25,
@@ -523,6 +629,19 @@ def main():
                                   "reward: router probability mass on the "
                                   "cached experts. LRU still touched by the "
                                   "top-k (--cache-experts-per-token) experts")
+    cache_group.add_argument("--conditioned-cache-sizes", type=str, default=None,
+                             help="Comma list of cache sizes (e.g. '2,4,8') "
+                                  "to condition the router on: each is given "
+                                  "a sinusoidal positional embedding added to "
+                                  "the router's input hidden states, round-"
+                                  "robin cycled every step (not blocked into "
+                                  "phases) so each size gets equal "
+                                  "interleaved exposure. Implies --soft-cache "
+                                  "(dense routing + soft cache reward); "
+                                  "--cache-size is ignored -- the LRU "
+                                  "capacity simulated for the reward always "
+                                  "tracks the CURRENT step's conditioned "
+                                  "size. Incompatible with --temporal.")
 
     temporal_group = parser.add_argument_group("Temporal MoE (optional)")
     temporal_group.add_argument("--temporal", action="store_true",
@@ -545,6 +664,13 @@ def main():
                                  "the PhiMoE one; unmatched names are ignored")
 
     args = parser.parse_args()
+
+    if args.conditioned_cache_sizes:
+        args.conditioned_cache_sizes = [
+            int(x) for x in args.conditioned_cache_sizes.split(",") if x.strip()]
+        if args.temporal:
+            raise ValueError("--conditioned-cache-sizes is incompatible with --temporal")
+        args.soft_cache = True  # same dense-routing + soft-reward mechanics as cache_sft
 
     import os
     os.environ.setdefault("WANDB_PROJECT", args.wandb_project)
@@ -706,8 +832,12 @@ def main():
     num_layers = model.config.num_hidden_layers
     if args.cache_layer < 0:
         args.cache_layer = num_layers // 2
-    print(f"[cache] LRU size={args.cache_size} on router of layer "
-          f"{args.cache_layer}/{num_layers}")
+    if args.conditioned_cache_sizes:
+        print(f"[cache] conditioned LRU sizes={args.conditioned_cache_sizes} "
+              f"on router of layer {args.cache_layer}/{num_layers}")
+    else:
+        print(f"[cache] LRU size={args.cache_size} on router of layer "
+              f"{args.cache_layer}/{num_layers}")
 
     if args.soft_cache:
         # Dense routing at the cache layer: every expert is active with its
@@ -722,7 +852,21 @@ def main():
             raise ValueError("--soft-cache is incompatible with --temporal")
         import types
 
+        cache_size_state = None
+        if args.conditioned_cache_sizes:
+            device = next(model.parameters()).device
+            cache_size_state = CacheSizeConditionState(
+                args.conditioned_cache_sizes, model.config.hidden_size,
+                device, torch.bfloat16)
+            engine.cache_size_state = cache_size_state
+            trainer.add_callback(CacheSizeScheduleCallback(cache_size_state))
+            print(f"[cache] conditioning on sizes {args.conditioned_cache_sizes} "
+                  f"(round-robin every step)")
+
         def _dense_router_forward(self, hidden_states):
+            if cache_size_state is not None:
+                hidden_states = hidden_states + cache_size_state.embedding.to(
+                    hidden_states.dtype)
             router_logits = F.linear(hidden_states, self.weight, self.bias)
             routing_weights = torch.softmax(router_logits.float(), dim=-1) \
                 .to(hidden_states.dtype)
@@ -758,35 +902,16 @@ def main():
         # calls on resume -- with a direct load_state_dict of the remapped
         # adapter tensors. Optimizer/scheduler/trainer state still load
         # through the normal Trainer path.
-        from safetensors.torch import load_file
         peft_model = trainer.model
 
         def _manual_load_adapter(ckpt_dir, adapter_name="default", **kwargs):
-            sd = load_file(str(Path(ckpt_dir) / "adapter_model.safetensors"))
-            model_keys = set(peft_model.state_dict().keys())
-            remapped = {}
-            for k, v in sd.items():
-                nk = k.replace(".lora_A.weight", f".lora_A.{adapter_name}.weight") \
-                      .replace(".lora_B.weight", f".lora_B.{adapter_name}.weight")
-                if nk not in model_keys:
-                    # modules_to_save entries (e.g. term_proj*): saved without
-                    # the wrapper infix -> '...modules_to_save.default.weight'
-                    head, _, tail = nk.rpartition(".")
-                    cand = f"{head}.modules_to_save.{adapter_name}.{tail}"
-                    if cand in model_keys:
-                        nk = cand
-                remapped[nk] = v
-            res = peft_model.load_state_dict(remapped, strict=False)
-            if res.unexpected_keys:
-                raise RuntimeError(
-                    f"adapter resume failed, unexpected keys: {res.unexpected_keys[:5]}")
-            missing_lora = [k for k in res.missing_keys if "lora" in k]
-            if missing_lora:
-                raise RuntimeError(
-                    f"adapter resume failed, missing lora keys: {missing_lora[:5]}")
-            print(f"[resume] manually loaded {len(remapped)} adapter tensors")
+            n = _load_adapter_tensors(peft_model, ckpt_dir, adapter_name)
+            print(f"[resume] manually loaded {n} adapter tensors")
 
         peft_model.load_adapter = _manual_load_adapter
+    elif args.init_adapter:
+        n = _load_adapter_tensors(trainer.model, args.init_adapter)
+        print(f"[init] loaded {n} adapter tensors from {args.init_adapter}")
 
     trainer.train(resume_from_checkpoint=resume_ckpt)
 

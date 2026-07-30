@@ -5,7 +5,7 @@
 #SBATCH --mem=48G
 #SBATCH --gres=gpu:2
 #SBATCH --partition=main
-#SBATCH --time=3:00:00
+#SBATCH --time=6:00:00
 
 # One job, two GPUs, two processes: base and tuned run concurrently (each
 # pinned to its own GPU), then a lightweight CPU-only merge writes

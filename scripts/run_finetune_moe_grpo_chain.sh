@@ -8,20 +8,24 @@
 #SBATCH --time=3:00:00
 #SBATCH --signal=B:USR1@120
 
-# Runs cache_sft and temporal_moe SEQUENTIALLY within one 4-GPU
-# short-unkillable allocation instead of two parallel `long`-partition
-# chains -- avoids needing 8 GPUs of simultaneous demand while both wait
-# in queue. Each gets a fixed time slice per job submission (checkpointing
-# every SAVE_EVERY steps via --resume), and this script resubmits itself
-# at the end until BOTH reach NUM_STEPS. WANDB run ids are keyed by the
-# save-dir basename (stable across resubmissions), not $SLURM_JOB_ID
-# (which changes every time this chain resubmits itself).
+# Runs cache_sft and temporal_moe CONCURRENTLY within one 4-GPU
+# short-unkillable allocation -- 2 GPUs each, as two background
+# `accelerate launch` processes -- instead of splitting the same 4 GPUs
+# into sequential time-boxed slices. Each SLURM submission gets one 3h
+# window; --signal=B:USR1@120 + each run's own Preemption handler
+# checkpoints before the job is killed at the time limit. This script
+# resubmits itself at the end if either run hasn't reached NUM_STEPS yet.
+#
+# GRAD_ACCUM defaults to 4 here (vs 2 in the 4-GPU standalone scripts) to
+# keep the effective global batch size the same: 8 (per-device) x 4
+# (accum) x 2 (GPUs) = 64, matching 8 x 2 x 4 = 64 on 4 GPUs -- important
+# since cache_sft already has real optimizer steps checkpointed at that
+# effective batch size and must resume train with the same dynamics.
 
 source .venv/bin/activate
 export HF_HOME=/home/mila/d/diego.calanzone/scratch/cache
 export UV_CACHE_DIR=/home/mila/d/diego.calanzone/scratch/cache
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export TRITON_CACHE_DIR=/tmp/triton_cache_${SLURM_JOB_ID}
 
 MODEL="${MODEL:-microsoft/Phi-tiny-MoE-instruct}"
 MODEL_TAG=$(basename "$MODEL" | tr '[:upper:]' '[:lower:]')
@@ -32,7 +36,7 @@ COMPLETION_LEN="${COMPLETION_LEN:-1024}"
 LR="${LR:-1e-4}"
 NUM_STEPS="${NUM_STEPS:-250}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
-GRAD_ACCUM="${GRAD_ACCUM:-2}"
+GRAD_ACCUM="${GRAD_ACCUM:-4}"
 BETA="${BETA:-0.08}"
 RL_COEF="${RL_COEF:-2.0}"
 SFT_COEF="${SFT_COEF:-0.5}"
@@ -42,12 +46,7 @@ CACHE_EXPERTS="${CACHE_EXPERTS:-2}"
 CACHE_TOPK="${CACHE_TOPK:-1}"
 RATIO_N="${RATIO_N:-8}"
 NUM_GEN="${NUM_GEN:-8}"
-SAVE_EVERY="${SAVE_EVERY:-10}"    # finer-grained than the standalone script
-                                   # (50) so a 3h slice reliably lands on a
-                                   # checkpoint before the job ends.
-SLICE_BUDGET="${SLICE_BUDGET:-4800}"  # ~80min per run per job submission,
-                                       # leaves headroom in the 3h cap for
-                                       # env/model/dataset setup twice.
+SAVE_EVERY="${SAVE_EVERY:-25}"
 DATA_TAG=$([ "$DATASET_SPLIT" = "math,code" ] && echo "mathcode" || echo "allsplits")
 
 # Mirrors run_finetune_moe_grpo.sh's SAVE_DIR/RUN_NAME naming exactly, so
@@ -77,22 +76,27 @@ print(json.load(open(d + '/trainer_state.json'))['global_step']) if d else print
 " 2>/dev/null || echo 0
 }
 
-run_slice() {  # $1 = EXTRA_ARGS (word-split), uses SAVE_DIR/RUN_NAME globals
-    local EXTRA_ARGS="$1"
+run_bg() {  # $1=CUDA_VISIBLE_DEVICES  $2=PORT  $3=EXTRA_ARGS  $4=LOG_SUFFIX
+    local DEVICES="$1" PORT="$2" EXTRA_ARGS="$3" LOG_SUFFIX="$4"
     mkdir -p .wandb_run_ids
     local WANDB_ID_FILE=".wandb_run_ids/$(basename "$SAVE_DIR")"
+    local WANDB_RUN_ID_VAL
     if [ -f "$WANDB_ID_FILE" ]; then
-        export WANDB_RUN_ID=$(cat "$WANDB_ID_FILE")
+        WANDB_RUN_ID_VAL=$(cat "$WANDB_ID_FILE")
     else
-        export WANDB_RUN_ID=$(python3 -c "import wandb; print(wandb.util.generate_id())")
-        echo "$WANDB_RUN_ID" > "$WANDB_ID_FILE"
+        WANDB_RUN_ID_VAL=$(python3 -c "import wandb; print(wandb.util.generate_id())")
+        echo "$WANDB_RUN_ID_VAL" > "$WANDB_ID_FILE"
     fi
-    export WANDB_RESUME=allow
-
-    echo "[chain] running $RUN_NAME for up to ${SLICE_BUDGET}s (save-dir: $SAVE_DIR)"
-    timeout "$SLICE_BUDGET" accelerate launch \
+    echo "[chain] launching $RUN_NAME on GPUs $DEVICES (save-dir: $SAVE_DIR)"
+    (
+      export CUDA_VISIBLE_DEVICES="$DEVICES"
+      export WANDB_RUN_ID="$WANDB_RUN_ID_VAL"
+      export WANDB_RESUME=allow
+      export TRITON_CACHE_DIR="/tmp/triton_cache_${SLURM_JOB_ID}_${LOG_SUFFIX}"
+      accelerate launch \
         --multi_gpu \
-        --num_processes 4 \
+        --num_processes 2 \
+        --main_process_port "$PORT" \
         scripts/finetune_moe_grpo.py \
         --model "$MODEL" \
         --dataset nvidia/Nemotron-Post-Training-Dataset-v2 \
@@ -123,31 +127,34 @@ run_slice() {  # $1 = EXTRA_ARGS (word-split), uses SAVE_DIR/RUN_NAME globals
         --eval-ppl-every 10 \
         --resume \
         $EXTRA_ARGS
-    local rc=$?
-    if [ $rc -ne 0 ] && [ $rc -ne 124 ]; then
-        echo "[chain] $RUN_NAME slice exited with unexpected code $rc"
-    fi
+    ) > "grpo_chain_${SLURM_JOB_ID}_${LOG_SUFFIX}.out" 2>&1 &
 }
 
-# --- cache_sft slice ---
+PIDS=()
+
+# --- cache_sft on GPUs 0,1 ---
 SOFT_CACHE=1 TEMPORAL=0
 compute_names
 CACHE_SAVE_DIR="$SAVE_DIR"
 if [ "$(current_step "$CACHE_SAVE_DIR")" -lt "$NUM_STEPS" ]; then
-    run_slice "--cache-topk --soft-cache"
+    run_bg "0,1" 29500 "--cache-topk --soft-cache" "cache_sft"
+    PIDS+=($!)
 else
     echo "[chain] cache_sft already at/above $NUM_STEPS steps, skipping"
 fi
 
-# --- temporal_moe slice ---
+# --- temporal_moe on GPUs 2,3 ---
 SOFT_CACHE=0 TEMPORAL=1
 compute_names
 TEMPORAL_SAVE_DIR="$SAVE_DIR"
 if [ "$(current_step "$TEMPORAL_SAVE_DIR")" -lt "$NUM_STEPS" ]; then
-    run_slice "--cache-topk --temporal --ratio-loss-N $RATIO_N"
+    run_bg "2,3" 29501 "--cache-topk --temporal --ratio-loss-N $RATIO_N" "temporal_moe"
+    PIDS+=($!)
 else
     echo "[chain] temporal_moe already at/above $NUM_STEPS steps, skipping"
 fi
+
+for pid in "${PIDS[@]}"; do wait "$pid"; done
 
 CACHE_STEP=$(current_step "$CACHE_SAVE_DIR")
 TEMPORAL_STEP=$(current_step "$TEMPORAL_SAVE_DIR")

@@ -78,6 +78,7 @@ retraining everything. Each takes `CLUSTER` as a required env var.
 | `train_cache_sft.sh` | `finetune_moe_grpo.py` (soft cache reward) | `checkpoints/cache_sft_<CLUSTER>` |
 | `train_temporal_moe.sh` | `finetune_moe_grpo.py` (+ `--temporal`) | `checkpoints/temporal_moe_<CLUSTER>` |
 | `train_controller_baseline.sh` | `finetune_moe_controller.py` | `checkpoints/controller_baseline_<CLUSTER>` |
+| `train_melinoe_baseline.sh` | `finetune_moe_melinoe.py` (cache-consistency + rank-margin loss, arXiv:2602.11192) | `checkpoints/melinoe_baseline_<CLUSTER>` |
 | `eval_lm_harness.sh [variant...]` | `scripts/eval_lm_harness.py` (lm-eval-harness: MMLU/MMMLU/GSM8K/HumanEval/MATH) | reads `checkpoints/<variant>_<CLUSTER>`, writes `evals/<CLUSTER>/<date>/` |
 | `eval_soft_cache.sh [variant...]` | `scripts/eval_soft_cache.py` (LRU cache-hit-rate; **stub**, see its docstring) | reads `checkpoints/<variant>_<CLUSTER>`, writes `evals/<CLUSTER>/soft_cache_<date>/` |
 

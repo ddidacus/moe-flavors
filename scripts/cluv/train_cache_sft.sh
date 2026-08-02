@@ -16,7 +16,7 @@ cluv submit --autocommit "$CLUSTER" --time=1-00:00:00 -- accelerate launch --mul
     --dataset-split stem,chat,math,code,multilingual_ja,multilingual_de,multilingual_it,multilingual_es,multilingual_fr \
     --max-samples 2000 --prompt-len 1024 --completion-len 1024 \
     --lr 1e-4 --lora-r 16 --lora-alpha 32 --seed 42 \
-    --wandb-project moe-cache-reinforce --save-every 50 --resume \
+    --wandb-project moe-cache-reinforce --save-every 100 --save-total-limit 3 --resume \
     --batch-size 8 --gradient-accumulation-steps 2 --num-steps 250 --num-epochs 10 \
     --num-generations 8 --temperature 1.0 --rl-coef 2.0 --sft-coef 0.5 --beta 0.08 \
     --cache-size 4 --cache-layer -1 --cache-experts-per-token 2 --cache-topk --soft-cache \

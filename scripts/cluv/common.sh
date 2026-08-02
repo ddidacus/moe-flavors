@@ -25,6 +25,23 @@ if [ "${UV_OFFLINE:-0}" = "1" ] && [ -d "${SCRATCH:-}/datasets/hf_cache" ]; then
     export HF_HUB_OFFLINE=1
 fi
 
+# scripts/finetune_moe_*.py write to a plain relative `checkpoints/` dir,
+# which otherwise lands on $HOME -- a tiny (e.g. 25GB on tamia) quota
+# shared with the venv, vs. $SCRATCH's ~TB-scale quota. A long GRPO run's
+# rotating LoRA checkpoints (up to save-total-limit x several GB) can fill
+# $HOME outright (EDQUOT mid-write -> corrupted checkpoint, see the
+# 2026-07-30 tamia incident). Symlink checkpoints/ to $SCRATCH once,
+# migrating any pre-existing on-$HOME checkpoints the first time.
+if [ -n "${SCRATCH:-}" ]; then
+    mkdir -p "$SCRATCH/checkpoints"
+    if [ -d checkpoints ] && [ ! -L checkpoints ]; then
+        shopt -s dotglob nullglob
+        mv checkpoints/* "$SCRATCH/checkpoints/" 2>/dev/null || true
+        rmdir checkpoints 2>/dev/null || true
+    fi
+    ln -sfn "$SCRATCH/checkpoints" checkpoints
+fi
+
 # Compute nodes on these clusters have no internet access, so wandb (even
 # in "offline" mode) is more trouble than it's worth -- force it off and
 # rely on the SLURM stdout log (%x_%j.out) instead. Overrides any

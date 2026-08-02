@@ -46,6 +46,46 @@ from trl import GRPOConfig, GRPOTrainer
 from src.cache_reinforce import cache_emulation_rewards
 
 
+def _checkpoint_is_intact(ckpt_dir):
+    """Best-effort integrity check for a Trainer checkpoint: verifies the
+    safetensors adapter file's header parses and optimizer.pt/scheduler.pt
+    (plain torch pickle/zip) fully deserialize. Catches the truncated-write
+    corruption a disk-quota-exceeded save leaves behind (safetensors
+    'HeaderTooLarge'/short-read, torch.load 'unexpected pos' zip errors)
+    without doing a real load into the model."""
+    ckpt_dir = Path(ckpt_dir)
+    try:
+        from safetensors import safe_open
+        with safe_open(str(ckpt_dir / "adapter_model.safetensors"),
+                        framework="pt") as f:
+            list(f.keys())
+        for fname in ("optimizer.pt", "scheduler.pt"):
+            fpath = ckpt_dir / fname
+            if fpath.is_file():
+                torch.load(str(fpath), map_location="cpu", weights_only=False)
+        return True
+    except Exception as e:
+        print(f"[resume] checkpoint {ckpt_dir} failed integrity check "
+              f"({type(e).__name__}: {e}) -- skipping")
+        return False
+
+
+def _find_valid_checkpoint(save_dir):
+    """Like transformers.trainer_utils.get_last_checkpoint, but falls back
+    to progressively older checkpoints in --save-dir when the newest one(s)
+    are corrupted (e.g. a save interrupted mid-write by a disk quota hit)."""
+    import re
+    ckpt_re = re.compile(r"^checkpoint-(\d+)$")
+    candidates = sorted(
+        (p for p in Path(save_dir).iterdir()
+         if p.is_dir() and ckpt_re.match(p.name)),
+        key=lambda p: int(ckpt_re.match(p.name).group(1)), reverse=True)
+    for ckpt in candidates:
+        if _checkpoint_is_intact(ckpt):
+            return str(ckpt)
+    return None
+
+
 def _load_adapter_tensors(peft_model, ckpt_dir, adapter_name="default"):
     """Load LoRA (+ modules_to_save) tensors from ckpt_dir's
     adapter_model.safetensors directly via load_state_dict, bypassing
@@ -211,6 +251,27 @@ def build_eval_sequences(tokenizer, dataset_name, split, n_total, max_len,
                             add_special_tokens=False)["input_ids"]
             eval_ids.append(ids)
     return eval_ids
+
+
+class CompletionsPruneCallback(TrainerCallback):
+    """GRPOConfig(log_completions=True) writes a new completions_NNNNN.parquet
+    to <output_dir>/completions/ on every logging step, with no rotation
+    (unlike model checkpoints' save_total_limit) -- left alone this fills
+    the disk over a long run (see the tamia disk-quota-exceeded crash on
+    2026-07-30). Keep only the `limit` most recent files."""
+
+    def __init__(self, limit=3):
+        self.limit = limit
+
+    def on_log(self, args, state, control, **kwargs):
+        if not state.is_world_process_zero:
+            return
+        comp_dir = Path(args.output_dir) / "completions"
+        if not comp_dir.is_dir():
+            return
+        files = sorted(comp_dir.glob("completions_*.parquet"))
+        for f in files[:-self.limit] if self.limit > 0 else []:
+            f.unlink(missing_ok=True)
 
 
 class PerplexityCallback(TrainerCallback):
@@ -572,6 +633,14 @@ def main():
     parser.add_argument("--wandb-run-name", type=str, default=None)
     parser.add_argument("--save-dir", type=str, default="checkpoints/grpo_olmoe_cache")
     parser.add_argument("--save-every", type=int, default=50)
+    parser.add_argument("--save-total-limit", type=int, default=3,
+                        help="Rotating checkpoints kept in --save-dir")
+    parser.add_argument("--logging-steps", type=int, default=10,
+                        help="Steps between metric/completions-sample logs. "
+                             "GRPOConfig(log_completions=True) writes a new, "
+                             "never-rotated completions_NNNNN.parquet per "
+                             "logging step -- keep this well above 1 or it "
+                             "silently fills the disk over a long run.")
     parser.add_argument("--resume", action="store_true",
                         help="Resume from last checkpoint in --save-dir")
     parser.add_argument("--init-adapter", type=str, default=None,
@@ -792,11 +861,11 @@ def main():
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         num_train_epochs=args.num_epochs,
         max_steps=args.num_steps,
-        logging_steps=1,
+        logging_steps=args.logging_steps,
         log_completions=True,  # sample completions -> wandb table (quality check)
         num_completions_to_print=0,
         save_steps=args.save_every,
-        save_total_limit=3,  # keep rewind points (reward hacking recovery)
+        save_total_limit=args.save_total_limit,  # keep rewind points (reward hacking recovery)
         num_generations=args.num_generations,
         max_completion_length=args.completion_len,
         temperature=args.temperature,
@@ -828,6 +897,7 @@ def main():
     ppl_cb.attach(trainer)
     trainer.add_callback(ppl_cb)
     trainer.add_callback(PreemptionCallback())
+    trainer.add_callback(CompletionsPruneCallback(limit=args.save_total_limit))
 
     model = trainer.accelerator.unwrap_model(trainer.model)
     num_layers = model.config.num_hidden_layers
@@ -891,8 +961,7 @@ def main():
 
     resume_ckpt = None
     if args.resume and Path(args.save_dir).is_dir():
-        from transformers.trainer_utils import get_last_checkpoint
-        resume_ckpt = get_last_checkpoint(args.save_dir)
+        resume_ckpt = _find_valid_checkpoint(args.save_dir)
         if resume_ckpt:
             print(f"Resuming from {resume_ckpt}")
 

@@ -253,6 +253,48 @@ def build_eval_sequences(tokenizer, dataset_name, split, n_total, max_len,
     return eval_ids
 
 
+def build_eval_prompts(tokenizer, dataset_name, split, n_total, max_len,
+                       seed, pool_per_split=EVAL_POOL_PER_SPLIT):
+    """Held-out PROMPTS only (chat template + add_generation_prompt=True,
+    no reference answer), truncated to max_len tokens, from the same
+    reserved eval pool as build_eval_sequences -- for on-policy eval
+    (generate + score the model's own completions), as opposed to
+    build_eval_sequences' teacher-forced full conversations. Returns
+    already-tokenized prompt id lists (ready for model.generate)."""
+    import random
+    from src.nemotron_data import load_split_stream
+
+    splits = [s.strip() for s in split.split(",") if s.strip()]
+    per_split = n_total // len(splits)
+    rng = random.Random(seed)
+    use_chat = tokenizer.chat_template is not None
+    prompt_ids = []
+    for sp in splits:
+        ds = load_split_stream(dataset_name, sp)
+        pool = []
+        for row in ds:
+            msgs = [m for m in row["messages"] if m["content"].strip()]
+            if any(m["role"] == "assistant" for m in msgs):
+                pool.append(msgs)
+            if len(pool) >= pool_per_split:
+                break
+        for msgs in rng.sample(pool, min(per_split, len(pool))):
+            user_msgs = []
+            for m in msgs:
+                if m["role"] == "assistant":
+                    break
+                user_msgs.append(m)
+            if use_chat:
+                text = tokenizer.apply_chat_template(
+                    user_msgs, add_generation_prompt=True, tokenize=False)
+            else:
+                text = "\n".join(m["content"] for m in user_msgs)
+            ids = tokenizer(text, truncation=True, max_length=max_len,
+                            add_special_tokens=False)["input_ids"]
+            prompt_ids.append(ids)
+    return prompt_ids
+
+
 class CompletionsPruneCallback(TrainerCallback):
     """GRPOConfig(log_completions=True) writes a new completions_NNNNN.parquet
     to <output_dir>/completions/ on every logging step, with no rotation

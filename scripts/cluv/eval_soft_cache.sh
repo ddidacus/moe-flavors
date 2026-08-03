@@ -20,5 +20,9 @@ if [ ${#VARIANTS[@]} -eq 0 ]; then
     VARIANTS=(base sft_baseline cache_sft temporal_moe controller_baseline)
 fi
 
-cluv submit --autocommit "$CLUSTER" -- bash scripts/cluv/_eval_soft_cache_run.sh "$CLUSTER" "${VARIANTS[@]}"
+# --time override: this eval is on-policy (generates a completion per
+# held-out prompt at T=1.0, then scores cache-hit rate on the generated
+# tokens only) -- much slower than teacher-forced scoring, past the
+# pyproject.toml 3h default.
+cluv submit --autocommit "$CLUSTER" --time=1-00:00:00 -- bash scripts/cluv/_eval_soft_cache_run.sh "$CLUSTER" "${VARIANTS[@]}"
 echo "eval_soft_cache [${VARIANTS[*]}] -> submitted to $CLUSTER"

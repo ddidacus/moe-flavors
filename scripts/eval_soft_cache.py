@@ -1,11 +1,20 @@
 """Cache-hit-rate extractor for the MoE cache-consolidation variants.
 
-STUB: this loads a checkpoint, runs held-out sequences through it with
-`output_router_logits=True`, and reports the empirical LRU cache-hit rate
-at `--cache-layer` (reusing the exact same `cache_emulation_rewards`
-simulation used as the training-time reward in finetune_moe_grpo.py). It
-does NOT yet implement the full routing-distribution analysis described in
-handoff/07-eval-setup.md:
+On-policy: generates completions from the model itself (temperature=1.0,
+top_p=1.0, top_k=0 -- matching GRPOConfig's training-time sampling exactly)
+from held-out prompts, then scores the cache-hit rate only on the
+generated tokens (output_router_logits over the full prompt+completion
+sequence, masked to completion positions) -- the exact same forward/mask/
+cache_emulation_rewards call as finetune_moe_grpo.py's RewardEngine._compute.
+Earlier versions of this script were teacher-forced (scored every token of
+held-out ground-truth conversations, prompt included) -- that measures a
+different distribution than the training reward and gave misleadingly flat
+numbers across all variants (~0.26 for both base and cache_sft, despite
+cache_sft's training-time reward climbing to ~0.50); see
+handoff/05-sweep-results.md's soft-cache off-policy eval finding.
+
+STUB: does NOT yet implement the full routing-distribution analysis
+described in handoff/07-eval-setup.md:
 
   TODO: working-set concentration plots (how routing mass distributes over
         the LRU's cached experts vs. evicted ones, over time)
@@ -17,6 +26,9 @@ handoff/07-eval-setup.md:
         for this, e.g. _last_F, but nothing here reads them yet)
   TODO: any actual plotting (matplotlib figures) -- this only writes raw
         numbers to a JSON summary
+  TODO: temporal_moe's effective held decisions (not raw router_logits) --
+        see finetune_moe_grpo.py's RewardEngine._compute temporal_wrappers
+        branch; not read here yet, same limitation as before
 
 Usage:
     python scripts/eval_soft_cache.py --variant cache_sft --out-dir evals/soft_cache
@@ -32,46 +44,62 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from eval_lm_harness import VARIANT_CHECKPOINTS, build_variant_model  # noqa: E402
-from finetune_moe_grpo import build_eval_sequences  # noqa: E402
+from finetune_moe_grpo import build_eval_prompts  # noqa: E402
 from src.cache_reinforce import cache_emulation_rewards  # noqa: E402
 
 
 @torch.no_grad()
-def compute_cache_hit_rate(model, tokenizer, eval_ids, cache_layer, cache_size,
-                           experts_per_token, use_topk, batch_size, device):
-    """Runs eval_ids through the model in batches and returns the per-sequence
-    and overall LRU cache-hit rate at `cache_layer`.
-
-    Simplification vs. training-time RewardEngine._compute: the reward there
-    only scores completion tokens (action_mask excludes the prompt); here we
-    score every non-pad token in the sequence (action_mask == valid_mask),
-    since these are held-out full conversations, not prompt/completion pairs.
-    Temporal-routing checkpoints (temporal_moe) are NOT specially handled --
-    this reports raw router-logits cache-hit rate, not the wrapper's actual
-    held decisions (see TODO above)."""
+def compute_cache_hit_rate(model, tokenizer, prompt_ids, cache_layer, cache_size,
+                           experts_per_token, use_topk, gen_len, batch_size, device):
+    """Generates a completion for each of prompt_ids (on-policy, T=1.0) and
+    returns the per-sequence and overall LRU cache-hit rate at `cache_layer`,
+    scored only on the generated (completion) tokens -- mirrors
+    finetune_moe_grpo.py's RewardEngine._compute exactly (prompt tokens warm
+    the cache but earn no reward)."""
     pad_id = tokenizer.pad_token_id
     per_seq_hit_rates = []
 
-    for i in range(0, len(eval_ids), batch_size):
-        chunk = eval_ids[i:i + batch_size]
+    for i in range(0, len(prompt_ids), batch_size):
+        chunk = prompt_ids[i:i + batch_size]
         B = len(chunk)
-        S = max(len(s) for s in chunk)
-        full_ids = torch.full((B, S), pad_id, dtype=torch.long)
-        valid = torch.zeros(B, S, dtype=torch.bool)
-        for j, ids in enumerate(chunk):
-            full_ids[j, :len(ids)] = torch.tensor(ids, dtype=torch.long)
-            valid[j, :len(ids)] = True
-        full_ids, valid = full_ids.to(device), valid.to(device)
+        P = max(len(p) for p in chunk)
+        prompt_batch = torch.full((B, P), pad_id, dtype=torch.long)
+        prompt_mask = torch.zeros((B, P), dtype=torch.long)
+        for j, p in enumerate(chunk):
+            # left-pad prompts so generation starts at the same column B-wide
+            prompt_batch[j, P - len(p):] = torch.tensor(p, dtype=torch.long)
+            prompt_mask[j, P - len(p):] = 1
+        prompt_batch, prompt_mask = prompt_batch.to(device), prompt_mask.to(device)
+
+        gen = model.generate(
+            input_ids=prompt_batch, attention_mask=prompt_mask,
+            do_sample=True, temperature=1.0, top_p=1.0, top_k=0,
+            max_new_tokens=gen_len, pad_token_id=pad_id,
+        )
+        completion_ids = gen[:, P:]  # (B, gen_len), right-padded by generate()
+
+        S = P + completion_ids.shape[1]
+        full_ids = torch.full((B, S), pad_id, dtype=torch.long, device=device)
+        valid = torch.zeros((B, S), dtype=torch.bool, device=device)
+        action = torch.zeros((B, S), dtype=torch.bool, device=device)
+        full_ids[:, :P] = prompt_batch
+        valid[:, :P] = prompt_mask.bool()
+        full_ids[:, P:] = completion_ids
+        comp_valid = completion_ids != pad_id
+        # eos may legitimately appear as a real token; only pad tail is invalid
+        comp_len = comp_valid.float().flip(-1).cumsum(-1).flip(-1).bool() | comp_valid
+        valid[:, P:] = comp_len if comp_len.any() else comp_valid
+        action[:, P:] = valid[:, P:]
 
         out = model(input_ids=full_ids, attention_mask=valid.long(),
                     output_router_logits=True, use_cache=False)
         router_logits = out.router_logits[cache_layer].view(B, S, -1)
         r_cache_tok, _, hit_rate = cache_emulation_rewards(
-            router_logits, valid, valid, cache_size=cache_size,
+            router_logits, valid, action, cache_size=cache_size,
             experts_per_token=experts_per_token, use_topk=use_topk,
         )
         # r_cache_tok sums to the per-sequence hit fraction on action
-        # positions (all valid tokens here) -- see cache_emulation_rewards.
+        # (completion) positions -- see cache_emulation_rewards.
         per_seq_hit_rates.extend(r_cache_tok.sum(-1).cpu().tolist())
 
     overall = sum(per_seq_hit_rates) / len(per_seq_hit_rates) if per_seq_hit_rates else 0.0
@@ -96,7 +124,12 @@ def main():
     ap.add_argument("--dataset", default="nvidia/Nemotron-Post-Training-Dataset-v2")
     ap.add_argument("--dataset-split", default="math,code")
     ap.add_argument("--num-eval-seqs", type=int, default=256)
-    ap.add_argument("--eval-seq-len", type=int, default=1024)
+    ap.add_argument("--prompt-len", type=int, default=1024,
+                    help="prompt truncation length (tokens)")
+    ap.add_argument("--gen-len", type=int, default=1024,
+                    help="tokens generated per prompt (T=1.0, matching "
+                         "GRPOConfig's training-time sampling) -- only "
+                         "these tokens are scored for cache-hit rate")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--out-dir", default="evals/soft_cache")
@@ -116,14 +149,16 @@ def main():
     else:
         cache_layer = args.cache_layer
 
-    eval_ids = build_eval_sequences(tok, args.dataset, args.dataset_split,
-                                    args.num_eval_seqs, args.eval_seq_len, args.seed)
+    prompt_ids = build_eval_prompts(tok, args.dataset, args.dataset_split,
+                                    args.num_eval_seqs, args.prompt_len, args.seed)
     print(f"[eval_soft_cache] variant={args.variant} cache_layer={cache_layer} "
-         f"cache_size={args.cache_size} n_eval_seqs={len(eval_ids)}", flush=True)
+         f"cache_size={args.cache_size} n_eval_seqs={len(prompt_ids)} "
+         f"gen_len={args.gen_len} (on-policy, T=1.0)", flush=True)
 
     per_seq, overall = compute_cache_hit_rate(
-        model, tok, eval_ids, cache_layer, args.cache_size,
-        args.cache_experts_per_token, args.cache_topk, args.batch_size, device)
+        model, tok, prompt_ids, cache_layer, args.cache_size,
+        args.cache_experts_per_token, args.cache_topk, args.gen_len,
+        args.batch_size, device)
     print(f"[eval_soft_cache] overall cache-hit rate: {overall:.4f}", flush=True)
 
     out_dir = Path(args.out_dir)
@@ -137,7 +172,9 @@ def main():
             "cache_size": args.cache_size,
             "cache_experts_per_token": args.cache_experts_per_token,
             "cache_topk": args.cache_topk,
-            "num_eval_seqs": len(eval_ids),
+            "on_policy": True,
+            "gen_len": args.gen_len,
+            "num_eval_seqs": len(prompt_ids),
             "overall_hit_rate": overall,
             "per_seq_hit_rate": per_seq,
         }, f, indent=2)

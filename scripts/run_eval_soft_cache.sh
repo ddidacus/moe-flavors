@@ -4,15 +4,19 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=96G
 #SBATCH --gres=gpu:a100l:4
-#SBATCH --partition=short-unkillable
-#SBATCH --time=3:00:00
+#SBATCH --partition=long
+#SBATCH --time=1-00:00:00
 
 # Takes one or more variant names as positional args, each pinned to its own
 # GPU (CUDA_VISIBLE_DEVICES=0,1,...) and run in parallel as background
 # processes within this single job -- same pattern as run_eval_lm_harness.sh.
-# Pass up to 4 variants (short-unkillable's QOS requires a minimum of 4
-# GPUs/job regardless of how many are actually used). --out-dir defaults to
-# evals/soft_cache_<today>; override with OUT_DIR=... if needed.
+# Pass up to 4 variants. On `long` (not short-unkillable): this eval is
+# on-policy (generates a completion per held-out prompt at T=1.0, then
+# scores cache-hit rate on the generated tokens only -- see
+# eval_soft_cache.py's docstring), which is much slower than the old
+# teacher-forced version and doesn't reliably fit short-unkillable's 3h cap.
+# --out-dir defaults to evals/soft_cache_<today>; override with OUT_DIR=...
+# if needed.
 #
 # Per-variant checkpoint override: set CHECKPOINT_DIR_<VARIANT> (uppercase,
 # hyphens/dashes as underscores) to point at a checkpoint trained elsewhere

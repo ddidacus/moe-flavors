@@ -1,35 +1,52 @@
 #!/bin/bash
-#SBATCH --job-name=eval_softcache
-#SBATCH --output=eval_softcache_%j.out
+#SBATCH --job-name=eval_soft_cache
+#SBATCH --output=eval_soft_cache_%j.out
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=48G
-#SBATCH --gres=gpu:2
-#SBATCH --partition=main
-#SBATCH --time=6:00:00
+#SBATCH --mem=96G
+#SBATCH --gres=gpu:a100l:4
+#SBATCH --partition=short-unkillable
+#SBATCH --time=3:00:00
 
-# One job, two GPUs, two processes: base and tuned run concurrently (each
-# pinned to its own GPU), then a lightweight CPU-only merge writes
-# metrics.json + all plots from the two partial states. Do not pass
-# --variant yourself -- it's appended last on each invocation below so it
-# always wins over anything in "$@".
+# Takes one or more variant names as positional args, each pinned to its own
+# GPU (CUDA_VISIBLE_DEVICES=0,1,...) and run in parallel as background
+# processes within this single job -- same pattern as run_eval_lm_harness.sh.
+# Pass up to 4 variants (short-unkillable's QOS requires a minimum of 4
+# GPUs/job regardless of how many are actually used). --out-dir defaults to
+# evals/soft_cache_<today>; override with OUT_DIR=... if needed.
+#
+# Per-variant checkpoint override: set CHECKPOINT_DIR_<VARIANT> (uppercase,
+# hyphens/dashes as underscores) to point at a checkpoint trained elsewhere
+# (e.g. a small-scale run synced from cluv) instead of
+# eval_lm_harness.py's VARIANT_CHECKPOINTS[variant] (the mila
+# run_finetune_moe_*.sh naming convention). "base" never takes a checkpoint.
+#
+# Usage: sbatch scripts/run_eval_soft_cache.sh cache_sft temporal_moe
+#        CHECKPOINT_DIR_CACHE_SFT=checkpoints/small-scale/cache_sft_tamia \
+#            sbatch scripts/run_eval_soft_cache.sh cache_sft
 
 source .venv/bin/activate
 export HF_HOME=/home/mila/d/diego.calanzone/scratch/cache
 
-CUDA_VISIBLE_DEVICES=0 TRITON_CACHE_DIR=/tmp/triton_cache_${SLURM_JOB_ID}_base \
-    python scripts/eval_soft_cache.py "$@" --variant base &
-pid_base=$!
+OUT_DIR="${OUT_DIR:-evals/soft_cache_$(date +%F)}"
 
-CUDA_VISIBLE_DEVICES=1 TRITON_CACHE_DIR=/tmp/triton_cache_${SLURM_JOB_ID}_tuned \
-    python scripts/eval_soft_cache.py "$@" --variant tuned &
-pid_tuned=$!
+pids=()
+gpu=0
+for variant in "$@"; do
+    ckpt_args=()
+    if [ "$variant" != "base" ]; then
+        env_name="CHECKPOINT_DIR_$(echo "$variant" | tr '[:lower:]-' '[:upper:]_')"
+        ckpt_dir="${!env_name:-}"
+        if [ -n "$ckpt_dir" ]; then ckpt_args=(--checkpoint-dir "$ckpt_dir"); fi
+    fi
+    CUDA_VISIBLE_DEVICES=$gpu TRITON_CACHE_DIR=/tmp/triton_cache_${SLURM_JOB_ID}_${variant} \
+        python scripts/eval_soft_cache.py --variant "$variant" "${ckpt_args[@]}" \
+        --out-dir "$OUT_DIR" &
+    pids+=($!)
+    gpu=$((gpu + 1))
+done
 
-wait "$pid_base"; status_base=$?
-wait "$pid_tuned"; status_tuned=$?
-
-if [ "$status_base" -ne 0 ] || [ "$status_tuned" -ne 0 ]; then
-    echo "[run_eval_soft_cache] a variant process failed (base=$status_base, tuned=$status_tuned)" >&2
-    exit 1
-fi
-
-python scripts/eval_soft_cache.py "$@" --variant merge
+status=0
+for pid in "${pids[@]}"; do
+    wait "$pid" || status=1
+done
+exit $status

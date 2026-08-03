@@ -22,6 +22,12 @@
 # MAX_GEN_TOKS are trimmed down from eval_lm_harness.py's own defaults
 # (4 seeds/200/2048) to actually fit -- override via env vars if you have
 # more time budget elsewhere (e.g. resubmit on `long` with the defaults).
+#
+# Per-variant checkpoint override: set CHECKPOINT_DIR_<VARIANT> (uppercase,
+# hyphens/dashes as underscores) to point at a checkpoint trained elsewhere
+# (e.g. a small-scale run synced from cluv) instead of
+# VARIANT_CHECKPOINTS[variant] (the mila run_finetune_moe_*.sh naming
+# convention). "base" never takes a checkpoint.
 NUM_SEEDS="${NUM_SEEDS:-2}"
 LIMIT="${LIMIT:-50}"
 MAX_GEN_TOKS="${MAX_GEN_TOKS:-1024}"
@@ -43,9 +49,16 @@ if [ "$MATH_ONLY" = "1" ]; then MATH_ONLY_FLAG="--math-only"; fi
 pids=()
 gpu=0
 for variant in "$@"; do
+    ckpt_args=()
+    if [ "$variant" != "base" ]; then
+        env_name="CHECKPOINT_DIR_$(echo "$variant" | tr '[:lower:]-' '[:upper:]_')"
+        ckpt_dir="${!env_name:-}"
+        if [ -n "$ckpt_dir" ]; then ckpt_args=(--checkpoint-dir "$ckpt_dir"); fi
+    fi
     CUDA_VISIBLE_DEVICES=$gpu TRITON_CACHE_DIR=/tmp/triton_cache_${SLURM_JOB_ID}_${variant} \
         python scripts/eval_lm_harness.py --variant "$variant" --out-dir "$OUT_DIR" \
-        --num-seeds "$NUM_SEEDS" --limit "$LIMIT" --max-gen-toks "$MAX_GEN_TOKS" $MATH_ONLY_FLAG &
+        --num-seeds "$NUM_SEEDS" --limit "$LIMIT" --max-gen-toks "$MAX_GEN_TOKS" \
+        $MATH_ONLY_FLAG "${ckpt_args[@]}" &
     pids+=($!)
     gpu=$((gpu + 1))
 done

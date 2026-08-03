@@ -149,7 +149,8 @@ def build_prompt_dataset(tokenizer, dataset_name, split, max_samples, prompt_len
     (Algorithm R) per split, tokenization deferred until after the reservoir
     is finalized -- identical convention/rationale to finetune_moe_controller
     .py's build_prompt_dataset."""
-    from datasets import Dataset, load_dataset
+    from datasets import Dataset
+    from src.nemotron_data import load_split_stream
     import random
 
     MAX_SCAN_PER_SPLIT = 50_000
@@ -158,7 +159,7 @@ def build_prompt_dataset(tokenizer, dataset_name, split, max_samples, prompt_len
     per_split = max_samples // len(splits)
     prompts, targets = [], []
     for sp in splits:
-        ds = load_dataset(dataset_name, split=sp, streaming=True)
+        ds = load_split_stream(dataset_name, sp)
         reservoir = []
         seen = 0
         scanned = 0

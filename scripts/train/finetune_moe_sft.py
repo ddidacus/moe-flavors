@@ -3,13 +3,13 @@ experiments -- no RL, no cache reward, no temporal mixin. Trains directly on
 the dataset's own ground-truth assistant completions (teacher-forced NLL,
 loss masked to completion tokens only), so it's the "what does plain SFT
 alone get you" reference point for the GRPO+cache-reward and temporal-moe
-runs in scripts/finetune_moe_grpo.py.
+runs in scripts/train/finetune_moe_grpo.py.
 
 Same dataset (Nemotron-v2 math/code), same held-out eval pool convention
 (first EVAL_POOL_PER_SPLIT rows of each split reserved, never trained on),
 same fused-expert LoRA target_parameters setup for phimoe, and the same
 SLURM preemption/resume pattern, so checkpoints from this script slot
-directly into the eval_soft_cache.py / eval_lm_harness.py pipeline alongside
+directly into the eval/eval_router.py / eval/eval_benchmarks.py pipeline alongside
 the RL-trained checkpoints.
 """
 
@@ -18,7 +18,7 @@ import signal
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import torch
 from transformers import AutoTokenizer, TrainerCallback
@@ -53,70 +53,28 @@ def build_sft_dataset(tokenizer, dataset_name, split, max_samples, prompt_len,
                       completion_len, seed, skip_first=EVAL_POOL_PER_SPLIT):
     """Nemotron rows -> Dataset({'prompt', 'completion'}), both conversational
     (list of chat messages) so SFTTrainer applies the chat template itself
-    and masks the loss to the completion (assistant) turn only. Text is
-    pre-truncated by token count (not char count) before being handed back
-    as text, matching build_prompt_dataset's truncation semantics in
-    finetune_moe_grpo.py. Same skip_first eval-pool reservation.
+    and masks the loss to the completion (assistant) turn only.
 
-    Uses reservoir sampling (Algorithm R) within each split so the result is
-    a genuine random sample, not a fixed prefix -- capped at a scan window
-    (see MAX_SCAN_PER_SPLIT) so very large splits don't have to be streamed
-    to completion just to draw a few hundred rows from them. Tokenization
-    happens AFTER the reservoir is finalized, not during the scan: doing it
-    eagerly per scanned row cost up to MAX_SCAN_PER_SPLIT x num_splits BPE
-    calls for a result that only keeps per_split x num_splits of them --
-    with 9 splits x 50k that's ~450k wasted tokenizer calls, which single-
-    handedly blew well past accelerate's 600s multi-GPU rendezvous timeout
-    (rank 0 stuck tokenizing while ranks 1-3 waited and gave up)."""
+    Prompts are FILTERED to prompt_len tokens, not truncated: rows whose
+    prompt is longer than prompt_len are dropped rather than clipped (see
+    src.nemotron_data.sample_filtered_prompts for the scan/filter logic,
+    shared with the grpo/controller/melinoe training scripts). Completions
+    are still truncated to completion_len -- only used for the loss, no
+    generation happens against them. Same skip_first eval-pool reservation
+    as finetune_moe_grpo.py."""
     from datasets import Dataset
-    import random
-    from src.nemotron_data import load_split_stream
+    from src.nemotron_data import sample_filtered_prompts
 
-    MAX_SCAN_PER_SPLIT = 50_000
-    rng = random.Random(seed)
-    splits = [s.strip() for s in split.split(",") if s.strip()]
-    per_split = max_samples // len(splits)
     prompts, completions = [], []
-    for sp in splits:
-        ds = load_split_stream(dataset_name, sp)
-        reservoir = []  # raw (text, target_text) strings, untokenized
-        seen = 0
-        scanned = 0
-        for r_idx, row in enumerate(ds):
-            if r_idx < skip_first:
-                continue
-            if scanned >= max(MAX_SCAN_PER_SPLIT, per_split):
-                break
-            scanned += 1
-            parts = []
-            target_text = None
-            for m in row["messages"]:
-                if m["role"] == "assistant":
-                    target_text = m["content"]
-                    break
-                if m["content"].strip():
-                    parts.append(m["content"])
-            text = "\n".join(parts).strip()
-            if not (text and target_text and target_text.strip()):
-                continue
-            item = (text, target_text.strip())
-            if len(reservoir) < per_split:
-                reservoir.append(item)
-            else:
-                j = rng.randint(0, seen)
-                if j < per_split:
-                    reservoir[j] = item
-            seen += 1
-        for text, target_text in reservoir:
-            ids = tokenizer(text, truncation=True,
-                            max_length=prompt_len)["input_ids"]
-            text = tokenizer.decode(ids)
-            c_ids = tokenizer(target_text, truncation=True,
-                              max_length=completion_len,
-                              add_special_tokens=False)["input_ids"]
-            completion_text = tokenizer.decode(c_ids)
-            prompts.append([{"role": "user", "content": text}])
-            completions.append([{"role": "assistant", "content": completion_text}])
+    for ids, target_text in sample_filtered_prompts(
+            tokenizer, dataset_name, split, max_samples, prompt_len, seed, skip_first):
+        text = tokenizer.decode(ids)
+        c_ids = tokenizer(target_text, truncation=True,
+                          max_length=completion_len,
+                          add_special_tokens=False)["input_ids"]
+        completion_text = tokenizer.decode(c_ids)
+        prompts.append([{"role": "user", "content": text}])
+        completions.append([{"role": "assistant", "content": completion_text}])
     return Dataset.from_dict(
         {"prompt": prompts, "completion": completions}).shuffle(seed=seed)
 

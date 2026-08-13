@@ -12,7 +12,7 @@
 # MELINOE baseline (Raje, Nayak & Joshi 2026, arXiv:2602.11192) -- same base
 # model + fine-tuning dataset as our other small-scale runs (sft_baseline,
 # cache_sft, temporal_moe, controller_baseline), see
-# scripts/finetune_moe_melinoe.py's own docstring for the method and the
+# scripts/train/finetune_moe_melinoe.py's own docstring for the method and the
 # deviations from the paper.
 
 source .venv/bin/activate
@@ -76,7 +76,7 @@ for ATTEMPT in 1 2 3; do
     accelerate launch \
     --multi_gpu \
     --num_processes 4 \
-    scripts/finetune_moe_melinoe.py \
+    scripts/train/finetune_moe_melinoe.py \
     --model "$MODEL" \
     --dataset nvidia/Nemotron-Post-Training-Dataset-v2 \
     --dataset-split "$DATASET_SPLIT" \

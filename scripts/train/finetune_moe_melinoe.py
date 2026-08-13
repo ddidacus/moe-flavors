@@ -35,11 +35,11 @@ Deviations from the paper, matching this repo's existing conventions (see
 finetune_moe_controller.py's own docstring for the same rationale):
   - ONE cache layer (--cache-layer), not every MoE layer, for direct
     comparability with cache_sft / temporal_moe / controller_baseline and
-    with eval_soft_cache.py's own single-layer analysis.
+    with eval/eval_router.py's own single-layer analysis.
   - No Stage 2 (BGE-embedding activation predictor + proactive GPU-cache
     prefetching): that stage targets real CPU-GPU transfer throughput on a
     memory-constrained deployment, which this repo doesn't measure --
-    eval_soft_cache.py evaluates routing-quality metrics (hit_ratio,
+    eval/eval_router.py evaluates routing-quality metrics (hit_ratio,
     switch_rate, expert_run_length) on the fine-tuned ROUTER alone, so only
     Stage 1 (Section 3.1.1) is in scope.
   - Cache capacity C = --cache-size (default 4) = E/4 for this model's E=16
@@ -66,7 +66,7 @@ import signal
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import torch
 import torch.nn as nn
@@ -145,58 +145,23 @@ EVAL_POOL_PER_SPLIT = 1000  # matches finetune_moe_grpo.py -- same held-out rows
 
 def build_prompt_dataset(tokenizer, dataset_name, split, max_samples, prompt_len,
                          completion_len, seed, skip_first=EVAL_POOL_PER_SPLIT):
-    """Nemotron rows -> Dataset({'prompt', 'target_ids'}); reservoir sampling
-    (Algorithm R) per split, tokenization deferred until after the reservoir
-    is finalized -- identical convention/rationale to finetune_moe_controller
-    .py's build_prompt_dataset."""
+    """Nemotron rows -> Dataset({'prompt', 'target_ids'}); prompt is FILTERED
+    to prompt_len tokens rather than truncated (see
+    src.nemotron_data.sample_filtered_prompts for the scan/filter logic,
+    shared with the grpo/sft/controller training scripts) -- identical
+    convention to finetune_moe_controller.py's build_prompt_dataset."""
     from datasets import Dataset
-    from src.nemotron_data import load_split_stream
-    import random
+    from src.nemotron_data import sample_filtered_prompts
 
-    MAX_SCAN_PER_SPLIT = 50_000
-    rng = random.Random(seed)
-    splits = [s.strip() for s in split.split(",") if s.strip()]
-    per_split = max_samples // len(splits)
     prompts, targets = [], []
-    for sp in splits:
-        ds = load_split_stream(dataset_name, sp)
-        reservoir = []
-        seen = 0
-        scanned = 0
-        for r_idx, row in enumerate(ds):
-            if r_idx < skip_first:
-                continue
-            if scanned >= max(MAX_SCAN_PER_SPLIT, per_split):
-                break
-            scanned += 1
-            parts = []
-            target_text = None
-            for m in row["messages"]:
-                if m["role"] == "assistant":
-                    target_text = m["content"]
-                    break
-                if m["content"].strip():
-                    parts.append(m["content"])
-            text = "\n".join(parts).strip()
-            if not (text and target_text and target_text.strip()):
-                continue
-            item = (text, target_text.strip())
-            if len(reservoir) < per_split:
-                reservoir.append(item)
-            else:
-                j = rng.randint(0, seen)
-                if j < per_split:
-                    reservoir[j] = item
-            seen += 1
-        for text, target_text in reservoir:
-            ids = tokenizer(text, truncation=True,
-                            max_length=prompt_len)["input_ids"]
-            text = tokenizer.decode(ids)
-            target_ids = tokenizer(target_text, truncation=True,
-                                   max_length=completion_len,
-                                   add_special_tokens=False)["input_ids"]
-            prompts.append(text)
-            targets.append(target_ids)
+    for ids, target_text in sample_filtered_prompts(
+            tokenizer, dataset_name, split, max_samples, prompt_len, seed, skip_first):
+        text = tokenizer.decode(ids)
+        target_ids = tokenizer(target_text, truncation=True,
+                               max_length=completion_len,
+                               add_special_tokens=False)["input_ids"]
+        prompts.append(text)
+        targets.append(target_ids)
     return Dataset.from_dict({"prompt": prompts, "target_ids": targets}) \
         .shuffle(seed=seed)
 
@@ -284,7 +249,7 @@ def melinoe_losses(peft_model, unwrapped_model, input_ids, attention_mask, label
         r_t = r_f[:, t, :]
         # loss uses c(t) as-of BEFORE this token's own request updates it --
         # "was this token's pick already warm from prior history" (matches
-        # eval_soft_cache.py's hit_ratio: `cached = cache.experts` read
+        # eval/eval_router.py's hit_ratio: `cached = cache.experts` read
         # before the current token's cache.access() calls).
         lcs_per_t.append((r_t * (1.0 - c)).sum(-1))
         r_hard_t = r_hard[:, t, :].detach()

@@ -50,3 +50,91 @@ def load_split_stream(dataset_name: str, split: str):
                 return load_from_disk(str(split_dir))
     from datasets import load_dataset
     return load_dataset(dataset_name, split=split, streaming=True)
+
+
+def sample_filtered_prompts(tokenizer, dataset_name, split, max_samples,
+                            prompt_len, seed, skip_first=0,
+                            scan_batch_size=1000, max_scan_per_split=50_000):
+    """Reservoir-samples (Algorithm R) up to max_samples (prompt_ids,
+    target_text) pairs across `split` (a comma-separated list of split
+    names), evenly divided per split. Every finetune_moe_*.py training
+    script's build_prompt_dataset/build_sft_dataset used to duplicate this
+    scan loop; it now lives here once.
+
+    Filtering, not truncation: rows whose prompt tokenizes to more than
+    prompt_len tokens are dropped rather than clipped, so every returned
+    prompt is a complete, untruncated conversation turn (the reservoir may
+    end up with fewer than max_samples // len(splits) items per split if
+    many candidates are filtered out). target_text is returned as a raw,
+    untruncated string -- each caller truncates/formats the completion side
+    its own way (e.g. as message-list "completion" for SFTTrainer vs.
+    tokenized target_ids for the GRPO/controller/melinoe NLL losses).
+
+    The length filter requires tokenizing every scanned row (unlike the old
+    truncate-after-sampling code, which only tokenized the much smaller
+    finalized reservoir) -- to keep that affordable, prompts are tokenized
+    in scan_batch_size-row batches via the fast tokenizer's batch call
+    rather than one row at a time. One-row-at-a-time tokenization across
+    every scanned row (up to max_scan_per_split x num_splits, e.g. 9 splits
+    x 50k = 450k individual calls) is what used to blow past accelerate's
+    600s multi-GPU rendezvous timeout; batching keeps the same total token
+    count but a fraction of the Python/call overhead.
+    """
+    import random
+
+    rng = random.Random(seed)
+    splits = [s.strip() for s in split.split(",") if s.strip()]
+    per_split = max_samples // len(splits)
+    sampled = []
+
+    for sp in splits:
+        ds = load_split_stream(dataset_name, sp)
+        reservoir = []  # (prompt_ids, target_text), already length-filtered
+        seen = 0
+        scanned = 0
+        batch_texts, batch_targets = [], []
+
+        def flush_batch():
+            nonlocal seen
+            if not batch_texts:
+                return
+            for ids, target_text in zip(tokenizer(list(batch_texts))["input_ids"],
+                                        batch_targets):
+                if len(ids) > prompt_len:
+                    continue  # filtered out: prompt too long, not truncated
+                item = (ids, target_text)
+                if len(reservoir) < per_split:
+                    reservoir.append(item)
+                else:
+                    j = rng.randint(0, seen)
+                    if j < per_split:
+                        reservoir[j] = item
+                seen += 1
+            batch_texts.clear()
+            batch_targets.clear()
+
+        for r_idx, row in enumerate(ds):
+            if r_idx < skip_first:
+                continue
+            if scanned >= max(max_scan_per_split, per_split):
+                break
+            scanned += 1
+            parts = []
+            target_text = None
+            for m in row["messages"]:
+                if m["role"] == "assistant":
+                    target_text = m["content"]
+                    break
+                if m["content"].strip():
+                    parts.append(m["content"])
+            text = "\n".join(parts).strip()
+            if not (text and target_text and target_text.strip()):
+                continue
+            batch_texts.append(text)
+            batch_targets.append(target_text.strip())
+            if len(batch_texts) >= scan_batch_size:
+                flush_batch()
+        flush_batch()
+        sampled.extend(reservoir)
+
+    return sampled

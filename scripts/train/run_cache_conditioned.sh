@@ -86,7 +86,7 @@ for ATTEMPT in 1 2 3; do
     timeout 10200 accelerate launch \
         --multi_gpu \
         --num_processes 4 \
-        scripts/finetune_moe_grpo.py \
+        scripts/train/finetune_moe_grpo.py \
         --model "$MODEL" \
         --dataset nvidia/Nemotron-Post-Training-Dataset-v2 \
         --dataset-split "$DATASET_SPLIT" \
@@ -126,7 +126,7 @@ STEP=$(current_step "$SAVE_DIR")
 echo "[chain] progress: ${STEP}/${NUM_STEPS}"
 if [ "$STEP" -lt "$NUM_STEPS" ]; then
     echo "[chain] not done -- resubmitting"
-    sbatch scripts/run_finetune_moe_cache_conditioned.sh
+    sbatch scripts/train/run_cache_conditioned.sh
 else
     echo "[chain] complete"
 fi

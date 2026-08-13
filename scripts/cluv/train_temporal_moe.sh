@@ -1,7 +1,7 @@
 #!/bin/bash
 # Submit the temporal_moe small-scale training job via cluv (see
 # scripts/train_small_scale.sh for the config this mirrors, and
-# scripts/run_finetune_moe_grpo.sh for the mila/sbatch equivalent).
+# scripts/train/run_grpo.sh for the mila/sbatch equivalent).
 # ~16.3h wall-clock estimated on 4 GPUs -- overrides the 3h pyproject.toml
 # default walltime. Saves to checkpoints/temporal_moe_<CLUSTER>.
 #
@@ -11,7 +11,7 @@ cd "$(dirname "$0")/../.."
 CLUSTER="${CLUSTER:?set CLUSTER=<tamia|rorqual|narval|vulcan|fir|nibi|first>}"
 
 cluv submit --autocommit "$CLUSTER" --time=1-00:00:00 -- accelerate launch --multi_gpu --num_processes 4 \
-    scripts/finetune_moe_grpo.py \
+    scripts/train/finetune_moe_grpo.py \
     --dataset nvidia/Nemotron-Post-Training-Dataset-v2 \
     --dataset-split stem,chat,math,code,multilingual_ja,multilingual_de,multilingual_it,multilingual_es,multilingual_fr \
     --max-samples 2000 --prompt-len 1024 --completion-len 1024 \

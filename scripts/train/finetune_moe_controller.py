@@ -14,7 +14,7 @@ rollout loop, GAE, and a Q-head for Q_U(s, option). This is a deliberately
 minimal, single-file version:
 
   - ONE controller at --cache-layer (not every MoE layer), matching our own
-    single-layer convention (finetune_moe_grpo.py, eval_soft_cache.py) so
+    single-layer convention (finetune_moe_grpo.py, eval/eval_router.py) so
     it's directly comparable to the other runs.
   - Teacher-forced, not on-policy rollout: reward_type=kl (self-distillation)
     needs no generation, only one forward pass over the dataset's own
@@ -61,7 +61,7 @@ import signal
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import torch
 import torch.nn as nn
@@ -213,72 +213,29 @@ def plackett_luce_sample(logits, k):
 
 def build_prompt_dataset(tokenizer, dataset_name, split, max_samples, prompt_len,
                          completion_len, seed, skip_first=EVAL_POOL_PER_SPLIT):
-    """Nemotron rows -> Dataset({'prompt', 'target_ids'}) -- prompt tokenized
-    and truncated to prompt_len, target_ids = the dataset's own ground-truth
-    assistant response, truncated to completion_len. Identical convention to
-    finetune_moe_grpo.py's build_prompt_dataset (skip_first reserves the same
-    held-out rows), except here 'prompt' is plain text (this script builds
-    the full teacher-forced prompt+completion sequence itself, no chat
-    template rendering needed since there's no on-policy generation).
-
-    Uses reservoir sampling (Algorithm R) within each split so the result is
-    a genuine random sample, not a fixed prefix -- capped at a scan window
-    (see MAX_SCAN_PER_SPLIT) so very large splits don't have to be streamed
-    to completion just to draw a few hundred rows from them. Tokenization
-    happens AFTER the reservoir is finalized, not during the scan: doing it
-    eagerly per scanned row cost up to MAX_SCAN_PER_SPLIT x num_splits BPE
-    calls for a result that only keeps per_split x num_splits of them --
-    with 9 splits x 50k that's ~450k wasted tokenizer calls, which single-
-    handedly blew well past accelerate's 600s multi-GPU rendezvous timeout
-    (rank 0 stuck tokenizing while other ranks waited and gave up)."""
+    """Nemotron rows -> Dataset({'prompt', 'target_ids'}) -- 'prompt' is
+    plain text (this script builds the full teacher-forced prompt+completion
+    sequence itself, no chat template rendering needed since there's no
+    on-policy generation), FILTERED to prompt_len tokens rather than
+    truncated: rows whose prompt is longer are dropped, so every training
+    prompt is a complete conversation turn (see
+    src.nemotron_data.sample_filtered_prompts for the scan/filter logic,
+    shared with the grpo/sft/melinoe training scripts). target_ids = the
+    dataset's own ground-truth assistant response, truncated to
+    completion_len. Same skip_first eval-pool reservation as
+    finetune_moe_grpo.py."""
     from datasets import Dataset
-    import random
-    from src.nemotron_data import load_split_stream
+    from src.nemotron_data import sample_filtered_prompts
 
-    MAX_SCAN_PER_SPLIT = 50_000
-    rng = random.Random(seed)
-    splits = [s.strip() for s in split.split(",") if s.strip()]
-    per_split = max_samples // len(splits)
     prompts, targets = [], []
-    for sp in splits:
-        ds = load_split_stream(dataset_name, sp)
-        reservoir = []  # raw (text, target_text) strings, untokenized
-        seen = 0
-        scanned = 0
-        for r_idx, row in enumerate(ds):
-            if r_idx < skip_first:
-                continue
-            if scanned >= max(MAX_SCAN_PER_SPLIT, per_split):
-                break
-            scanned += 1
-            parts = []
-            target_text = None
-            for m in row["messages"]:
-                if m["role"] == "assistant":
-                    target_text = m["content"]
-                    break
-                if m["content"].strip():
-                    parts.append(m["content"])
-            text = "\n".join(parts).strip()
-            if not (text and target_text and target_text.strip()):
-                continue
-            item = (text, target_text.strip())
-            if len(reservoir) < per_split:
-                reservoir.append(item)
-            else:
-                j = rng.randint(0, seen)
-                if j < per_split:
-                    reservoir[j] = item
-            seen += 1
-        for text, target_text in reservoir:
-            ids = tokenizer(text, truncation=True,
-                            max_length=prompt_len)["input_ids"]
-            text = tokenizer.decode(ids)
-            target_ids = tokenizer(target_text, truncation=True,
-                                   max_length=completion_len,
-                                   add_special_tokens=False)["input_ids"]
-            prompts.append(text)
-            targets.append(target_ids)
+    for ids, target_text in sample_filtered_prompts(
+            tokenizer, dataset_name, split, max_samples, prompt_len, seed, skip_first):
+        text = tokenizer.decode(ids)
+        target_ids = tokenizer(target_text, truncation=True,
+                               max_length=completion_len,
+                               add_special_tokens=False)["input_ids"]
+        prompts.append(text)
+        targets.append(target_ids)
     return Dataset.from_dict({"prompt": prompts, "target_ids": targets}) \
         .shuffle(seed=seed)
 
@@ -287,7 +244,7 @@ def collate(batch, tokenizer, prompt_len, completion_len):
     """prompt (left-padded) + target_ids (right-padded) concatenated, plus an
     action_mask marking the target span (the only positions the controller
     and the NLL loss are scored on -- the prompt only warms the option, same
-    convention as eval_soft_cache.py's prompt_lens)."""
+    convention as eval/eval_router.py's prompt_lens)."""
     pad_id = tokenizer.pad_token_id
     prompt_ids = [tokenizer(b["prompt"], truncation=True,
                             max_length=prompt_len)["input_ids"] for b in batch]
@@ -330,7 +287,7 @@ def controller_losses(model, controller, input_ids, attention_mask,
     h_seq = outputs.hidden_states[cache_layer]              # [B, T, H]
     B, T, _ = h_seq.shape
     # router_logits comes out flattened as [B*T, E], not [B, T, E] (same
-    # gotcha handled in eval_soft_cache.py's analyze())
+    # gotcha handled in eval/eval_router.py's analyze())
     router_logits = outputs.router_logits[cache_layer].float().view(B, T, -1)
     teacher_probs = F.softmax(router_logits, dim=-1)         # [B, T, E]
     device = h_seq.device

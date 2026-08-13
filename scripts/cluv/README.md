@@ -21,7 +21,7 @@ a node with no internet (tamia, rorqual, narval; also vulcan, to be safe),
 so cluv jobs rely on the SLURM stdout log (`%x_%j.out`, in the project
 root) instead of wandb. Metrics/progress should be `print`ed or logged to
 that file. This does not affect the existing mila `sbatch` scripts
-(`scripts/run_finetune_moe_*.sh`), which are submitted directly, not
+(`scripts/train/run_*.sh`), which are submitted directly, not
 through cluv, and keep using wandb online as before.
 
 `scripts/job.sh` is the generic fallback cluv uses for any cluster without
@@ -54,7 +54,7 @@ particular mandates whole-node allocation anyway.
 ```bash
 # submit to a specific cluster, program args after `--`
 cluv submit tamia -- accelerate launch --multi_gpu --num_processes 4 \
-    scripts/finetune_moe_sft.py --model microsoft/Phi-tiny-MoE-instruct ...
+    scripts/train/finetune_moe_sft.py --model microsoft/Phi-tiny-MoE-instruct ...
 
 # --autocommit must come BEFORE the cluster name -- cluv's own sbatch_args
 # parser (argparse.REMAINDER) silently swallows it if placed after, see
@@ -79,24 +79,24 @@ retraining everything. Each takes `CLUSTER` as a required env var.
 | `train_temporal_moe.sh` | `finetune_moe_grpo.py` (+ `--temporal`) | `checkpoints/temporal_moe_<CLUSTER>` |
 | `train_controller_baseline.sh` | `finetune_moe_controller.py` | `checkpoints/controller_baseline_<CLUSTER>` |
 | `train_melinoe_baseline.sh` | `finetune_moe_melinoe.py` (cache-consistency + rank-margin loss, arXiv:2602.11192) | `checkpoints/melinoe_baseline_<CLUSTER>` |
-| `eval_lm_harness.sh [variant...]` | `scripts/eval_lm_harness.py` (lm-eval-harness: MMLU/MMMLU/GSM8K/HumanEval/MATH) | reads `checkpoints/<variant>_<CLUSTER>`, writes `evals/<CLUSTER>/<date>/` |
-| `eval_soft_cache.sh [variant...]` | `scripts/eval_soft_cache.py` (LRU cache-hit-rate; **stub**, see its docstring) | reads `checkpoints/<variant>_<CLUSTER>`, writes `evals/<CLUSTER>/soft_cache_<date>/` |
+| `eval_benchmarks.sh [variant...]` | `scripts/eval/eval_benchmarks.py` (lm-eval-harness: MMLU/MMMLU/GSM8K/HumanEval/MATH) | reads `checkpoints/<variant>_<CLUSTER>`, writes `evals/<CLUSTER>/<date>/` |
+| `eval_router.sh [variant...]` | `scripts/eval/eval_router.py` (LRU cache-hit-rate; **stub**, see its docstring) | reads `checkpoints/<variant>_<CLUSTER>`, writes `evals/<CLUSTER>/router_<date>/` |
 
 The two `eval_*.sh` scripts default to all 5 variants (`base`,
 `sft_baseline`, `cache_sft`, `temporal_moe`, `controller_baseline`) run in
-parallel, GPU-pinned, within one job (`_eval_lm_harness_run.sh` /
-`_eval_soft_cache_run.sh` are the actual remote drivers -- not meant to be
+parallel, GPU-pinned, within one job (`_eval_benchmarks_run.sh` /
+`_eval_router_run.sh` are the actual remote drivers -- not meant to be
 invoked directly; kept as real files rather than inline shell strings
 because `cluv submit` breaks on nested quotes/parens passed as program args).
 
 ```bash
 CLUSTER=fir bash scripts/cluv/train_cache_sft.sh
-CLUSTER=fir bash scripts/cluv/eval_lm_harness.sh cache_sft temporal_moe
-CLUSTER=fir bash scripts/cluv/eval_soft_cache.sh cache_sft temporal_moe
+CLUSTER=fir bash scripts/cluv/eval_benchmarks.sh cache_sft temporal_moe
+CLUSTER=fir bash scripts/cluv/eval_router.sh cache_sft temporal_moe
 ```
 
-`eval_lm_harness.py` and `eval_soft_cache.py` both accept a
+`eval_benchmarks.py` and `eval_router.py` both accept a
 `--checkpoint-dir` override (added specifically for cluv checkpoints, whose
-`<variant>_<CLUSTER>` naming differs from the mila `run_finetune_moe_*.sh`
+`<variant>_<CLUSTER>` naming differs from the mila `scripts/train/run_*.sh`
 `VARIANT_CHECKPOINTS` convention) -- the `eval_*.sh` wrappers pass it
 automatically, you shouldn't need to set it by hand.

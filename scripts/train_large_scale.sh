@@ -22,7 +22,7 @@ echo "[train_large_scale] dataset: $MAX_SAMPLES sequences across all splits, seq
 
 j1=$(DATASET_SPLIT="$DATASET_SPLIT" MAX_SAMPLES=$MAX_SAMPLES PROMPT_LEN=$PROMPT_LEN COMPLETION_LEN=$COMPLETION_LEN \
      LR=$LR NUM_STEPS=157 BATCH_SIZE=4 GRAD_ACCUM=4 \
-     sbatch --parsable scripts/run_finetune_moe_sft.sh)
+     sbatch --parsable scripts/train/run_sft.sh)
 echo "sft_baseline       -> job $j1 (157 steps, batch=4/accum=4)"
 
 # cache_sft/temporal_moe: ~198.5/~326.0 GPU-hours estimated (~49.6h/~81.5h
@@ -31,17 +31,17 @@ echo "sft_baseline       -> job $j1 (157 steps, batch=4/accum=4)"
 # (a100l:4 nodes there, up to 7-day limit) with a generous 4-day budget.
 j2=$(DATASET_SPLIT="$DATASET_SPLIT" MAX_SAMPLES=$MAX_SAMPLES PROMPT_LEN=$PROMPT_LEN COMPLETION_LEN=$COMPLETION_LEN \
      LR=$LR NUM_STEPS=1250 BATCH_SIZE=8 GRAD_ACCUM=2 SOFT_CACHE=1 BETA=0.08 RL_COEF=2.0 SFT_COEF=0.5 \
-     sbatch --parsable --partition=long --time=4-00:00:00 scripts/run_finetune_moe_grpo.sh)
+     sbatch --parsable --partition=long --time=4-00:00:00 scripts/train/run_grpo.sh)
 echo "cache_sft          -> job $j2 (1250 steps, batch=8/accum=2, long partition, ~2.1d est.)"
 
 j3=$(DATASET_SPLIT="$DATASET_SPLIT" MAX_SAMPLES=$MAX_SAMPLES PROMPT_LEN=$PROMPT_LEN COMPLETION_LEN=$COMPLETION_LEN \
      LR=$LR NUM_STEPS=1250 BATCH_SIZE=8 GRAD_ACCUM=2 TEMPORAL=1 CACHE_TOPK=1 BETA=0.08 RL_COEF=2.0 SFT_COEF=0.5 \
-     sbatch --parsable --partition=long --time=4-00:00:00 scripts/run_finetune_moe_grpo.sh)
+     sbatch --parsable --partition=long --time=4-00:00:00 scripts/train/run_grpo.sh)
 echo "temporal_moe       -> job $j3 (1250 steps, batch=8/accum=2, long partition, ~3.4d est.)"
 
 j4=$(DATASET_SPLIT="$DATASET_SPLIT" MAX_SAMPLES=$MAX_SAMPLES PROMPT_LEN=$PROMPT_LEN COMPLETION_LEN=$COMPLETION_LEN \
      LR=$LR NUM_STEPS=157 BATCH_SIZE=4 GRAD_ACCUM=4 \
-     sbatch --parsable scripts/run_finetune_moe_controller.sh)
+     sbatch --parsable scripts/train/run_controller.sh)
 echo "controller_baseline -> job $j4 (157 steps, batch=4/accum=4)"
 
 echo "[train_large_scale] all 4 jobs submitted: $j1 $j2 $j3 $j4"

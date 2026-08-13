@@ -71,7 +71,7 @@ for ATTEMPT in 1 2 3; do
     accelerate launch \
     --multi_gpu \
     --num_processes 4 \
-    scripts/finetune_moe_controller.py \
+    scripts/train/finetune_moe_controller.py \
     --model "$MODEL" \
     --dataset nvidia/Nemotron-Post-Training-Dataset-v2 \
     --dataset-split "$DATASET_SPLIT" \

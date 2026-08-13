@@ -34,8 +34,9 @@ Once checkpoints exist, evaluate with:
 
 ```bash
 # quantitative + qualitative eval, per checkpoint -- see handoff/07-eval-setup.md
-sbatch scripts/run_eval_lm_harness.sh <variant1> [variant2]   # downstream tasks
-sbatch scripts/run_eval_soft_cache.sh --checkpoint <path>     # routing/cache metrics
+sbatch scripts/eval/run_benchmarks.sh <variant1> [variant2]   # downstream tasks
+sbatch scripts/eval/run_router.sh --checkpoint <path>          # routing/cache metrics
+python scripts/eval/eval_postprocess.py                       # tables + plots from evals/
 ```
 
 ## Project structure

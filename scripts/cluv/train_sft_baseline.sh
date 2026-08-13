@@ -1,9 +1,9 @@
 #!/bin/bash
 # Submit the sft_baseline small-scale training job via cluv (see
 # scripts/train_small_scale.sh for the config this mirrors, and
-# scripts/run_finetune_moe_sft.sh for the mila/sbatch equivalent).
+# scripts/train/run_sft.sh for the mila/sbatch equivalent).
 # Saves to checkpoints/sft_baseline_<CLUSTER> -- matches what
-# scripts/cluv/eval_lm_harness.sh / eval_soft_cache.sh look up by default.
+# scripts/cluv/eval_benchmarks.sh / eval_router.sh look up by default.
 #
 # Usage: CLUSTER=fir bash scripts/cluv/train_sft_baseline.sh
 set -euo pipefail
@@ -11,7 +11,7 @@ cd "$(dirname "$0")/../.."
 CLUSTER="${CLUSTER:?set CLUSTER=<tamia|rorqual|narval|vulcan|fir|nibi|first>}"
 
 cluv submit --autocommit "$CLUSTER" -- accelerate launch --multi_gpu --num_processes 4 \
-    scripts/finetune_moe_sft.py \
+    scripts/train/finetune_moe_sft.py \
     --dataset nvidia/Nemotron-Post-Training-Dataset-v2 \
     --dataset-split stem,chat,math,code,multilingual_ja,multilingual_de,multilingual_it,multilingual_es,multilingual_fr \
     --max-samples 2000 --prompt-len 1024 --completion-len 1024 \

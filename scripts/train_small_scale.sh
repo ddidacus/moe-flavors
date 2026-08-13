@@ -12,7 +12,7 @@
 #        CLUSTER=fir bash scripts/train_small_scale.sh   # submit via cluv instead of sbatch
 #
 # CLUSTER defaults to "mila", which submits directly with `sbatch` against
-# the existing scripts/run_finetune_moe_*.sh job scripts (unchanged
+# the existing scripts/train/run_*.sh job scripts (unchanged
 # behavior). Any other CLUSTER value (tamia, rorqual, narval, vulcan, fir,
 # nibi -- see scripts/cluv/README.md) submits the same 4 jobs through
 # `cluv submit`, using that cluster's scripts/cluv/<cluster>_job.sh
@@ -33,7 +33,7 @@ echo "[train_small_scale] cluster: $CLUSTER, dataset: $MAX_SAMPLES sequences acr
 if [ "$CLUSTER" = "mila" ]; then
     j1=$(DATASET_SPLIT="$DATASET_SPLIT" MAX_SAMPLES=$MAX_SAMPLES PROMPT_LEN=$PROMPT_LEN COMPLETION_LEN=$COMPLETION_LEN \
          LR=$LR NUM_STEPS=32 BATCH_SIZE=4 GRAD_ACCUM=4 \
-         sbatch --parsable scripts/run_finetune_moe_sft.sh)
+         sbatch --parsable scripts/train/run_sft.sh)
     echo "sft_baseline       -> job $j1 (32 steps, batch=4/accum=4)"
 
     # cache_sft/temporal_moe: ~39.7/~65.2 GPU-hours estimated (~9.9h/~16.3h
@@ -42,17 +42,17 @@ if [ "$CLUSTER" = "mila" ]; then
     # to `long` (a100l:4 nodes there) with a 1-day budget.
     j2=$(DATASET_SPLIT="$DATASET_SPLIT" MAX_SAMPLES=$MAX_SAMPLES PROMPT_LEN=$PROMPT_LEN COMPLETION_LEN=$COMPLETION_LEN \
          LR=$LR NUM_STEPS=250 BATCH_SIZE=8 GRAD_ACCUM=2 SOFT_CACHE=1 BETA=0.08 RL_COEF=2.0 SFT_COEF=0.5 \
-         sbatch --parsable --partition=long --time=1-00:00:00 scripts/run_finetune_moe_grpo.sh)
+         sbatch --parsable --partition=long --time=1-00:00:00 scripts/train/run_grpo.sh)
     echo "cache_sft          -> job $j2 (250 steps, batch=8/accum=2, long partition, ~9.9h est.)"
 
     j3=$(DATASET_SPLIT="$DATASET_SPLIT" MAX_SAMPLES=$MAX_SAMPLES PROMPT_LEN=$PROMPT_LEN COMPLETION_LEN=$COMPLETION_LEN \
          LR=$LR NUM_STEPS=250 BATCH_SIZE=8 GRAD_ACCUM=2 TEMPORAL=1 CACHE_TOPK=1 BETA=0.08 RL_COEF=2.0 SFT_COEF=0.5 \
-         sbatch --parsable --partition=long --time=1-00:00:00 scripts/run_finetune_moe_grpo.sh)
+         sbatch --parsable --partition=long --time=1-00:00:00 scripts/train/run_grpo.sh)
     echo "temporal_moe       -> job $j3 (250 steps, batch=8/accum=2, long partition, ~16.3h est.)"
 
     j4=$(DATASET_SPLIT="$DATASET_SPLIT" MAX_SAMPLES=$MAX_SAMPLES PROMPT_LEN=$PROMPT_LEN COMPLETION_LEN=$COMPLETION_LEN \
          LR=$LR NUM_STEPS=32 BATCH_SIZE=4 GRAD_ACCUM=4 \
-         sbatch --parsable scripts/run_finetune_moe_controller.sh)
+         sbatch --parsable scripts/train/run_controller.sh)
     echo "controller_baseline -> job $j4 (32 steps, batch=4/accum=4)"
 
     echo "[train_small_scale] all 4 jobs submitted: $j1 $j2 $j3 $j4"
@@ -67,7 +67,7 @@ COMMON_ARGS=(--dataset nvidia/Nemotron-Post-Training-Dataset-v2
              --wandb-project moe-cache-reinforce --save-every 50 --resume)
 
 cluv submit --autocommit "$CLUSTER" -- accelerate launch --multi_gpu --num_processes 4 \
-    scripts/finetune_moe_sft.py "${COMMON_ARGS[@]}" \
+    scripts/train/finetune_moe_sft.py "${COMMON_ARGS[@]}" \
     --batch-size 4 --gradient-accumulation-steps 4 --num-steps 32 --num-epochs 10 \
     --wandb-run-name "sft-baseline-${CLUSTER}" --save-dir "checkpoints/sft_baseline_${CLUSTER}"
 echo "sft_baseline        -> submitted to $CLUSTER (32 steps, batch=4/accum=4)"
@@ -75,7 +75,7 @@ echo "sft_baseline        -> submitted to $CLUSTER (32 steps, batch=4/accum=4)"
 # cache_sft/temporal_moe: ~9.9h/~16.3h wall-clock on 4 GPUs estimated (see
 # mila branch above) -- override walltime past the 3h pyproject.toml default.
 cluv submit --autocommit "$CLUSTER" --time=1-00:00:00 -- accelerate launch --multi_gpu --num_processes 4 \
-    scripts/finetune_moe_grpo.py "${COMMON_ARGS[@]}" \
+    scripts/train/finetune_moe_grpo.py "${COMMON_ARGS[@]}" \
     --batch-size 8 --gradient-accumulation-steps 2 --num-steps 250 --num-epochs 10 \
     --num-generations 8 --temperature 1.0 --rl-coef 2.0 --sft-coef 0.5 --beta 0.08 \
     --cache-size 4 --cache-layer -1 --cache-experts-per-token 2 --cache-topk --soft-cache \
@@ -84,7 +84,7 @@ cluv submit --autocommit "$CLUSTER" --time=1-00:00:00 -- accelerate launch --mul
 echo "cache_sft           -> submitted to $CLUSTER (250 steps, batch=8/accum=2, ~9.9h est.)"
 
 cluv submit --autocommit "$CLUSTER" --time=1-00:00:00 -- accelerate launch --multi_gpu --num_processes 4 \
-    scripts/finetune_moe_grpo.py "${COMMON_ARGS[@]}" \
+    scripts/train/finetune_moe_grpo.py "${COMMON_ARGS[@]}" \
     --batch-size 8 --gradient-accumulation-steps 2 --num-steps 250 --num-epochs 10 \
     --num-generations 8 --temperature 1.0 --rl-coef 2.0 --sft-coef 0.5 --beta 0.08 \
     --cache-size 4 --cache-layer -1 --cache-experts-per-token 2 --cache-topk \
@@ -93,7 +93,7 @@ cluv submit --autocommit "$CLUSTER" --time=1-00:00:00 -- accelerate launch --mul
 echo "temporal_moe        -> submitted to $CLUSTER (250 steps, batch=8/accum=2, ~16.3h est.)"
 
 cluv submit --autocommit "$CLUSTER" -- accelerate launch --multi_gpu --num_processes 4 \
-    scripts/finetune_moe_controller.py "${COMMON_ARGS[@]}" \
+    scripts/train/finetune_moe_controller.py "${COMMON_ARGS[@]}" \
     --batch-size 4 --gradient-accumulation-steps 4 --num-steps 32 \
     --cache-size 4 --cache-layer -1 --deliberation-cost 0.02 \
     --wandb-run-name "controller-baseline-${CLUSTER}" --save-dir "checkpoints/controller_baseline_${CLUSTER}"

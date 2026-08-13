@@ -1,8 +1,8 @@
 """Downstream task eval (EleutherAI lm-evaluation-harness) for the MoE
 cache-reward experiments: MMLU + MMMLU (knowledge/reasoning, English +
 14-language pooled sample), GSM8K + MATH (math), HumanEval (code) -- so
-cache-hit/temporal-consolidation gains from eval_soft_cache.py can be
-checked against actual task performance, not just routing metrics.
+cache-hit/temporal-consolidation gains from eval_router.py can be checked
+against actual task performance, not just routing metrics.
 
 MMMLU has no native "all languages pooled" task in lm-eval -- only 798
 separate per-(language, subject) leaf tasks (14 languages x 57 subjects,
@@ -16,21 +16,25 @@ of MMLU (identical example counts), taken from our own completed English
 MMLU run rather than re-downloading all 798 configs just to measure sizes.
 
 Variants (each loaded as its own model instance -- see build_variant_model):
-  base          plain microsoft/Phi-tiny-MoE-instruct, no adapter
-  cache_sft     GRPO + soft cache-hit reward + SFT NLL loss, lr=1e-4
-                (checkpoints/grpo_..._softall_lr1e-4_..., non-temporal)
-  temporal_moe  same, but with the boundary/hold-switch mixin at the cache
-                layer (checkpoints/grpo_..._tmoeN8_lr1e-4_...)
-  sft_baseline  plain LoRA SFT (scripts/finetune_moe_sft.py), no RL, no
-                cache reward -- the standard-finetuning reference point
-  controller_baseline  Option-Critic MoE controller (Shen & Henderson 2026),
-                scripts/finetune_moe_controller.py
+  base                 plain microsoft/Phi-tiny-MoE-instruct, no adapter
+  sft_baseline          plain LoRA SFT (finetune_moe_sft.py), no RL, no cache
+                        reward -- the standard-finetuning reference point
+  cache_sft             GRPO + soft cache-hit reward + SFT NLL loss, lr=1e-4
+                        (checkpoints/grpo_..._softall_lr1e-4_..., non-temporal)
+  temporal_moe          same, but with the boundary/hold-switch mixin at the
+                        cache layer (checkpoints/grpo_..._tmoeN8_lr1e-4_...)
+  controller_baseline    Option-Critic MoE controller (Shen & Henderson 2026),
+                        finetune_moe_controller.py
+  melinoe                cluster-affinity soft-cache controller,
+                        finetune_moe_melinoe.py
+  sft_then_dapo          GRPO cache reward initialized from an SFT checkpoint
+                        (DAPO-style warm start)
 
-Each variant runs in its own process (see run_eval_lm_harness.sh -- one
-sbatch job per variant, GPU-pinned, so they can run concurrently), writing
+Each variant runs in its own process (see run_benchmarks.sh -- one sbatch
+job per variant, GPU-pinned, so they can run concurrently), writing
 results_<variant>.json. --variant merge then loads every results_*.json in
 --out-dir and writes summary.json + a printed table -- no model/GPU needed,
-mirrors eval_soft_cache.py's base/tuned/merge split.
+mirrors eval_router.py's base/tuned/merge split.
 
 Generation is fixed at temperature=1.0, top_p=0.95, max 2048 new tokens
 (SAMPLING_KWARGS below) -- applied uniformly to every generate_until task
@@ -53,6 +57,12 @@ import os
 import sys
 from pathlib import Path
 
+# ---------------------------------------------------------------------------
+# Environment setup and third-party monkeypatches. All three patches below
+# must run at import time, before lm_eval or peft touch the relevant code
+# paths -- see each patch's comment for why.
+# ---------------------------------------------------------------------------
+
 # HumanEval's own utils.py runs a code_eval self-test at import time (before
 # lm_eval's own confirm_run_unsafe_code gate is ever consulted) -- the
 # underlying `evaluate` HF metric refuses to execute generated code at all
@@ -62,7 +72,7 @@ from pathlib import Path
 # use case the checkbox exists for.
 os.environ.setdefault("HF_ALLOW_CODE_EVAL", "1")
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import torch
 
@@ -111,6 +121,12 @@ def _build_qa_turn_str_safe(self, *, q=None, c=None, a=None, gen_prefix=None,
 
 _lm_task.ConfigurableTask.build_qa_turn = _build_qa_turn_str_safe
 
+# ---------------------------------------------------------------------------
+# Variant registry: every method/baseline this pipeline evaluates, and where
+# its checkpoint lives on the mila filesystem (run_finetune_moe_*.sh naming
+# convention). "base" is not listed -- it needs no checkpoint. --checkpoint-dir
+# overrides any of these for checkpoints trained elsewhere (e.g. via cluv).
+# ---------------------------------------------------------------------------
 
 VARIANT_CHECKPOINTS = {
     "cache_sft": "checkpoints/grpo_phi-tiny-moe-instruct_cache_allsplits_"
@@ -126,10 +142,16 @@ VARIANT_CHECKPOINTS = {
     "melinoe": "checkpoints/melinoe_phi-tiny-moe-instruct_allsplits_"
               "c4_lcs0.5_lrm0.1_seq1024-1024_n2000_initsft",
 }
+ALL_VARIANTS = ["base"] + list(VARIANT_CHECKPOINTS.keys())
+
 # mmlu/mmmlu_<lang>: multiple_choice, loglikelihood-scored -- deterministic,
 # unaffected by temperature/top_p/seed. gsm8k/humaneval/hendrycks_math:
 # generate_until -- affected by SAMPLING_KWARGS and reseeded per SEEDS.
 STOCHASTIC_TASKS = ["gsm8k", "humaneval", "hendrycks_math"]
+# Logical table/summary tasks -- "mmmlu" here is our synthetic pooled
+# aggregate (see build_mmmlu_samples), not a real lm_eval task name.
+TASKS = ["mmlu", "mmmlu"] + STOCHASTIC_TASKS
+
 MMMLU_TOTAL_SAMPLES = 200  # pooled across ALL languages, not per-language
 
 # hendrycks_math ships with 0 few-shot examples by default -- without a
@@ -174,6 +196,10 @@ MMLU_SUBJECT_SIZES = {
     "prehistory": 324, "professional_law": 1534, "world_religions": 171,
 }
 
+SEEDS = [42, 43, 44, 45]
+SAMPLING_KWARGS = {"do_sample": True, "temperature": 1.0, "top_p": 0.95,
+                  "max_gen_toks": 2048}
+
 
 def build_mmmlu_samples(seed, n_total=MMMLU_TOTAL_SAMPLES):
     """Uniformly-random n_total (language, subject, doc_index) triples
@@ -195,18 +221,15 @@ def build_mmmlu_samples(seed, n_total=MMMLU_TOTAL_SAMPLES):
     return samples
 
 
-# Logical table/summary tasks -- "mmmlu" here is our synthetic pooled
-# aggregate (see build_mmmlu_samples), not a real lm_eval task name.
-TASKS = ["mmlu", "mmmlu"] + STOCHASTIC_TASKS
-
-SEEDS = [42, 43, 44, 45]
-SAMPLING_KWARGS = {"do_sample": True, "temperature": 1.0, "top_p": 0.95,
-                  "max_gen_toks": 2048}
-
+# ---------------------------------------------------------------------------
+# Model loading: build a ready-to-eval nn.Module for any variant, including
+# the manual adapter loader that works around peft 0.19's inability to load
+# ParamWrapper/target_parameters adapters via its own state-dict path.
+# ---------------------------------------------------------------------------
 
 def load_adapter(peft_model, ckpt_dir):
     """Manual adapter load (peft 0.19 can't load ParamWrapper/target_parameters
-    adapters) -- identical to eval_soft_cache.py's load_adapter."""
+    adapters) -- identical to eval_router.py's load_adapter."""
     from safetensors.torch import load_file
     sd = load_file(str(Path(ckpt_dir) / "adapter_model.safetensors"))
     model_keys = set(peft_model.state_dict().keys())
@@ -229,7 +252,7 @@ def load_adapter(peft_model, ckpt_dir):
 
 def build_variant_model(variant, base_model_name, device, checkpoint_dir=None):
     """Returns a ready-to-eval nn.Module for one variant -- no dense-router
-    patching here (unlike eval_soft_cache.py): this is a downstream task
+    patching here (unlike eval_router.py): this is a downstream task
     eval, so every variant runs with its actual deployment-time routing
     (native sparse top-k, or the temporal mixin's real hold/switch forward),
     not an analysis-only monkeypatch.
@@ -257,7 +280,7 @@ def build_variant_model(variant, base_model_name, device, checkpoint_dir=None):
 
     if variant == "temporal_moe":
         # architectural (not something LoRA adds) -> wrap before the adapter
-        # is loaded on top of it, exactly like training/eval_soft_cache.py.
+        # is loaded on top of it, exactly like training/eval_router.py.
         from src.temporal_moe_wrapper import TemporalWrapConfig, TemporalWrapMixin
         TemporalWrapMixin.apply(m, TemporalWrapConfig(ste=True))
 
@@ -266,6 +289,12 @@ def build_variant_model(variant, base_model_name, device, checkpoint_dir=None):
     load_adapter(peft_model, ckpt_dir)
     return peft_model
 
+
+# ---------------------------------------------------------------------------
+# Per-variant eval driver: runs the deterministic (MMLU/MMMLU) tasks once,
+# then the stochastic (generate_until) tasks under every seed in SEEDS,
+# aggregating mean/std across seeds for the latter.
+# ---------------------------------------------------------------------------
 
 def _mean_std(values):
     n = len(values)
@@ -462,12 +491,16 @@ def run_math_only(variant, base_model_name, batch_size, limit, out_dir, checkpoi
     print(f"[eval] patched hendrycks_math into {out_path}")
 
 
+# ---------------------------------------------------------------------------
+# Merge: combine every results_<variant>.json already written in --out-dir
+# into one summary.json plus a printed table. CPU-only, no model needed --
+# meant to be run after all per-variant jobs have finished.
+# ---------------------------------------------------------------------------
+
 def merge(out_dir):
     out_dir = Path(out_dir)
-    all_variants = ["base", "sft_baseline", "controller_baseline",
-                   "cache_sft", "temporal_moe", "sft_then_dapo", "melinoe"]
     summary = {}
-    for variant in all_variants:
+    for variant in ALL_VARIANTS:
         p = out_dir / f"results_{variant}.json"
         if not p.exists():
             print(f"[merge] skipping {variant}: {p} not found")
@@ -483,7 +516,7 @@ def merge(out_dir):
     # aggregated over SEEDS -- see run_variant. Table shows "mean±std" for
     # the latter.
     primary = {"mmlu": "acc,none", "mmmlu": "acc,none",
-              "gsm8k": "exact_match,strict-match",
+              "gsm8k": "exact_match,flexible-extract",
               "humaneval": "pass@1,create_test",
               "hendrycks_math": "exact_match,none"}
     header = ["variant"] + TASKS
@@ -507,16 +540,16 @@ def merge(out_dir):
     print(f"\n[merge] wrote {out_dir / 'summary.json'}")
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
 def main():
     global SEEDS, SAMPLING_KWARGS
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", default="microsoft/Phi-tiny-MoE-instruct")
-    ap.add_argument("--variant",
-                    choices=["base", "cache_sft", "temporal_moe",
-                             "sft_baseline", "controller_baseline",
-                             "sft_then_dapo", "melinoe", "merge"],
-                    required=True)
+    ap.add_argument("--variant", choices=ALL_VARIANTS + ["merge"], required=True)
     ap.add_argument("--batch-size", default="auto")
     ap.add_argument("--limit", type=float, default=200,
                     help="cap examples per task/subtask (200 by default, "
@@ -524,7 +557,7 @@ def main():
                          "= full set. Note: for grouped benchmarks (mmlu, "
                          "mmmlu_fr_fr, hendrycks_math) this applies per "
                          "constituent subtask, not once for the whole group")
-    ap.add_argument("--out-dir", default="eval_lm_harness")
+    ap.add_argument("--out-dir", default="evals/benchmarks")
     ap.add_argument("--num-seeds", type=int, default=len(SEEDS),
                     help=f"how many of {SEEDS} to actually run for the "
                          f"stochastic tasks (fewer = faster, less variance "

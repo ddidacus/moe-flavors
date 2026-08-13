@@ -2,15 +2,15 @@
 # Submit a soft-cache (LRU cache-hit-rate) eval via cluv: one job, up to 5
 # variants in parallel (GPU-pinned), targeting checkpoints/<variant>_<CLUSTER>
 # -- the naming scripts/cluv/train_<variant>.sh saves to. See
-# scripts/eval_soft_cache.py's module docstring for what this does and does
+# scripts/eval/eval_router.py's module docstring for what this does and does
 # NOT implement yet (it's a stub -- raw cache-hit-rate numbers only, no
 # routing-distribution plots).
 #
-# Usage: CLUSTER=fir bash scripts/cluv/eval_soft_cache.sh [variant ...]
+# Usage: CLUSTER=fir bash scripts/cluv/eval_router.sh [variant ...]
 #        (default: base sft_baseline cache_sft temporal_moe controller_baseline)
 #
 # Pass at most 4 variants at once (the job requests one exclusive 4-GPU
-# node); results land in evals/<CLUSTER>/soft_cache_<date>/results_soft_cache_<variant>.json
+# node); results land in evals/<CLUSTER>/router_<date>/results_soft_cache_<variant>.json
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 CLUSTER="${CLUSTER:?set CLUSTER=<tamia|rorqual|narval|vulcan|fir|nibi|first>}"
@@ -24,5 +24,5 @@ fi
 # held-out prompt at T=1.0, then scores cache-hit rate on the generated
 # tokens only) -- much slower than teacher-forced scoring, past the
 # pyproject.toml 3h default.
-cluv submit --autocommit "$CLUSTER" --time=1-00:00:00 -- bash scripts/cluv/_eval_soft_cache_run.sh "$CLUSTER" "${VARIANTS[@]}"
-echo "eval_soft_cache [${VARIANTS[*]}] -> submitted to $CLUSTER"
+cluv submit --autocommit "$CLUSTER" --time=1-00:00:00 -- bash scripts/cluv/_eval_router_run.sh "$CLUSTER" "${VARIANTS[@]}"
+echo "eval_router [${VARIANTS[*]}] -> submitted to $CLUSTER"

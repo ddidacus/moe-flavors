@@ -1,8 +1,8 @@
 #!/bin/bash
-# Runs one or more scripts/eval_lm_harness.py variants in parallel
-# (GPU-pinned), mirroring scripts/run_eval_lm_harness.sh's pattern. Not
-# meant to be run directly -- invoked by scripts/cluv/eval_lm_harness.sh via
-# `cluv submit <cluster> -- bash scripts/cluv/_eval_lm_harness_run.sh
+# Runs one or more scripts/eval/eval_benchmarks.py variants in parallel
+# (GPU-pinned), mirroring scripts/eval/run_benchmarks.sh's pattern. Not
+# meant to be run directly -- invoked by scripts/cluv/eval_benchmarks.sh via
+# `cluv submit <cluster> -- bash scripts/cluv/_eval_benchmarks_run.sh
 # <cluster> <variant> [variant ...]`.
 set -euo pipefail
 CLUSTER="$1"; shift
@@ -16,7 +16,7 @@ for variant in "$@"; do
         ckpt_args=(--checkpoint-dir "checkpoints/${variant}_${CLUSTER}")
     fi
     CUDA_VISIBLE_DEVICES=$gpu TRITON_CACHE_DIR=/tmp/triton_cache_${SLURM_JOB_ID}_${variant} \
-        python scripts/eval_lm_harness.py --variant "$variant" "${ckpt_args[@]}" \
+        python scripts/eval/eval_benchmarks.py --variant "$variant" "${ckpt_args[@]}" \
         --out-dir "$OUT_DIR" &
     pids+=($!)
     gpu=$((gpu + 1))

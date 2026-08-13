@@ -97,7 +97,7 @@ run_bg() {  # $1=CUDA_VISIBLE_DEVICES  $2=PORT  $3=EXTRA_ARGS  $4=LOG_SUFFIX
         --multi_gpu \
         --num_processes 2 \
         --main_process_port "$PORT" \
-        scripts/finetune_moe_grpo.py \
+        scripts/train/finetune_moe_grpo.py \
         --model "$MODEL" \
         --dataset nvidia/Nemotron-Post-Training-Dataset-v2 \
         --dataset-split "$DATASET_SPLIT" \
@@ -162,7 +162,7 @@ echo "[chain] progress: cache_sft ${CACHE_STEP}/${NUM_STEPS}, temporal_moe ${TEM
 
 if [ "$CACHE_STEP" -lt "$NUM_STEPS" ] || [ "$TEMPORAL_STEP" -lt "$NUM_STEPS" ]; then
     echo "[chain] not done -- resubmitting"
-    sbatch scripts/run_finetune_moe_grpo_chain.sh
+    sbatch scripts/train/run_grpo_chain.sh
 else
     echo "[chain] both runs complete"
 fi

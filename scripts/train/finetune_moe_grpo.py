@@ -33,7 +33,7 @@ import signal
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import torch
 import torch.nn.functional as F
@@ -148,75 +148,31 @@ def build_prompt_dataset(tokenizer, dataset_name, split, max_samples,
                          skip_first=EVAL_POOL_PER_SPLIT):
     """Nemotron rows -> Dataset({'prompt', 'target_ids'}).
 
-    'prompt' is pre-truncated to prompt_len tokens (TRL 1.8 has no
-    max_prompt_length). 'target_ids' is the dataset's own ground-truth
-    assistant response, tokenized and truncated to completion_len tokens --
-    used only for the SFT NLL loss term (GRPOTrainerWithSFT), never for
-    reward computation or generation. The first `skip_first` rows of each
-    split are reserved for the perplexity eval.
-
-    Uses reservoir sampling (Algorithm R) within each split so the result is
-    a genuine random sample, not a fixed prefix -- capped at a scan window
-    (see MAX_SCAN_PER_SPLIT) so very large splits (e.g. "chat") don't have to
-    be streamed to completion just to draw a few hundred rows from them.
-    Tokenization happens AFTER the reservoir is finalized, not during the
-    scan: doing it eagerly per scanned row cost up to MAX_SCAN_PER_SPLIT x
-    num_splits BPE calls for a result that only keeps per_split x num_splits
-    of them -- with 9 splits x 50k that's ~450k wasted tokenizer calls,
-    which single-handedly blew well past accelerate's 600s multi-GPU
-    rendezvous timeout (rank 0 stuck tokenizing while other ranks waited and
-    gave up).
+    'prompt' is FILTERED to prompt_len tokens, not truncated: rows whose
+    prompt is longer than prompt_len are dropped, so every training prompt
+    is a complete conversation turn (see
+    src.nemotron_data.sample_filtered_prompts for the scan/filter logic,
+    shared with the sft/controller/melinoe training scripts). 'target_ids'
+    is the dataset's own ground-truth assistant response, tokenized and
+    truncated to completion_len tokens -- used only for the SFT NLL loss
+    term (GRPOTrainerWithSFT), never for reward computation or generation.
+    The first `skip_first` rows of each split are reserved for the
+    perplexity eval.
     """
-    import random
-    from src.nemotron_data import load_split_stream
+    from src.nemotron_data import sample_filtered_prompts
 
-    MAX_SCAN_PER_SPLIT = 50_000  # bounds streaming cost on large splits
-    rng = random.Random(seed)
-    splits = [s.strip() for s in split.split(",") if s.strip()]
-    per_split = max_samples // len(splits)
     use_chat = tokenizer.chat_template is not None
     prompts, targets = [], []
-    for sp in splits:
-        ds = load_split_stream(dataset_name, sp)
-        reservoir = []  # raw (text, target_text) strings, untokenized
-        seen = 0
-        scanned = 0
-        for r_idx, row in enumerate(ds):
-            if r_idx < skip_first:
-                continue
-            if scanned >= max(MAX_SCAN_PER_SPLIT, per_split):
-                break
-            scanned += 1
-            parts = []
-            target_text = None
-            for m in row["messages"]:
-                if m["role"] == "assistant":
-                    target_text = m["content"]
-                    break
-                if m["content"].strip():
-                    parts.append(m["content"])
-            text = "\n".join(parts).strip()
-            if not (text and target_text and target_text.strip()):
-                continue
-            item = (text, target_text.strip())
-            if len(reservoir) < per_split:
-                reservoir.append(item)
-            else:
-                j = rng.randint(0, seen)
-                if j < per_split:
-                    reservoir[j] = item
-            seen += 1
-        for text, target_text in reservoir:
-            ids = tokenizer(text, truncation=True,
-                            max_length=prompt_len)["input_ids"]
-            text = tokenizer.decode(ids)
-            # conversational format -> TRL applies the chat template
-            prompt_repr = [{"role": "user", "content": text}] if use_chat else text
-            target_ids = tokenizer(target_text, truncation=True,
-                                   max_length=completion_len,
-                                   add_special_tokens=False)["input_ids"]
-            prompts.append(prompt_repr)
-            targets.append(target_ids)
+    for ids, target_text in sample_filtered_prompts(
+            tokenizer, dataset_name, split, max_samples, prompt_len, seed, skip_first):
+        text = tokenizer.decode(ids)
+        # conversational format -> TRL applies the chat template
+        prompt_repr = [{"role": "user", "content": text}] if use_chat else text
+        target_ids = tokenizer(target_text, truncation=True,
+                               max_length=completion_len,
+                               add_special_tokens=False)["input_ids"]
+        prompts.append(prompt_repr)
+        targets.append(target_ids)
     return Dataset.from_dict({"prompt": prompts, "target_ids": targets}) \
         .shuffle(seed=seed)
 

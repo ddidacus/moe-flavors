@@ -3,13 +3,15 @@
 # scripts/train_small_scale.sh for the config this mirrors, and
 # scripts/train/run_grpo.sh for the mila/sbatch equivalent).
 #
-# prompt-len/completion-len=1024/1024, batch-size=16, no gradient
-# accumulation: scripts/train/smoke_test_context.sh confirmed 2048+2048
-# OOMs a single 80GB A100L at batch=16 (peak ~78GB before the crash), while
-# 1024+1024 fits -- barely (peak ~78.6/80GB on the smoke test's 3-step
-# probe, so there's very little headroom; if this OOMs partway through a
-# real run, --gradient-accumulation-steps 2 --batch-size 8 is the fallback
-# that keeps the same effective batch). Prompts are FILTERED to prompt-len,
+# prompt-len/completion-len=1024/1024, batch-size=8 with
+# gradient-accumulation-steps=2 (effective batch 16): scripts/train/
+# smoke_test_context.sh confirmed 2048+2048 OOMs a single 80GB A100L at
+# batch=16 (peak ~78GB before the crash), and 1024+1024 at batch=16 fit the
+# smoke test's 3-step probe only barely (~78.6/80GB peak) -- the first real
+# tamia submission (job 407136) did in fact OOM on step 1
+# ("CUDA out of memory... 72.20 GiB memory in use" on an H100 80GB), so
+# this now uses the documented fallback (batch=8, grad-accum=2) to keep the
+# same effective batch with lower peak memory. Prompts are FILTERED to prompt-len,
 # not truncated (see src.nemotron_data.sample_filtered_prompts) -- rows
 # with a too-long prompt are dropped from the sample instead. max-samples
 # 3200 = num-steps(200) x batch-size(16), so every step sees a fresh,
@@ -33,7 +35,7 @@ cluv submit --autocommit "$CLUSTER" --time=1-00:00:00 -- accelerate launch --mul
     --max-samples 3200 --prompt-len 1024 --completion-len 1024 \
     --lr 1e-4 --lora-r 16 --lora-alpha 32 --seed 42 \
     --wandb-project moe-cache-reinforce --save-every 50 --save-total-limit 3 --resume \
-    --batch-size 16 --gradient-accumulation-steps 1 --num-steps 200 \
+    --batch-size 8 --gradient-accumulation-steps 2 --num-steps 200 \
     --num-generations 8 --temperature 1.0 --rl-coef 2.0 --sft-coef 0.5 --beta 0.08 \
     --cache-size 4 --cache-layer -1 --cache-experts-per-token 2 --cache-topk --soft-cache \
     --eval-ppl-every 10 \

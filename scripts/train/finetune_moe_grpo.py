@@ -343,6 +343,100 @@ class PerplexityCallback(TrainerCallback):
                   f"(base {self._base_ppl:.3f})", flush=True)
 
 
+class CacheHitRateEvalCallback(TrainerCallback):
+    """Every `every` optimizer steps, generates on-policy completions for a
+    small held-out prompt set (rank 0 only) and logs the average LRU
+    cache-hit rate at `cache_layer`, scored on the generated tokens only --
+    same construction as eval/eval_router.py's compute_cache_hit_rate, but
+    run inline during training so hit-rate progress is visible in the wandb
+    run without waiting for a separate post-hoc eval job."""
+
+    def __init__(self, eval_prompt_ids, tokenizer, cache_layer, cache_size,
+                experts_per_token, use_topk, gen_len, every=25, batch_size=16):
+        self.eval_prompt_ids = eval_prompt_ids
+        self.tokenizer = tokenizer
+        self.cache_layer = cache_layer
+        self.cache_size = cache_size
+        self.experts_per_token = experts_per_token
+        self.use_topk = use_topk
+        self.gen_len = gen_len
+        self.every = every
+        self.bs = batch_size
+        self.trainer = None
+
+    def attach(self, trainer):
+        self.trainer = trainer
+
+    @torch.no_grad()
+    def _hit_rate(self, model):
+        was_training = model.training
+        model.eval()
+        device = next(model.parameters()).device
+        pad_id = self.tokenizer.pad_token_id
+        per_seq_hit_rates = []
+        for i in range(0, len(self.eval_prompt_ids), self.bs):
+            chunk = self.eval_prompt_ids[i:i + self.bs]
+            B = len(chunk)
+            P = max(len(p) for p in chunk)
+            prompt_batch = torch.full((B, P), pad_id, dtype=torch.long)
+            prompt_mask = torch.zeros((B, P), dtype=torch.long)
+            for j, p in enumerate(chunk):
+                prompt_batch[j, P - len(p):] = torch.tensor(p, dtype=torch.long)
+                prompt_mask[j, P - len(p):] = 1
+            prompt_batch, prompt_mask = prompt_batch.to(device), prompt_mask.to(device)
+
+            gen = model.generate(
+                input_ids=prompt_batch, attention_mask=prompt_mask,
+                do_sample=True, temperature=1.0, top_p=1.0, top_k=0,
+                max_new_tokens=self.gen_len, pad_token_id=pad_id,
+            )
+            completion_ids = gen[:, P:]
+
+            S = P + completion_ids.shape[1]
+            full_ids = torch.full((B, S), pad_id, dtype=torch.long, device=device)
+            valid = torch.zeros((B, S), dtype=torch.bool, device=device)
+            action = torch.zeros((B, S), dtype=torch.bool, device=device)
+            full_ids[:, :P] = prompt_batch
+            valid[:, :P] = prompt_mask.bool()
+            full_ids[:, P:] = completion_ids
+            comp_valid = completion_ids != pad_id
+            # eos may legitimately appear as a real token; only pad tail is invalid
+            comp_len = comp_valid.float().flip(-1).cumsum(-1).flip(-1).bool() | comp_valid
+            valid[:, P:] = comp_len if comp_len.any() else comp_valid
+            action[:, P:] = valid[:, P:]
+
+            out = model(input_ids=full_ids, attention_mask=valid.long(),
+                        output_router_logits=True, use_cache=False)
+            router_logits = out.router_logits[self.cache_layer].view(B, S, -1)
+            r_cache_tok, _, _ = cache_emulation_rewards(
+                router_logits, valid, action, cache_size=self.cache_size,
+                experts_per_token=self.experts_per_token, use_topk=self.use_topk,
+            )
+            per_seq_hit_rates.extend(r_cache_tok.sum(-1).cpu().tolist())
+        if was_training:
+            model.train()
+        return sum(per_seq_hit_rates) / len(per_seq_hit_rates) if per_seq_hit_rates else 0.0
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step % self.every != 0:
+            return
+        tr = self.trainer
+        if tr is None:
+            return
+        # ALL ranks run the (identical) eval so no rank lags the others into
+        # an NCCL collective timeout; only rank 0 logs -- same pattern as
+        # PerplexityCallback.
+        model = tr.accelerator.unwrap_model(tr.model)
+        hit_rate = self._hit_rate(model)
+        if tr.accelerator.is_main_process:
+            import wandb
+            if wandb.run is not None:
+                wandb.log({"eval/cache_hit_rate": hit_rate,
+                          "train/global_step": state.global_step})
+            print(f"[eval] step {state.global_step}: cache_hit_rate {hit_rate:.4f}",
+                 flush=True)
+
+
 class PreemptionCallback(TrainerCallback):
     """SLURM preemption/requeue: SIGUSR1 (sent --signal seconds before the
     time limit, or on preemption of a --requeue job) and SIGTERM just set a
@@ -652,6 +746,12 @@ def main():
                         help="Held-out sequences for the perplexity eval")
     parser.add_argument("--eval-ppl-every", type=int, default=25,
                         help="Optimizer steps between perplexity evals")
+    parser.add_argument("--eval-hitrate-seqs", type=int, default=32,
+                        help="Held-out prompts for the on-policy cache-hit-"
+                             "rate eval (generates a completion per prompt, "
+                             "same mechanics as eval/eval_router.py)")
+    parser.add_argument("--eval-hitrate-every", type=int, default=25,
+                        help="Optimizer steps between cache-hit-rate evals")
 
     rl_group = parser.add_argument_group("Rewards")
     rl_group.add_argument("--rl-coef", type=float, default=1.0,
@@ -754,15 +854,16 @@ def main():
     import hashlib, pickle
     key = hashlib.md5(str((args.dataset, args.dataset_split, args.max_samples,
                            args.prompt_len, args.completion_len,
-                           args.eval_ppl_seqs, args.seed, args.model,
-                           "v2_target_ids")).encode()  # bump on cache schema changes
+                           args.eval_ppl_seqs, args.eval_hitrate_seqs,
+                           args.seed, args.model,
+                           "v3_hitrate_prompts")).encode()  # bump on cache schema changes
                       ).hexdigest()[:12]
     cache_file = Path("data") / f"prompt_cache_{key}.pkl"
     from accelerate import PartialState
     with PartialState().main_process_first():
         if cache_file.exists():
             with open(cache_file, "rb") as f:
-                prompts_list, targets_list, eval_ids = pickle.load(f)
+                prompts_list, targets_list, eval_ids, eval_prompt_ids = pickle.load(f)
             train_dataset = Dataset.from_dict(
                 {"prompt": prompts_list, "target_ids": targets_list})
             print(f"[data] loaded cached prompts from {cache_file}")
@@ -773,14 +874,31 @@ def main():
             eval_ids = build_eval_sequences(
                 tokenizer, args.dataset, args.dataset_split, args.eval_ppl_seqs,
                 args.prompt_len + args.completion_len, args.seed)
+            eval_prompt_ids = build_eval_prompts(
+                tokenizer, args.dataset, args.dataset_split, args.eval_hitrate_seqs,
+                args.prompt_len, args.seed)
             if PartialState().is_main_process:
                 cache_file.parent.mkdir(parents=True, exist_ok=True)
-                with open(cache_file, "wb") as f:
+                # Atomic write (per-process temp file + os.replace): two
+                # entirely separate training runs sharing the same dataset
+                # config (e.g. cache_sft/cache_reward launched side by side
+                # on one node) hash to the same cache_file and race on
+                # writing it. os.replace is atomic on POSIX, so a concurrent
+                # reader always sees either the old file or one fully-
+                # written new one -- but the temp filename itself must be
+                # unique per process (pid-suffixed), or two racing writers
+                # can share it and one's os.replace consumes the file out
+                # from under the other, raising FileNotFoundError.
+                tmp_file = cache_file.with_suffix(f".pkl.tmp.{os.getpid()}")
+                with open(tmp_file, "wb") as f:
                     pickle.dump((list(train_dataset["prompt"]),
-                                list(train_dataset["target_ids"]), eval_ids), f)
+                                list(train_dataset["target_ids"]), eval_ids,
+                                eval_prompt_ids), f)
+                os.replace(tmp_file, cache_file)
                 print(f"[data] cached prompts to {cache_file}")
     print(f"[eval] {len(eval_ids)} held-out sequences "
-          f"(<= {args.prompt_len + args.completion_len} tokens each)")
+          f"(<= {args.prompt_len + args.completion_len} tokens each), "
+          f"{len(eval_prompt_ids)} held-out prompts for cache-hit-rate eval")
 
     # peft auto-converts classic expert names (gate_proj/up_proj/down_proj) to
     # fused target_parameters for registered archs (olmoe->qwen2_moe pattern),
@@ -956,6 +1074,13 @@ def main():
                 f"patched {patched}")
         print(f"[cache] dense routing (K=all experts) patched on {patched[0]}; "
               f"soft cache reward = router prob mass on cached experts")
+
+    hitrate_cb = CacheHitRateEvalCallback(
+        eval_prompt_ids, tokenizer, args.cache_layer, args.cache_size,
+        args.cache_experts_per_token, args.cache_topk, args.completion_len,
+        every=args.eval_hitrate_every)
+    hitrate_cb.attach(trainer)
+    trainer.add_callback(hitrate_cb)
 
     resume_ckpt = None
     if args.resume and Path(args.save_dir).is_dir():

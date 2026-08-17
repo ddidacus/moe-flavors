@@ -77,6 +77,9 @@ def cache_emulation_rewards(router_logits, valid_mask, action_mask, cache_size,
             prompt tokens warm the cache but emit no reward.
         action_mask: (B, S) bool, True on generated tokens (rewarded).
         cache_size: LRU capacity (number of experts in the working set).
+            Either a scalar int (shared by every sequence) or a per-sequence
+            sequence of length B (list/tuple/tensor), for prompt-conditioned
+            cache sizes.
         experts_per_token: experts drawn per token.
         use_topk: if True take the router's top-k experts (deterministic,
             mirrors real routing) instead of sampling e_t ~ G(x_t).
@@ -117,12 +120,15 @@ def cache_emulation_rewards(router_logits, valid_mask, action_mask, cache_size,
                 replacement=False, generator=generator,
             ).reshape(B, S, experts_per_token)
 
+    if not hasattr(cache_size, "__len__"):
+        cache_size = [cache_size] * B
+
     rewards = torch.zeros(B, S, dtype=torch.float32)
     experts_cpu = experts.cpu()
     valid_cpu, action_cpu = valid_mask.cpu(), action_mask.cpu()
     hits = accesses = 0
     for b in range(B):
-        cache = LRUExpertCache(cache_size)
+        cache = LRUExpertCache(int(cache_size[b]))
         T = max(int(action_cpu[b].sum()), 1)
         for s in range(S):
             if not valid_cpu[b, s]:

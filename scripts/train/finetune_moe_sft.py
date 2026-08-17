@@ -50,7 +50,8 @@ EVAL_POOL_PER_SPLIT = 1000  # matches finetune_moe_grpo.py -- same held-out rows
 
 
 def build_sft_dataset(tokenizer, dataset_name, split, max_samples, prompt_len,
-                      completion_len, seed, skip_first=EVAL_POOL_PER_SPLIT):
+                      completion_len, seed, skip_first=EVAL_POOL_PER_SPLIT,
+                      max_scan_per_split=50_000):
     """Nemotron rows -> Dataset({'prompt', 'completion'}), both conversational
     (list of chat messages) so SFTTrainer applies the chat template itself
     and masks the loss to the completion (assistant) turn only.
@@ -67,7 +68,8 @@ def build_sft_dataset(tokenizer, dataset_name, split, max_samples, prompt_len,
 
     prompts, completions = [], []
     for ids, target_text in sample_filtered_prompts(
-            tokenizer, dataset_name, split, max_samples, prompt_len, seed, skip_first):
+            tokenizer, dataset_name, split, max_samples, prompt_len, seed, skip_first,
+            max_scan_per_split=max_scan_per_split):
         text = tokenizer.decode(ids)
         c_ids = tokenizer(target_text, truncation=True,
                           max_length=completion_len,
@@ -111,6 +113,13 @@ def main():
                         default="nvidia/Nemotron-Post-Training-Dataset-v2")
     parser.add_argument("--dataset-split", type=str, default="math,code")
     parser.add_argument("--max-samples", type=int, default=20000)
+    parser.add_argument("--max-scan-per-split", type=int, default=50_000,
+                        help="rows scanned (streamed+tokenized for the length "
+                             "filter) per split before the reservoir sample is "
+                             "finalized -- raise this to draw the sample from "
+                             "more of the dataset instead of just the first "
+                             "N rows of each split (see "
+                             "src.nemotron_data.sample_filtered_prompts)")
     parser.add_argument("--prompt-len", type=int, default=512)
     parser.add_argument("--completion-len", type=int, default=512)
     parser.add_argument("--batch-size", type=int, default=16)
@@ -162,7 +171,8 @@ def main():
     import hashlib, pickle
     key = hashlib.md5(str((args.dataset, args.dataset_split, args.max_samples,
                            args.prompt_len, args.completion_len, args.seed,
-                           args.model, "sft_v1")).encode()).hexdigest()[:12]
+                           args.model, args.max_scan_per_split,
+                           "sft_v2_scan")).encode()).hexdigest()[:12]
     cache_file = Path("data") / f"sft_prompt_cache_{key}.pkl"
     from accelerate import PartialState
     with PartialState().main_process_first():
@@ -176,7 +186,8 @@ def main():
         else:
             train_dataset = build_sft_dataset(
                 tokenizer, args.dataset, args.dataset_split, args.max_samples,
-                args.prompt_len, args.completion_len, args.seed)
+                args.prompt_len, args.completion_len, args.seed,
+                max_scan_per_split=args.max_scan_per_split)
             if PartialState().is_main_process:
                 cache_file.parent.mkdir(parents=True, exist_ok=True)
                 with open(cache_file, "wb") as f:

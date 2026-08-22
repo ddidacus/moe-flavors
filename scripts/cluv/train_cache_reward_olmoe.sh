@@ -31,7 +31,7 @@ cluv submit --autocommit "$CLUSTER" --time=1-00:00:00 -- accelerate launch --mul
     --wandb-project moe-cache-reinforce --save-every 50 --save-total-limit 3 --resume \
     --batch-size 8 --gradient-accumulation-steps 2 --num-steps 200 \
     --num-generations 8 --temperature 1.0 --rl-coef 2.0 --sft-coef 0 --beta 0.08 \
-    --cache-size 16 --cache-layer -1 --cache-experts-per-token 8 --cache-topk --soft-cache \
+    --cache-size 16 --cache-layer -1 --cache-experts-per-token 8 --cache-topk \
     --eval-ppl-every 10 \
     --wandb-run-name "cache-reward-olmoe-${CLUSTER}" --save-dir "checkpoints/cache_reward_olmoe_${CLUSTER}"
 echo "cache_reward (OLMoE-7B) -> submitted to $CLUSTER"

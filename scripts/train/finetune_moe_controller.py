@@ -507,13 +507,14 @@ def main():
     # native routing, not a random guess)
     router_module = None
     for name, mod in model.named_modules():
-        if (type(mod).__name__ == "PhimoeTopKRouter"
+        if (type(mod).__name__ in ("PhimoeTopKRouter", "OlmoeTopKRouter")
                 and f"layers.{args.cache_layer}.mlp" in name):
             router_module = mod
             break
     assert router_module is not None, f"no router found at layer {args.cache_layer}"
     router_weight = router_module.weight.data.clone()
-    router_bias = router_module.bias.data.clone() if router_module.bias is not None else None
+    router_bias_attr = getattr(router_module, "bias", None)
+    router_bias = router_bias_attr.data.clone() if router_bias_attr is not None else None
 
     peft_model = get_peft_model(model, lora_config)
     peft_model.gradient_checkpointing_enable()

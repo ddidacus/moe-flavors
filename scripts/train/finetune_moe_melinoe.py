@@ -433,7 +433,7 @@ def main():
 
     router_module = None
     for name, mod in model.named_modules():
-        if (type(mod).__name__ == "PhimoeTopKRouter"
+        if (type(mod).__name__ in ("PhimoeTopKRouter", "OlmoeTopKRouter")
                 and f"layers.{args.cache_layer}.mlp" in name):
             router_module = mod
             break

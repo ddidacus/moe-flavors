@@ -20,18 +20,18 @@
 # OLMoE smoke test yet. Consider a short dry run (small --max-samples/
 # --num-steps) before trusting the full 200-step budget.
 #
-# --num_processes 4 (NOT reduced to 2): the tamia NCCL hang debugged for
-# this script's Phi-tiny-MoE variant (see train_prompt_conditioned_200steps.sh)
-# is a separate, model-independent concern -- start at 4 here and only
-# fall back to 2 if the same "Watchdog caught collective operation
-# timeout" signature reappears for OLMoE.
+# --num_processes 1: job 422274 hit the same NCCL collective-operation
+# timeout as the Phi-tiny-MoE variant at --num_processes 4 (see
+# train_prompt_conditioned_200steps.sh) -- confirming the hang is specific
+# to this script, not model-dependent. Only --num_processes 1 (no
+# --multi_gpu) is proven reliable for it.
 #
 # Usage: CLUSTER=tamia bash scripts/cluv/train_prompt_conditioned_olmoe.sh
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 CLUSTER="${CLUSTER:?set CLUSTER=<tamia|rorqual|narval|vulcan|fir|nibi|first>}"
 
-cluv submit --autocommit "$CLUSTER" --time=1-00:00:00 -- accelerate launch --multi_gpu --num_processes 4 \
+cluv submit --autocommit "$CLUSTER" --time=1-00:00:00 -- accelerate launch --num_processes 1 \
     scripts/train/train_prompt_conditioned.py \
     --model allenai/OLMoE-1B-7B-0125-Instruct \
     --dataset nvidia/Nemotron-Post-Training-Dataset-v2 \

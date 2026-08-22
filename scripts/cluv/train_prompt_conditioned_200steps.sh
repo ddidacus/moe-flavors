@@ -30,12 +30,24 @@
 # gives ample headroom even though this variant lacks --soft-cache's dense
 # routing overhead and should be faster per step.
 #
+# --num_processes 2 (not 4): job 421623 (the first tamia attempt at 4
+# processes) hung with the exact same NCCL "Watchdog caught collective
+# operation timeout" signature extensively debugged on mila for this same
+# script (train_prompt_conditioned.py reliably hangs at --num_processes 4,
+# runs cleanly at 1-2 -- see that debugging history). Other variants
+# (cache_sft, melinoe, controller) DO run fine at 4 processes on tamia, so
+# this looks specific to this script rather than a general tamia issue.
+# The node is still requested exclusively (tamia_job.sh's
+# --gpus-per-node=h100:4 --exclusive), so 2 of the 4 granted GPUs just go
+# unused -- wasteful but proven-safe until the underlying 4-GPU hang is
+# root-caused.
+#
 # Usage: CLUSTER=tamia bash scripts/cluv/train_prompt_conditioned_200steps.sh
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 CLUSTER="${CLUSTER:?set CLUSTER=<tamia|rorqual|narval|vulcan|fir|nibi|first>}"
 
-cluv submit --autocommit "$CLUSTER" --time=1-00:00:00 -- accelerate launch --multi_gpu --num_processes 4 \
+cluv submit --autocommit "$CLUSTER" --time=1-00:00:00 -- accelerate launch --multi_gpu --num_processes 2 \
     scripts/train/train_prompt_conditioned.py \
     --dataset nvidia/Nemotron-Post-Training-Dataset-v2 \
     --dataset-split stem,chat,math,code,multilingual_ja,multilingual_de,multilingual_it,multilingual_es,multilingual_fr \

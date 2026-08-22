@@ -30,24 +30,27 @@
 # gives ample headroom even though this variant lacks --soft-cache's dense
 # routing overhead and should be faster per step.
 #
-# --num_processes 2 (not 4): job 421623 (the first tamia attempt at 4
-# processes) hung with the exact same NCCL "Watchdog caught collective
-# operation timeout" signature extensively debugged on mila for this same
-# script (train_prompt_conditioned.py reliably hangs at --num_processes 4,
-# runs cleanly at 1-2 -- see that debugging history). Other variants
-# (cache_sft, melinoe, controller) DO run fine at 4 processes on tamia, so
-# this looks specific to this script rather than a general tamia issue.
-# The node is still requested exclusively (tamia_job.sh's
-# --gpus-per-node=h100:4 --exclusive), so 2 of the 4 granted GPUs just go
-# unused -- wasteful but proven-safe until the underlying 4-GPU hang is
-# root-caused.
+# --num_processes 1 (not 4, not even 2): job 421623 (4 processes) hung at
+# step 0. job 422173 (2 processes, the first fallback) hung at step 4 --
+# further, but still hung, with the exact same NCCL "Watchdog caught
+# collective operation timeout" signature extensively debugged on mila for
+# this same script. On mila, only --num_processes 1 ran cleanly for a full
+# 60-step run with real reward improvement; 1-2 processes both eventually
+# hung there too, just later. Other variants (cache_sft, melinoe,
+# controller) DO run fine at 4 processes on tamia, so this looks specific
+# to this script rather than a general tamia issue -- root cause still
+# unknown, but single-GPU is the only config actually proven reliable for
+# it so far. The node is still requested exclusively (tamia_job.sh's
+# --gpus-per-node=h100:4 --exclusive), so 3 of the 4 granted GPUs go
+# unused -- wasteful but the only proven-safe option until the underlying
+# hang is root-caused.
 #
 # Usage: CLUSTER=tamia bash scripts/cluv/train_prompt_conditioned_200steps.sh
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 CLUSTER="${CLUSTER:?set CLUSTER=<tamia|rorqual|narval|vulcan|fir|nibi|first>}"
 
-cluv submit --autocommit "$CLUSTER" --time=1-00:00:00 -- accelerate launch --multi_gpu --num_processes 2 \
+cluv submit --autocommit "$CLUSTER" --time=1-00:00:00 -- accelerate launch --num_processes 1 \
     scripts/train/train_prompt_conditioned.py \
     --dataset nvidia/Nemotron-Post-Training-Dataset-v2 \
     --dataset-split stem,chat,math,code,multilingual_ja,multilingual_de,multilingual_it,multilingual_es,multilingual_fr \

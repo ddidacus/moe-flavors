@@ -544,7 +544,7 @@ def main():
     cache_layer, other_layers = resolve_layers(num_hidden_layers, args.cache_layer)
     viz_layers = sorted({cache_layer, *other_layers})
 
-    out_dir = Path(args.out_dir_root) / args.model.split("/")[-1] / args.date
+    out_dir = Path(args.out_dir_root) / args.model.split("/")[-1] / args.date / args.variant
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"[eval_complete] model={args.model} variant={args.variant} "
          f"num_hidden_layers={num_hidden_layers} num_experts={num_experts} "

@@ -48,7 +48,11 @@ build_cmd() {
     local model=$1 variant=$2 ckpt=$3 cache_size=$4 experts=$5
     local ckpt_args=""
     if [ -n "$ckpt" ]; then ckpt_args="--checkpoint-dir $ckpt"; fi
-    echo "cd \$HOME/moe-flavors && source .venv/bin/activate && export HF_HOME=\$SCRATCH/datasets/hf_cache HF_HUB_OFFLINE=1 HF_ALLOW_CODE_EVAL=1 && python scripts/eval/eval_complete.py --model $model --variant $variant $ckpt_args --cache-size $cache_size --cache-experts-per-token $experts --cache-topk"
+    # cluv already runs everything through `uv run --directory=moe-flavors`
+    # (handles venv/cwd) and common.sh already sets HF_HOME/HF_HUB_OFFLINE --
+    # no need to redo any of that here, only HF_ALLOW_CODE_EVAL (HumanEval's
+    # code_eval self-test import-time check, not set by common.sh).
+    echo "HF_ALLOW_CODE_EVAL=1 python scripts/eval/eval_complete.py --model $model --variant $variant $ckpt_args --cache-size $cache_size --cache-experts-per-token $experts --cache-topk"
 }
 
 n=${#all_combos[@]}
@@ -56,7 +60,7 @@ i=0
 while [ $i -lt $n ]; do
     IFS='|' read -r m1 v1 c1 cs1 e1 <<< "${all_combos[$i]}"
     cmd1=$(build_cmd "$m1" "$v1" "$c1" "$cs1" "$e1")
-    cmd2=""
+    cmd2="" v2=""
     if [ $((i + 1)) -lt $n ]; then
         IFS='|' read -r m2 v2 c2 cs2 e2 <<< "${all_combos[$((i + 1))]}"
         cmd2=$(build_cmd "$m2" "$v2" "$c2" "$cs2" "$e2")
@@ -71,7 +75,7 @@ done
 # each already sweeps 3 cache sizes internally, long-running on its own) ---
 cc_cmd() {
     local model=$1 ckpt=$2 sizes=$3 experts=$4
-    echo "cd \$HOME/moe-flavors && source .venv/bin/activate && export HF_HOME=\$SCRATCH/datasets/hf_cache HF_HUB_OFFLINE=1 HF_ALLOW_CODE_EVAL=1 && python scripts/eval/eval_complete_cache_conditioned.py --model $model --checkpoint-dir $ckpt --cache-sizes $sizes --cache-experts-per-token $experts --cache-topk"
+    echo "HF_ALLOW_CODE_EVAL=1 python scripts/eval/eval_complete_cache_conditioned.py --model $model --checkpoint-dir $ckpt --cache-sizes $sizes --cache-experts-per-token $experts --cache-topk"
 }
 
 echo "=== job: phi prompt_conditioned (cache-conditioned sweep) ==="

@@ -227,6 +227,26 @@ def build_mmmlu_samples(seed, n_total=MMMLU_TOTAL_SAMPLES):
 # ParamWrapper/target_parameters adapters via its own state-dict path.
 # ---------------------------------------------------------------------------
 
+def resolve_checkpoint_dir(ckpt):
+    """Resolves a --checkpoint-dir value to a local directory containing
+    adapter_config.json + adapter_model.safetensors. Two forms accepted:
+      - a local training output dir (e.g. checkpoints/cache_reward_tamia)
+        -> latest checkpoint-N subdir via get_last_checkpoint, same as
+        before this function existed.
+      - a HF Hub repo id (e.g. ddidacus/phi-tiny-moe-cache-reward, one of
+        the checkpoints pushed to https://huggingface.co/ddidacus) -> the
+        whole repo is downloaded (cached) via snapshot_download and that
+        local path is returned as-is (these repos hold one flat adapter
+        directory each, not nested checkpoint-N subdirs, since only the
+        final checkpoint of each run was ever pushed)."""
+    from pathlib import Path as _Path
+    if _Path(ckpt).exists():
+        from transformers.trainer_utils import get_last_checkpoint
+        return get_last_checkpoint(ckpt) or ckpt
+    from huggingface_hub import snapshot_download
+    return snapshot_download(ckpt)
+
+
 def load_adapter(peft_model, ckpt_dir):
     """Manual adapter load (peft 0.19 can't load ParamWrapper/target_parameters
     adapters) -- identical to eval_router.py's load_adapter."""
@@ -270,8 +290,7 @@ def build_variant_model(variant, base_model_name, device, checkpoint_dir=None):
 
     from peft import LoraConfig, get_peft_model
     ckpt = checkpoint_dir or VARIANT_CHECKPOINTS[variant]
-    from transformers.trainer_utils import get_last_checkpoint
-    ckpt_dir = get_last_checkpoint(ckpt) or ckpt
+    ckpt_dir = resolve_checkpoint_dir(ckpt)
     assert Path(ckpt_dir, "adapter_config.json").exists(), \
         f"no adapter checkpoint found under {ckpt}"
 

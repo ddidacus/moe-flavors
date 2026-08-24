@@ -98,6 +98,60 @@ def resolve_layers(num_hidden_layers, cache_layer_arg):
     return cache_layer, other_layers
 
 
+def _left_pad_batch(prompt_ids_chunk, pad_id, device):
+    """Left-pad a list of variable-length token-id lists into one (B, P)
+    tensor -- required for correct batched model.generate() (new tokens
+    are appended at the right, so every sequence in the batch must end at
+    the same column). Returns (input_ids, attention_mask), both on device."""
+    B = len(prompt_ids_chunk)
+    P = max(len(p) for p in prompt_ids_chunk)
+    input_ids = torch.full((B, P), pad_id, dtype=torch.long)
+    attn_mask = torch.zeros((B, P), dtype=torch.long)
+    for j, p in enumerate(prompt_ids_chunk):
+        input_ids[j, P - len(p):] = torch.tensor(p, dtype=torch.long)
+        attn_mask[j, P - len(p):] = 1
+    return input_ids.to(device), attn_mask.to(device)
+
+
+def _right_pad_batch(prompt_ids_chunk, pad_id, device):
+    """Right-pad a list of variable-length token-id lists into one (B, P)
+    tensor -- fine for a standalone forward pass with no generate() call
+    (part 2's routing-distribution scan), unlike _left_pad_batch above."""
+    B = len(prompt_ids_chunk)
+    P = max(len(p) for p in prompt_ids_chunk)
+    input_ids = torch.full((B, P), pad_id, dtype=torch.long)
+    attn_mask = torch.zeros((B, P), dtype=torch.long)
+    for j, p in enumerate(prompt_ids_chunk):
+        input_ids[j, :len(p)] = torch.tensor(p, dtype=torch.long)
+        attn_mask[j, :len(p)] = 1
+    return input_ids.to(device), attn_mask.to(device)
+
+
+def _append_completion(prompt_ids, prompt_mask, completion_ids, pad_id, device):
+    """Concatenate a left-padded prompt batch with its generated completion
+    into one (B, S) sequence, plus the masks scoring code needs:
+    `valid` (every real, non-pad token) and `action` (completion tokens
+    only). Shared by generate_batch (parts 3/5) and run_throughput's
+    generate+miss-count step (part 4) -- both build this from a
+    model.generate() call's output the same way."""
+    B, P = prompt_ids.shape
+    completion_valid = completion_ids != pad_id
+    # eos may legitimately appear as a real token; only the pad tail is invalid
+    completion_len = completion_valid.float().flip(-1).cumsum(-1).flip(-1).bool()
+    completion_valid = completion_len if completion_len.any() else completion_valid
+
+    S = P + completion_ids.shape[1]
+    full_ids = torch.full((B, S), pad_id, dtype=torch.long, device=device)
+    valid = torch.zeros((B, S), dtype=torch.bool, device=device)
+    action = torch.zeros((B, S), dtype=torch.bool, device=device)
+    full_ids[:, :P] = prompt_ids
+    valid[:, :P] = prompt_mask.bool()
+    full_ids[:, P:] = completion_ids
+    valid[:, P:] = completion_valid
+    action[:, P:] = valid[:, P:]
+    return full_ids, valid, action
+
+
 @torch.no_grad()
 def generate_batch(model, tokenizer, prompt_ids_chunk, gen_len, device):
     """Left-pad + on-policy generate (T=1.0) for one batch of prompts,
@@ -107,14 +161,8 @@ def generate_batch(model, tokenizer, prompt_ids_chunk, gen_len, device):
     eval_cache_conditioning.py, factored out since this script needs it
     for parts 3 and 4 (part 5 calls compute_cache_hit_rate directly)."""
     pad_id = tokenizer.pad_token_id
-    B = len(prompt_ids_chunk)
-    P = max(len(p) for p in prompt_ids_chunk)
-    prompt_batch = torch.full((B, P), pad_id, dtype=torch.long)
-    prompt_mask = torch.zeros((B, P), dtype=torch.long)
-    for j, p in enumerate(prompt_ids_chunk):
-        prompt_batch[j, P - len(p):] = torch.tensor(p, dtype=torch.long)
-        prompt_mask[j, P - len(p):] = 1
-    prompt_batch, prompt_mask = prompt_batch.to(device), prompt_mask.to(device)
+    prompt_batch, prompt_mask = _left_pad_batch(prompt_ids_chunk, pad_id, device)
+    P = prompt_batch.shape[1]
 
     gen = model.generate(
         input_ids=prompt_batch, attention_mask=prompt_mask,
@@ -122,18 +170,8 @@ def generate_batch(model, tokenizer, prompt_ids_chunk, gen_len, device):
         max_new_tokens=gen_len, pad_token_id=pad_id,
     )
     completion_ids = gen[:, P:]
-
-    S = P + completion_ids.shape[1]
-    full_ids = torch.full((B, S), pad_id, dtype=torch.long, device=device)
-    valid = torch.zeros((B, S), dtype=torch.bool, device=device)
-    action = torch.zeros((B, S), dtype=torch.bool, device=device)
-    full_ids[:, :P] = prompt_batch
-    valid[:, :P] = prompt_mask.bool()
-    full_ids[:, P:] = completion_ids
-    comp_valid = completion_ids != pad_id
-    comp_len = comp_valid.float().flip(-1).cumsum(-1).flip(-1).bool() | comp_valid
-    valid[:, P:] = comp_len if comp_len.any() else comp_valid
-    action[:, P:] = valid[:, P:]
+    full_ids, valid, action = _append_completion(
+        prompt_batch, prompt_mask, completion_ids, pad_id, device)
     return full_ids, valid, action, P
 
 
@@ -248,13 +286,8 @@ def run_routing_distribution(model, tokenizer, prompt_ids, cache_layer,
     for i in range(0, len(prompt_ids), batch_size):
         chunk = prompt_ids[i:i + batch_size]
         B = len(chunk)
-        P = max(len(p) for p in chunk)
-        input_ids = torch.full((B, P), pad_id, dtype=torch.long)
-        attn_mask = torch.zeros((B, P), dtype=torch.long)
-        for j, p in enumerate(chunk):
-            input_ids[j, :len(p)] = torch.tensor(p, dtype=torch.long)
-            attn_mask[j, :len(p)] = 1
-        input_ids, attn_mask = input_ids.to(device), attn_mask.to(device)
+        input_ids, attn_mask = _right_pad_batch(chunk, pad_id, device)
+        P = input_ids.shape[1]
 
         out = model(input_ids=input_ids, attention_mask=attn_mask,
                     output_router_logits=True, use_cache=False)
@@ -377,16 +410,8 @@ def run_throughput(model, tokenizer, prompt_ids, cache_layer, cache_size,
     for i in range(0, len(prompt_ids), batch_size):
         chunk = prompt_ids[i:i + batch_size]
         B = len(chunk)
-        P = max(len(p) for p in chunk)
-        input_ids = torch.full((B, P), pad_id, dtype=torch.long)
-        attn_mask = torch.zeros((B, P), dtype=torch.long)
-        for j, p in enumerate(chunk):
-            # left-pad: required for correct batched model.generate() below
-            # (right-padding, fine for a standalone forward pass, breaks
-            # causal continuation once real generation is involved).
-            input_ids[j, P - len(p):] = torch.tensor(p, dtype=torch.long)
-            attn_mask[j, P - len(p):] = 1
-        input_ids, attn_mask = input_ids.to(device), attn_mask.to(device)
+        input_ids, attn_mask = _left_pad_batch(chunk, pad_id, device)
+        P = input_ids.shape[1]
 
         # standalone prefill timing (teacher-forced forward, no generation)
         start_evt, end_evt = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
@@ -415,17 +440,8 @@ def run_throughput(model, tokenizer, prompt_ids, cache_layer, cache_size,
         decode_ms = max(generate_total_ms - fwd_ms, 0.0)
 
         completion_ids = gen[:, P:]
-        S = P + completion_ids.shape[1]
-        full_ids = torch.full((B, S), pad_id, dtype=torch.long, device=device)
-        valid = torch.zeros((B, S), dtype=torch.bool, device=device)
-        action = torch.zeros((B, S), dtype=torch.bool, device=device)
-        full_ids[:, :P] = input_ids
-        valid[:, :P] = attn_mask.bool()
-        full_ids[:, P:] = completion_ids
-        comp_valid = completion_ids != pad_id
-        comp_len = comp_valid.float().flip(-1).cumsum(-1).flip(-1).bool() | comp_valid
-        valid[:, P:] = comp_len if comp_len.any() else comp_valid
-        action[:, P:] = valid[:, P:]
+        full_ids, valid, action = _append_completion(
+            input_ids, attn_mask, completion_ids, pad_id, device)
 
         # whole-sequence (prefill + decode) cache misses
         out = model(input_ids=full_ids, attention_mask=valid.long(),

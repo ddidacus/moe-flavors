@@ -35,7 +35,7 @@ cd "$(dirname "$0")/../.."
 
 PHI="microsoft/Phi-tiny-MoE-instruct"
 OLMOE="allenai/OLMoE-1B-7B-0125-Instruct"
-TIME="12:00:00"
+TIME="24:00:00"
 JOBS_DIR="scripts/eval/_sweep_jobs"
 mkdir -p "$JOBS_DIR"
 rm -f "$JOBS_DIR"/*.sh

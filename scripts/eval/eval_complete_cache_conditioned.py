@@ -72,6 +72,9 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--num-expert-load-trials", type=int, default=1024)
+    ap.add_argument("--base-throughput-json", default=None,
+                    help="see eval_complete.py --base-throughput-json -- same "
+                         "flag, used for every cache size in this sweep")
     ap.add_argument("--harness-total-budget", type=int, default=1024)
     ap.add_argument("--harness-num-seeds", type=int, default=1)
     ap.add_argument("--skip-parts", default="",
@@ -145,12 +148,21 @@ def main():
                             f"{args.variant}_cache{cache_size}")
 
         if 4 not in skip:
+            compute_ms_reference = None
+            if args.base_throughput_json:
+                import json
+                with open(args.base_throughput_json) as f:
+                    base_t = json.load(f)
+                key_fwd = "own_fwd_ms" if "own_fwd_ms" in base_t else "fwd_ms"
+                key_decode = "own_decode_ms" if "own_decode_ms" in base_t else "decode_ms"
+                compute_ms_reference = (base_t[key_fwd]["mean"], base_t[key_decode]["mean"])
             r4 = run_throughput(model, tok, prompt_ids, cache_layer, cache_size,
                                 args.cache_experts_per_token, args.cache_topk,
                                 args.gen_len, args.batch_size, device, args.model,
                                 args.num_expert_load_trials,
                                 cs_dir / "eval_throughput.json",
-                                f"{args.variant}_cache{cache_size}")
+                                f"{args.variant}_cache{cache_size}",
+                                compute_ms_reference)
             tok_per_sec_by_size[cache_size] = r4["tokens_per_second_mean"]
 
         if 5 not in skip:

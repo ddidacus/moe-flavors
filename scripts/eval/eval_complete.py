@@ -397,7 +397,21 @@ def run_routing_viz(model, tokenizer, prompt_ids, layers, num_experts,
 @torch.no_grad()
 def run_throughput(model, tokenizer, prompt_ids, cache_layer, cache_size,
                    experts_per_token, use_topk, gen_len, batch_size, device,
-                   model_name, num_expert_load_trials, out_path, variant):
+                   model_name, num_expert_load_trials, out_path, variant,
+                   compute_ms_reference=None):
+    """compute_ms_reference: optional (fwd_ms, decode_ms) pair to use as the
+    "compute" term instead of this run's own measured timing -- for
+    adapter-wrapped variants whose LoRA touches the expert MLPs (e.g. the
+    working-set reward objective), the adapter's own extra matmuls inflate
+    decode time in a way that has nothing to do with the working-set/
+    offload benefit being measured. Passing in the base (untuned) model's
+    own compute timing isolates that: total_ms = base_fwd + base_decode +
+    misses * offload_ms, using THIS run's own miss count (its real routing
+    behavior) against a shared, adapter-free compute reference. The
+    variant's own actually-measured compute timing is still recorded in
+    the output under own_fwd_ms/own_decode_ms/own_tokens_per_second for
+    transparency; it is simply not what tokens_per_second reports when a
+    reference is given."""
     pad_id = tokenizer.pad_token_id
     print(f"[eval_complete][4/5] benchmarking per-expert disk-load time "
          f"({num_expert_load_trials} trials) ...", flush=True)
@@ -405,7 +419,7 @@ def run_throughput(model, tokenizer, prompt_ids, cache_layer, cache_size,
     load_mean = statistics.fmean(load_times_ms)
     load_std = statistics.pstdev(load_times_ms)
 
-    fwd_ms_list, decode_ms_list, misses_list, tok_per_sec_list = [], [], [], []
+    fwd_ms_list, decode_ms_list, misses_list, comp_tokens_list = [], [], [], []
 
     for i in range(0, len(prompt_ids), batch_size):
         chunk = prompt_ids[i:i + batch_size]
@@ -460,16 +474,27 @@ def run_throughput(model, tokenizer, prompt_ids, cache_layer, cache_size,
         fwd_ms_per_sample = fwd_ms / B
         decode_ms_per_sample = decode_ms / B
         for b in range(B):
-            total_ms = fwd_ms_per_sample + decode_ms_per_sample + float(misses[b]) * load_mean
             fwd_ms_list.append(fwd_ms_per_sample)
             decode_ms_list.append(decode_ms_per_sample)
             misses_list.append(float(misses[b]))
-            tok_per_sec_list.append(float(comp_tokens[b]) / (total_ms / 1000.0))
+            comp_tokens_list.append(float(comp_tokens[b]))
         print(f"[eval_complete][4/5] {min(i + batch_size, len(prompt_ids))}/"
              f"{len(prompt_ids)}", flush=True)
 
-    total_ms_list = [f + d + m * load_mean for f, d, m in
-                     zip(fwd_ms_list, decode_ms_list, misses_list)]
+    # "own" compute: this run's own measured fwd+decode timing, which for an
+    # adapter whose LoRA touches the expert MLPs (not just attention) bakes
+    # in that adapter's extra compute cost alongside the offload benefit
+    # being measured -- kept for transparency, not the headline number.
+    own_total_ms_list = [f + d + m * load_mean for f, d, m in
+                         zip(fwd_ms_list, decode_ms_list, misses_list)]
+    own_tok_per_sec_list = [c / (t / 1000.0) for c, t in zip(comp_tokens_list, own_total_ms_list)]
+
+    if compute_ms_reference is not None:
+        ref_fwd_ms, ref_decode_ms = compute_ms_reference
+        total_ms_list = [ref_fwd_ms + ref_decode_ms + m * load_mean for m in misses_list]
+    else:
+        total_ms_list = own_total_ms_list
+    tok_per_sec_list = [c / (t / 1000.0) for c, t in zip(comp_tokens_list, total_ms_list)]
 
     def _agg(vals):
         return {"mean": statistics.fmean(vals), "std": statistics.pstdev(vals) if len(vals) > 1 else 0.0}
@@ -480,10 +505,15 @@ def run_throughput(model, tokenizer, prompt_ids, cache_layer, cache_size,
             "model": model_name, "variant": variant, "cache_layer": cache_layer,
             "cache_size": cache_size, "experts_per_token": experts_per_token,
             "n_prompts": len(prompt_ids),
+            "compute_ms_reference": {"fwd_ms": compute_ms_reference[0],
+                                    "decode_ms": compute_ms_reference[1]}
+                                    if compute_ms_reference is not None else None,
             "expert_load_ms": {"mean": load_mean, "std": load_std,
                               "n_trials": num_expert_load_trials},
-            "fwd_ms": {**_agg(fwd_ms_list), "per_seq": fwd_ms_list},
-            "decode_ms": {**_agg(decode_ms_list), "per_seq": decode_ms_list},
+            "own_fwd_ms": {**_agg(fwd_ms_list), "per_seq": fwd_ms_list},
+            "own_decode_ms": {**_agg(decode_ms_list), "per_seq": decode_ms_list},
+            "own_estimated_total_ms": {**_agg(own_total_ms_list), "per_seq": own_total_ms_list},
+            "own_tokens_per_second": {**_agg(own_tok_per_sec_list), "per_seq": own_tok_per_sec_list},
             "cache_misses": {**_agg(misses_list), "per_seq": misses_list},
             "estimated_total_ms": {**_agg(total_ms_list), "per_seq": total_ms_list},
             "tokens_per_second": {**_agg(tok_per_sec_list), "per_seq": tok_per_sec_list},
@@ -539,6 +569,16 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--num-expert-load-trials", type=int, default=1024)
+    ap.add_argument("--base-throughput-json", default=None,
+                    help="path to the base variant's own eval_throughput.json "
+                         "(same model, --variant base) -- when given, part 4's "
+                         "tokens_per_second uses this run's fwd+decode timing "
+                         "instead of the current variant's own, since an "
+                         "adapter that touches the expert MLPs (not just "
+                         "attention) inflates decode time in a way that has "
+                         "nothing to do with the offload/working-set benefit "
+                         "being measured. Own timing is still recorded under "
+                         "own_tokens_per_second in the output regardless.")
     ap.add_argument("--harness-total-budget", type=int, default=1024)
     ap.add_argument("--harness-num-seeds", type=int, default=1)
     ap.add_argument("--skip-parts", default="",
@@ -596,11 +636,19 @@ def main():
                         out_dir / "expert_trace.png", args.model, args.variant)
 
     if 4 not in skip:
+        compute_ms_reference = None
+        if args.base_throughput_json:
+            with open(args.base_throughput_json) as f:
+                base_t = json.load(f)
+            key_fwd = "own_fwd_ms" if "own_fwd_ms" in base_t else "fwd_ms"
+            key_decode = "own_decode_ms" if "own_decode_ms" in base_t else "decode_ms"
+            compute_ms_reference = (base_t[key_fwd]["mean"], base_t[key_decode]["mean"])
         r4 = run_throughput(model, tok, prompt_ids, cache_layer, args.cache_size,
                             args.cache_experts_per_token, args.cache_topk,
                             args.gen_len, args.batch_size, device, args.model,
                             args.num_expert_load_trials,
-                            out_dir / "eval_throughput.json", args.variant)
+                            out_dir / "eval_throughput.json", args.variant,
+                            compute_ms_reference)
         summary["tokens_per_second_mean"] = r4["tokens_per_second_mean"]
 
     if 5 not in skip:

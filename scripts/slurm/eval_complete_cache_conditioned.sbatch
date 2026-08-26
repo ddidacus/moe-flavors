@@ -25,8 +25,11 @@
 # #SBATCH --account=<your-account>
 
 set -euo pipefail
-cd "$(dirname "$0")/../.."
-mkdir -p logs/slurm
+# SLURM copies this script to a spool dir before running it, so
+# "dirname $0" does not point at the repo -- use the directory sbatch was
+# invoked from instead.
+cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")/../..}"
+mkdir -p logs/slurm 2>/dev/null || true
 
 source .venv/bin/activate
 export HF_ALLOW_CODE_EVAL=1

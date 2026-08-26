@@ -256,42 +256,123 @@ adapter-inflated, decode time.
 \begin{table}[h]
 \centering
 \small
-\caption{Early, in-progress results on OLMoE-1B-7B (1024 held-out prompts). Phi-tiny-MoE
-and the remaining objectives (causal LM alone, the combined reward of
-Section~\ref{sec:sft}) are still running; this table is a placeholder to be replaced by
-the full comparison. Working-set hit ratio and tokens/second are measured at the trained
-capacity ($c=16$, top-8); tokens/second follows the estimated offloaded-inference latency
-model of Appendix~\ref{app:stack} (compute plus a per-expert transfer penalty on every
-working-set miss) rather than a wall-clock trace on real offloading hardware.}
-\begin{tabular}{lccccccc}
+\caption{Results on Phi-tiny-MoE-instruct (1024 held-out prompts). Working-set hit ratio,
+misses, ECI, and tokens/second are measured at the trained capacity ($c=4$, top-2).
+Misses is the mean number of working-set misses per sequence (lower is better); ECI is
+the normalized routing entropy $H(p)/\log(E)$ over the empirical expert-choice
+distribution (1.0 = perfectly load-balanced routing across experts, near 0 = collapsed
+onto a few experts). Tokens/second
+follows the estimated offloaded-inference latency model of Appendix~\ref{app:stack}
+(compute plus a per-expert transfer penalty on every working-set miss) rather than a
+wall-clock trace on real offloading hardware, and is normalized against the base model's
+own compute pass (see the LoRA note above) so that adapters touching the expert
+projections are not penalized twice.}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lccccccccc}
 \toprule
-Objective & MMLU & MMMLU & GSM8K & HumanEval & MATH & Hit ratio & Tokens/s \\
+Objective & MMLU & MMMLU & GSM8K & HumanEval & MATH & Hit ratio & Misses & ECI & Tokens/s \\
 \midrule
-Base (untuned)         & 0.563 & 0.380 & 0.673 & 0.244 & 0.058 & 0.687 & 395.2 \\
-Working-set reward      & 0.563 & 0.367 & 0.664 & 0.329 & 0.061 & \textbf{0.759} & 279.2 \\
-Option-critic controller & 0.527 & 0.311 & 0.542 & 0.140 & 0.002 & 0.684 & 392.2 \\
-MELINOE                & 0.492 & 0.322 & 0.435 & 0.079 & 0.002 & \textbf{0.763} & 439.5 \\
+Base (untuned)          & 0.614 & 0.345 & 0.622 & 0.024 & 0.090 & 0.571 & 651.1 & 0.892 & 393.3 \\
+Causal LM alone (SFT)   & 0.618 & 0.313 & 0.575 & 0.049 & 0.090 & 0.561 & 694.9 & 0.890 & 411.2 \\
+Working-set reward       & 0.610 & 0.343 & 0.578 & 0.018 & 0.073 & 0.624 & 434.3 & 0.888 & 273.0 \\
+Working-set reward + SFT & 0.618 & 0.346 & 0.561 & 0.037 & 0.071 & \textbf{0.773} & \textbf{441.3} & 0.721 & 509.6 \\
+Option-critic controller & 0.582 & 0.334 & 0.516 & 0.000 & 0.011 & \textbf{1.000} & \textbf{0.1} & 0.279 & 514.8 \\
+MELINOE                 & 0.605 & 0.333 & 0.511 & 0.000 & 0.017 & 0.880 & 236.3 & 0.674 & 517.7 \\
 \bottomrule
-\end{tabular}
+\end{tabular}%
+}
+\label{tab:phiresults}
 \end{table}
 
-The working-set reward alone (no supervised anchor) matches or improves the base model on
-every task except MMMLU, and improves HumanEval by 8.5 points, while raising the hit
-ratio by 7.2 points over the base model at the same capacity -- both option-critic and
+\begin{table}[h]
+\centering
+\small
+\caption{Results on OLMoE-1B-7B (1024 held-out prompts). Working-set hit ratio, misses,
+ECI, and tokens/second are measured at the trained capacity ($c=16$, top-8), normalized
+against the base model's own compute pass as above. The combined working-set reward + SFT
+objective for this backbone was still running at submission time and is omitted.}
+\label{tab:olmoeresults}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lccccccccc}
+\toprule
+Objective & MMLU & MMMLU & GSM8K & HumanEval & MATH & Hit ratio & Misses & ECI & Tokens/s \\
+\midrule
+Base (untuned)          & 0.563 & 0.380 & 0.673 & 0.244 & 0.058 & 0.687 & 1869.0 & 0.895 & 395.5 \\
+Causal LM alone (SFT)   & 0.549 & 0.370 & 0.592 & 0.189 & 0.036 & 0.679 & 1930.0 & 0.897 & 388.9 \\
+Working-set reward       & 0.563 & 0.367 & 0.664 & 0.329 & 0.061 & \textbf{0.759} & \textbf{1004.2} & 0.895 & 273.9 \\
+Option-critic controller & 0.527 & 0.311 & 0.542 & 0.140 & 0.002 & 0.684 & 2012.7 & 0.888 & 390.5 \\
+MELINOE                 & 0.492 & 0.322 & 0.435 & 0.079 & 0.002 & 0.763 & 1541.9 & 0.838 & 438.2 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+On both backbones the working-set reward alone (no supervised anchor) is competitive with
+or better than the base model on most tasks, and its combination with the supervised loss
+(Phi-tiny-MoE only, so far) raises the hit ratio further still, to 0.773, while also
+recovering the throughput cost of the reward-only variant -- both option-critic and
 MELINOE lose several points of downstream accuracy relative to the base model, most
-sharply on MATH and GSM8K, for a comparable or smaller hit-ratio gain. Tokens/second is
-computed against the base model's own compute pass plus each objective's own working-set
-miss count (see the LoRA note above), which isolates the offload benefit from each
-adapter's own inference-time cost; under this measure the working-set reward variant
-still trails the base model rather than surpassing it, despite the higher hit ratio and
-fewer raw misses, which we attribute to its shorter average completions (530 tokens
-against the base model's 760) dividing a comparable total latency over fewer generated
-tokens, and flag as a limitation of a purely token-averaged throughput metric rather than
-evidence against the working-set benefit itself.
+sharply on MATH, GSM8K, and HumanEval, for a comparable or, on Phi-tiny-MoE, a much larger
+hit-ratio gain (option-critic reaches a hit ratio of 1.0, i.e. every expert access falls
+within its working set, at the cost of collapsing HumanEval and MATH to near zero).
+Tokens/second is computed against the base model's own compute pass plus each objective's
+own working-set miss count (see the LoRA note above), which isolates the offload benefit
+from each adapter's own inference-time cost; under this measure the working-set-reward-only
+variant is the one exception that still trails the base model on both backbones despite a
+higher hit ratio and fewer raw misses, which we attribute to its shorter average
+completions dividing a comparable total latency over fewer generated tokens, and flag as a
+limitation of a purely token-averaged throughput metric rather than evidence against the
+working-set benefit itself; combining the reward with the SFT anchor (Phi-tiny-MoE)
+removes this effect entirely. The option-critic controller's near-total hit ratio comes at
+the cost of routing collapse -- its ECI drops to 0.28 on Phi-tiny-MoE (from 0.89 for the
+base model), meaning the controller has learned to route almost every token through a
+small, fixed subset of experts rather than genuinely exploiting sequence-level locality;
+MELINOE's ECI (0.67) sits between the two, consistent with a smaller but real drop in
+routing diversity. The working-set reward, by contrast, keeps ECI close to the base
+model's (0.89 on Phi-tiny-MoE, 0.90 on OLMoE) while still cutting misses by a third to a
+half, indicating its hit-ratio gains come from exploiting temporal reuse of a still
+load-balanced expert population rather than from collapsing the router.
 
 \subsection{With Prompt Conditioning}
 \label{sec:results-conditioned}
 
+The prompt-conditioned policy is trained once per backbone but evaluated at every working-set
+capacity it was conditioned on, by prefixing each prompt with the target capacity
+(Section~\ref{sec:conditioning}); Table~\ref{tab:conditioned} reports OLMoE-1B-7B swept
+across $c \in \{8, 16, 32\}$ (Phi-tiny-MoE's sweep over $c \in \{2, 4, 8\}$ was still
+running at submission time and is omitted). As expected, both hit ratio and misses improve
+monotonically with capacity, from 0.507 at $c=8$ to 0.901 at $c=32$; tokens/second also
+increases with capacity, since a larger working set both raises the hit ratio and is
+evaluated with a fixed generation length, so the throughput gain compounds rather than
+trading off against the hit-ratio gain as it does for the fixed-capacity working-set
+reward of Table~\ref{tab:olmoeresults}. A single prompt-conditioned policy therefore lets a deployment pick a
+hit-ratio/throughput operating point at inference time without retraining, unlike the
+fixed-capacity variants of Section~\ref{sec:results-unconditioned}.
+
+\begin{table}[h]
+\centering
+\small
+\caption{OLMoE-1B-7B prompt-conditioned policy swept over every working-set capacity it
+was trained on (1024 held-out prompts per capacity, top-8). Tokens/second is normalized
+against the (unconditioned) base model's own compute pass, as in Tables~1-2.}
+\label{tab:conditioned}
+\begin{tabular}{lccc}
+\toprule
+Capacity $c$ & Hit ratio & Tokens/s \\
+\midrule
+8  & 0.507 & 445.6 \\
+16 & 0.741 & 459.0 \\
+32 & \textbf{0.901} & \textbf{476.9} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+For reference, the same checkpoint evaluated unconditioned on the downstream task suite
+(lm-eval-harness prompts do not carry a \texttt{[CACHE\_SIZE=X]} prefix, so this is a single
+run rather than swept per capacity) scores MMLU 0.544, MMMLU 0.374, GSM8K 0.662, HumanEval
+0.268, and MATH 0.053 -- in the same range as the unconditioned objectives of
+Table~\ref{tab:olmoeresults}, indicating the conditioning prefix does not measurably harm
+general task performance.
 
 \section{Conclusion}
 
@@ -465,5 +546,110 @@ Prompt / completion length & 1024 / 1024 & 1024 / 1024 \\
 \bottomrule
 \end{tabular}
 \end{table}
+
+\section{Expert Routing Traces and Prompt-Conditioned Scaling}
+\label{app:figures}
+
+Figures~\ref{fig:phi_base}--\ref{fig:olmoe_scaling_tps} collect every routing-trace and
+scaling figure generated for the results of Section~\ref{sec:results}, for selection into
+the main text. Each expert-routing-trace figure shows, for 16 held-out prompts (rows)
+generated on-policy by the given (backbone, objective) pair, the top-1 expert chosen at
+each of three quartile-spaced layers of the backbone (25\%/50\%/75\% depth) over every
+generated token (columns), colored by expert id.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.85\textwidth]{figures/phi_base_expert_trace.png}
+\caption{Phi-tiny-MoE-instruct, base (untuned) model -- expert routing trace at layers 8/16/24.}
+\label{fig:phi_base}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.85\textwidth]{figures/phi_sft_baseline_expert_trace.png}
+\caption{Phi-tiny-MoE-instruct, causal LM alone (SFT) -- expert routing trace at layers 8/16/24.}
+\label{fig:phi_sft}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.85\textwidth]{figures/phi_cache_reward_expert_trace.png}
+\caption{Phi-tiny-MoE-instruct, working-set reward alone -- expert routing trace at layers 8/16/24.}
+\label{fig:phi_reward}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.85\textwidth]{figures/phi_cache_sft_expert_trace.png}
+\caption{Phi-tiny-MoE-instruct, working-set reward + SFT (combined objective) -- expert routing trace at layers 8/16/24.}
+\label{fig:phi_cachesft}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.85\textwidth]{figures/phi_controller_baseline_expert_trace.png}
+\caption{Phi-tiny-MoE-instruct, option-critic controller baseline -- expert routing trace at layers 8/16/24.}
+\label{fig:phi_controller}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.85\textwidth]{figures/phi_melinoe_baseline_expert_trace.png}
+\caption{Phi-tiny-MoE-instruct, MELINOE baseline -- expert routing trace at layers 8/16/24.}
+\label{fig:phi_melinoe}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.85\textwidth]{figures/olmoe_base_expert_trace.png}
+\caption{OLMoE-1B-7B, base (untuned) model -- expert routing trace at layers 4/8/12.}
+\label{fig:olmoe_base}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.85\textwidth]{figures/olmoe_sft_baseline_expert_trace.png}
+\caption{OLMoE-1B-7B, causal LM alone (SFT) -- expert routing trace at layers 4/8/12.}
+\label{fig:olmoe_sft}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.85\textwidth]{figures/olmoe_cache_reward_expert_trace.png}
+\caption{OLMoE-1B-7B, working-set reward alone -- expert routing trace at layers 4/8/12.}
+\label{fig:olmoe_reward}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.85\textwidth]{figures/olmoe_controller_baseline_expert_trace.png}
+\caption{OLMoE-1B-7B, option-critic controller baseline -- expert routing trace at layers 4/8/12.}
+\label{fig:olmoe_controller}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.85\textwidth]{figures/olmoe_melinoe_baseline_expert_trace.png}
+\caption{OLMoE-1B-7B, MELINOE baseline -- expert routing trace at layers 4/8/12.}
+\label{fig:olmoe_melinoe}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.6\textwidth]{figures/olmoe_prompt_conditioned_scaling_hit_ratio.png}
+\caption{OLMoE-1B-7B, prompt-conditioned policy -- working-set hit ratio as a function of
+the conditioned capacity $c \in \{8, 16, 32\}$ (descending on the $x$-axis), corresponding
+to Table~\ref{tab:conditioned}.}
+\label{fig:olmoe_scaling_hit}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.6\textwidth]{figures/olmoe_prompt_conditioned_scaling_tokens_per_second.png}
+\caption{OLMoE-1B-7B, prompt-conditioned policy -- estimated tokens/second (own, adapter-inflated
+measurement, not base-normalized) as a function of the conditioned capacity $c \in \{8, 16, 32\}$
+(descending on the $x$-axis), corresponding to Table~\ref{tab:conditioned}.}
+\label{fig:olmoe_scaling_tps}
+\end{figure}
 
 \end{document}

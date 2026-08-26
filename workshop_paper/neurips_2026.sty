@@ -1,0 +1,148 @@
+% Good-faith reconstruction of the NeurIPS 2026 LaTeX style, built from the
+% official template shell's own formatting instructions (margins, type
+% sizes, title/heading rules, footnote conventions), since the .sty itself
+% could not be fetched live in this environment (Overleaf/CTAN unreachable).
+% Verify against the official neurips_2026.sty before final submission.
+
+\NeedsTeXFormat{LaTeX2e}
+\ProvidesPackage{neurips_2026}[2026/05/01 NeurIPS 2026 style file]
+
+\newif\if@neuripsfinal
+\newif\if@neuripspreprint
+\newif\if@neuripsworkshop
+\newif\if@neuripsnonatbib
+
+\DeclareOption{final}{\@neuripsfinaltrue}
+\DeclareOption{preprint}{\@neuripspreprinttrue}
+\DeclareOption{sglblindworkshop}{\@neuripsworkshoptrue\@neuripsfinaltrue}
+\DeclareOption{dblblindworkshop}{\@neuripsworkshoptrue}
+\DeclareOption{main}{}
+\DeclareOption{position}{}
+\DeclareOption{eandd}{}
+\DeclareOption{creativeai}{}
+\DeclareOption{education}{}
+\DeclareOption{nonatbib}{\@neuripsnonatbibtrue}
+\ProcessOptions\relax
+
+\RequirePackage{iftex}
+\ifPDFTeX
+  \RequirePackage[T1]{fontenc}
+\fi
+
+% Text block: 5.5in x 9in, 1.5in side margins, 1in top/bottom -- per the
+% official instructions ("The text must be confined within a rectangle
+% 5.5 inches (33 picas) wide and 9 inches (54 picas) long. The left margin
+% is 1.5 inch (9 picas)... All pages should start at 1 inch from the top").
+\RequirePackage{geometry}
+\geometry{letterpaper, left=1.5in, right=1in, top=1in, bottom=1in, includefoot}
+
+\RequirePackage{times}
+\RequirePackage{microtype}
+\RequirePackage{graphicx}
+\RequirePackage{amsmath,amssymb}
+\RequirePackage{booktabs}
+\RequirePackage{verbatim} % for the \comment trick used by the ack environment
+
+\if@neuripsnonatbib\else
+  \RequirePackage[numbers,compress,sort]{natbib}
+\fi
+
+\RequirePackage[colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue,breaklinks=true]{hyperref}
+
+% 10pt type, 11pt leading, per spec.
+\renewcommand{\baselinestretch}{1.0}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{5.5pt}
+
+\renewcommand\normalsize{%
+  \@setfontsize\normalsize\@xpt{11}%
+  \abovedisplayskip 8\p@ \@plus2\p@ \@minus4\p@
+  \belowdisplayskip \abovedisplayskip
+  \abovedisplayshortskip \z@ \@plus2\p@
+  \belowdisplayshortskip 4\p@ \@plus2\p@ \@minus2\p@
+}
+\normalsize
+
+% Footnote rule: "Precede the footnote with a horizontal rule of 2 inches."
+\renewcommand{\footnoterule}{\kern-3\p@ \hrule width 2in \kern 2.6\p@}
+
+% Title: 17pt bold, centered between a 4pt top rule and a 1pt bottom rule,
+% 1/4 inch space above/below the title to the rules.
+\def\@maketitle{%
+  \newpage
+  \null
+  \vskip -1em
+  \noindent\rule{\textwidth}{4\p@}
+  \vskip 0.25in
+  \begin{center}
+    {\fontsize{17}{20}\selectfont\bfseries \@title \par}
+  \end{center}
+  \vskip 0.25in
+  \noindent\rule{\textwidth}{1\p@}
+  \vskip 0.3in
+  \if@neuripsfinal
+    \begin{center}
+      {\large \@author \par}
+    \end{center}
+  \else
+    \begin{center}
+      {\large Anonymous Author(s)\par Affiliation\par Address\par \texttt{email}\par}
+    \end{center}
+  \fi
+  \if@neuripsworkshop
+    \footnotetext[0]{\@workshoptitle}
+  \fi
+  \vskip 0.3in
+}
+
+\newcommand{\workshoptitle}[1]{\gdef\@workshoptitle{#1}}
+\newcommand{\@workshoptitle}{}
+
+% First-level headings: 12pt bold flush left. Second/third level: 10pt.
+\renewcommand\section{\@startsection{section}{1}{\z@}%
+  {-2.5ex \@plus -1ex \@minus -0.2ex}%
+  {1.0ex \@plus 0.2ex}%
+  {\normalfont\fontsize{12}{14}\selectfont\bfseries}}
+\renewcommand\subsection{\@startsection{subsection}{2}{\z@}%
+  {-2.0ex\@plus -1ex \@minus -0.2ex}%
+  {0.8ex \@plus 0.2ex}%
+  {\normalfont\fontsize{10}{12}\selectfont\bfseries}}
+\renewcommand\subsubsection{\@startsection{subsubsection}{3}{\z@}%
+  {-1.8ex\@plus -1ex \@minus -0.2ex}%
+  {0.5ex \@plus 0.2ex}%
+  {\normalfont\fontsize{10}{12}\selectfont\bfseries}}
+\renewcommand\paragraph{\@startsection{paragraph}{4}{\z@}%
+  {1.5ex \@plus 1ex \@minus 0.2ex}%
+  {-1em}%
+  {\normalfont\normalsize\bfseries}}
+
+% Abstract: indented 1/2in both margins, "Abstract" centered bold 12pt,
+% two line spaces before the abstract body.
+\renewenvironment{abstract}{%
+  \vskip 0.2in
+  \begin{center}
+    {\fontsize{12}{14}\selectfont\bfseries Abstract}
+  \end{center}
+  \vskip 0.1in
+  \list{}{\leftmargin 0.5in \rightmargin 0.5in}
+  \item\relax
+}{%
+  \endlist
+  \vskip 0.2in
+}
+
+% Acknowledgments: only typeset in the final (non-anonymized) version;
+% silently discarded otherwise, per the double-blind submission policy.
+\newenvironment{ack}{%
+  \if@neuripsfinal
+    \section*{Acknowledgments}
+  \else
+    \expandafter\comment
+  \fi
+}{%
+  \if@neuripsfinal\else\endcomment\fi
+}
+
+\pagenumbering{arabic}
+
+\endinput

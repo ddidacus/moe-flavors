@@ -1,0 +1,469 @@
+\documentclass{article}
+
+% Track: workshop, double-blind. Add "final" only for the camera-ready
+% version; omit it (and keep double-blind anonymization) for submission.
+\usepackage[dblblindworkshop,final]{neurips_2026}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsfonts}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{graphicx}
+
+\title{Working-Set-Aware Policy Gradients for Efficient Mixture-of-Experts Inference}
+\workshoptitle{NeurIPS 2026 Workshop on Efficient Systems for Foundation Models}
+
+\author{
+  Diego Calanzone \\
+  Mila, Quebec AI Institute \\
+  \texttt{diego.calanzone@mila.quebec}
+}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Serving very large mixture-of-experts (MoE) language models requires either tensor
+parallelism across many accelerators or offloading expert weights to host memory, both
+of which are constrained by the interconnect bandwidth available for expert transfers.
+Prior work reduces this cost by encouraging the router to reuse a small set of experts
+over a sequence, either through architectural changes to the routing mechanism, such as
+option-critic style temporal extension, or through custom auxiliary losses that penalize
+working-set misses while regularizing against distribution shift with a rank matching term. We
+instead treat working-set locality as a reward signal and optimize it directly with an
+established policy gradient algorithm, GRPO, using an LRU cache simulator over the
+router's expert selections as a stateful reward function. This removes the need for
+custom losses, additional trainable modules, or termination functions. We further combine
+the working-set reward with the causal language modeling objective on the same rollouts,
+which we interpret as jointly reinforcing the highest-reward completions sampled by the
+policy and the ground truth completion, and find this to regularize distribution shift
+more effectively than a KL penalty against a frozen reference. We introduce a prompt
+conditioning variant that lets a single policy target different working-set budgets at
+inference time by reading a literal instruction from its own context, and evaluate on
+downstream task performance, working-set hit ratio, and stack distance, together with an
+interpretability analysis of expert specialization.
+\end{abstract}
+
+\section{Introduction}
+
+Deploying very large mixture-of-experts (MoE) language models, such as DeepSeek-V3 and
+its successors \citep{liu2024deepseekv3} or the Kimi K2 line of models
+\citep{moonshot2025kimi}, requires distributing hundreds of experts across multiple
+accelerators, either through tensor parallelism or through offloading the bulk of expert
+weights to host memory and streaming them to the device on demand
+\citep{eliseev2023offloading}. Even with efficient serving systems, such as vLLM
+\citep{kwon2023vllm}, throughput degrades sharply once expert transfers become frequent,
+since the cost of moving weights over a comparably slow interconnect, e.g., PCIe, starts
+to dominate over the cost of computation itself. This effect is worsened by the standard
+load balancing objectives used at pretraining time, which explicitly encourage a router
+to spread its selections uniformly over all experts to keep per-device utilization
+even, at the expense of the locality that a working set would need to be useful at inference
+time.
+
+A natural way to alleviate this bottleneck is to fine-tune the router so that it
+concentrates its choices on a smaller working set of experts per sequence, without
+degrading the underlying model. One line of work draws on the option-critic framework
+\citep{bacon2017optioncritic} and extends MoE routing temporally, holding an expert
+selection as a macro-action until a learned termination function decides to switch
+\citep{shen2026temporal}. This reduces the switch rate by design, but option-critic
+architectures are known to be prone to degenerate solutions, such as options that never
+terminate or that terminate at every step, and require an explicit deliberation cost to
+avoid collapsing to one of these extremes \citep{harb2018waiting}, which introduces its
+own training instability on top of the added termination and policy-over-options
+modules. MELINOE \citep{raje2026melinoe} instead keeps the original routing architecture
+and introduces a cache simulation loss that directly penalizes expert switching, paired
+with a rank matching loss against a frozen reference router to prevent distributional
+collapse onto a globally preferred subset of experts.
+
+We take a different approach and ask whether working-set locality can be optimized
+directly as a reward with an established policy gradient algorithm, rather than through
+a bespoke loss or architectural change. We simulate a fixed-capacity LRU cache of
+experts at a single router layer over the tokens a policy generates and use the
+resulting hit ratio, or a soft relaxation of it, as the reward signal for GRPO and its
+variant DAPO \citep{shao2024deepseekmath,yu2025dapo}, whose group-relative advantage and
+trust region already provide most of the stability that a rank matching loss is meant
+to supply, without an additional regularizer. We further combine this reward with the
+causal language modeling objective on the model's own ground truth completions, which we
+interpret as reinforcing two complementary trajectories per prompt at once, the
+highest-reward rollout sampled by the policy and the one rollout known to be correct,
+and find this to regularize distribution shift more effectively than a KL penalty
+against a frozen reference or a distillation-style reward. Last, we introduce a prompt
+conditioning variant that lets a single fine-tuned policy target different working-set budgets
+at deployment time by reading a literal instruction from its own prompt.
+
+Summarizing, we: i) reformulate working-set-friendly MoE fine-tuning as a policy gradient
+problem with a stateful, simulator-based reward, requiring no custom loss or
+architectural change; ii) show that combining this reward with a causal language
+modeling objective on the same rollouts regularizes distribution shift more effectively
+than a KL penalty; iii) introduce a prompt conditioning mechanism that lets one policy
+serve multiple working-set budgets; and iv) evaluate the resulting policies on two MoE
+backbones of different scale along task performance, working-set efficiency, and expert
+specialization.
+
+\section{Methodology}
+
+\subsection{Stateful Working-Set Reward}
+\label{sec:reward}
+
+We simulate a fixed-capacity LRU cache of experts at a single transformer layer
+$\ell$, chosen as the middle layer of the backbone. Let $p_t \in \Delta^{E}$ be the
+router's distribution over $E$ experts at token $t$, and let $K$ be the number of
+experts requested per token. We record a request set
+$e_t = \mathrm{TopK}(p_t, K) \subset \{1, \dots, E\}$ at every position, including the
+prompt, which is used only to warm the working set and is never rewarded. Let
+$\mathcal{C}_t \subseteq \{1, \dots, E\}$, $|\mathcal{C}_t| \le c$, denote the set of
+experts resident in the working set after token $t$, for a target capacity $c$. For each
+$e \in e_t$, if $e \in \mathcal{C}_{t^-}$, the access is a hit and $e$ is promoted to
+most-recently-used; otherwise it is a miss, $e$ is inserted, and the least-recently-used
+expert is evicted once the capacity is exceeded. At training time, we route densely at
+layer $\ell$, so that every expert participates in the forward pass weighted by $p_t$,
+and use a soft reward, the probability mass already captured by the working set before it is
+updated,
+\begin{equation}
+  r_t = \sum_{e \in \mathcal{C}_{t^-}} p_t[e], \qquad
+  R(x, y) = \frac{1}{T} \sum_{t=1}^{T} r_t,
+  \label{eq:softreward}
+\end{equation}
+where $T$ is the number of generated tokens and $R(x, y)$ is the sequence-level reward
+handed to GRPO. This reward is stateful, since the value assigned to a token depends on
+the entire working-set trajectory up to that point, but it requires no additional trainable
+parameters and no assumption about which eviction policy the router should be tailored
+to beyond the choice of $c$. We give the full derivation of the reward and its
+relationship to the classical LRU stack algorithm in Appendix~\ref{app:stack}.
+
+\subsection{Prompt Conditioning}
+\label{sec:conditioning}
+
+A single policy trained against a fixed working-set capacity $c$ only ever learns one
+operating point. We instead let $c$ vary per example and condition the policy on it
+through its own prompt, so that one fine-tuned model can be deployed at whichever working-set
+budget the serving system actually has available. Given a pool of prompts
+$\mathcal{D}$ and a set of candidate working-set sizes $\mathcal{C}$, we construct, for every
+$x \in \mathcal{D}$ and every $c \in \mathcal{C}$, a conditioned prompt
+$\tilde{x}_c = \texttt{[CACHE\_SIZE=}c\texttt{]} \oplus x$, prepending the literal
+instruction to the first turn. The augmented training set
+$\mathcal{D}' = \{(\tilde{x}_c, c) : x \in \mathcal{D}, c \in \mathcal{C}\}$ triples the
+size of the original pool and is shuffled before training, so that every mini-batch
+mixes examples conditioned on different budgets. Because the target capacity is now
+encoded in the prompt itself, it is recovered at reward time by parsing the rollout's
+own prompt text, $c = \mathrm{parse}(\tilde{x}_c)$, which makes $c$ a per-example
+property of a training batch rather than a fixed hyperparameter, so the working set simulated
+in Equation~\ref{eq:softreward} matches whichever budget the current example asks for.
+
+\subsection{Combining Policy Gradients with Supervised Fine-Tuning}
+\label{sec:sft}
+
+GRPO estimates an advantage for a rollout $y_g$ by comparing its reward against the
+mean and standard deviation of $G$ rollouts sampled from the same prompt,
+$A_g = (R_g - \mathrm{mean}(R_{1:G})) / \mathrm{std}(R_{1:G})$, and the resulting policy
+gradient reinforces whichever sampled rollout achieved the highest working-set reward relative
+to its group. This can be read as a Monte Carlo estimate over the policy's own rollouts,
+identifying and reinforcing the most working-set-friendly trajectory the policy currently
+assigns non-negligible probability to. We additionally minimize the standard
+teacher-forced negative log-likelihood of the dataset's own ground truth completion
+$y^\star$ on the same prompt, so that the total objective is
+\begin{equation}
+  \mathcal{L}(\theta) = -\mathbb{E}_{x, \{y_g\}} \left[ \frac{1}{G} \sum_{g=1}^{G}
+    A_g \log \pi_\theta(y_g \mid x) \right] + \lambda_{\mathrm{sft}}\, \mathrm{NLL}(y^\star \mid x),
+  \label{eq:combinedloss}
+\end{equation}
+with no KL term against a frozen reference. Equation~\ref{eq:combinedloss} reinforces two
+trajectories per prompt at once, the one rollout sampled by the policy that happened to
+be the most working-set-friendly and the one rollout known a priori to be correct. When these
+two objectives agree, i.e., when the ground truth completion is itself reasonably
+working-set-friendly, which is common since natural language already reuses vocabulary and
+concepts locally, their gradients concord; when they disagree, the supervised term keeps
+the policy anchored to a distribution known to remain fluent and correct, which we find
+to regularize distribution shift more effectively than a KL penalty or a
+distillation-style reward, discussed further in Appendix~\ref{app:sft}.
+
+\subsection{Metrics}
+\label{sec:metrics}
+
+\paragraph{Working-set hit ratio.} At evaluation time we replace the soft reward of
+Section~\ref{sec:reward} with its hard counterpart, using deterministic top-$K$ routing
+to match real deployment behavior rather than the differentiable, dense routing used
+during training. The hit ratio of a rollout is
+$h_t = \frac{1}{K} \sum_{e \in e_t} \mathbb{1}[e \in \mathcal{C}_{t^-}]$, averaged over
+generated tokens.
+
+\paragraph{Stack distance.} The hit ratio in Equation~\ref{eq:softreward} is a function
+of the chosen capacity $c$, which makes it awkward to compare how working-set-friendly a
+policy's routing is independently of any one deployment budget. We additionally report
+the LRU stack distance \citep{mattson1970evaluation}: maintaining a recency-ordered
+stack of distinct experts seen so far in a sequence, an access to expert $e$ at depth
+$d$ in the stack, 1-indexed, has stack distance $d$, and is promoted to the top; an
+access to an expert never seen before in the sequence is a compulsory miss. An access is
+an LRU hit at capacity $c$ if and only if its stack distance is at most $c$, so a single
+pass over a routing trace yields the hit ratio at every capacity at once, and the
+distribution of stack distances itself, or a summary such as its mean, is a
+capacity-independent measure of routing locality. We give the connection between this
+quantity and the total number of expert transfers in Appendix~\ref{app:stack}.
+
+\section{Experimental Setup}
+\label{sec:setup}
+
+We fine-tune two MoE backbones of different scale, Phi-tiny-MoE-instruct (32 layers, 16
+experts, top-2) and OLMoE-1B-7B \citep{muennighoff2024olmoe} (16 layers, 64 experts,
+top-8), using LoRA \citep{hu2021lora} adapters on the attention and expert projections.
+Training data is drawn from the Nemotron Post-Training Dataset v2
+\citep{nvidia2025nemotron}, filtered rather than truncated to fit the context budget. The
+working-set reward is simulated at the middle layer of each backbone, with the working-set capacity
+fixed as a fraction of the total number of experts and scaled accordingly across the two
+backbones. We train with GRPO using the DAPO loss variant, group size $8$, and no KL
+penalty when the supervised term of Section~\ref{sec:sft} is enabled. We compare five
+objectives per backbone: causal language modeling alone; the working-set reward alone; their
+combination, Equation~\ref{eq:combinedloss}; the prompt-conditioned variant of
+Section~\ref{sec:conditioning}; and, as baselines, an option-critic style temporally
+extended router \citep{shen2026temporal,bacon2017optioncritic} and MELINOE
+\citep{raje2026melinoe}. Hyperparameters are given in Appendix~\ref{app:hparams}.
+
+\section{Experimental Results}
+\label{sec:results}
+
+We report downstream task performance (MMLU \citep{hendrycks2021mmlu}, MMMLU, GSM8K
+\citep{cobbe2021gsm8k}, HumanEval \citep{chen2021humaneval}, and MATH
+\citep{hendrycks2021math}), working-set efficiency (hit ratio, stack distance, throughput), and an
+interpretability analysis of expert specialization, comparing every objective of
+Section~\ref{sec:setup} on both backbones. Results are organized by whether the policy
+is conditioned on a target working-set size at inference time.
+
+\paragraph{Note on LoRA.} Every objective below, including the base model's own baselines
+and MELINOE and the option-critic controller, is evaluated as a LoRA adapter on top of the
+frozen backbone rather than a fully fine-tuned model. Downstream task scores are
+consequently expected to be somewhat lower across the board than a full fine-tune of the
+same objective would reach, since LoRA's low-rank update is a strictly smaller hypothesis
+class; this affects every method in this comparison equally and should not be read as a
+property of any one objective. We also do not merge the adapter into the backbone before
+timing throughput, so an adapter that touches the expert projections directly, as the
+working-set reward does (Section~\ref{sec:setup}), adds its own inference-time compute
+cost on top of whatever offload savings its routing behavior achieves; we control for this
+in the throughput numbers below by timing the base model's own compute pass and adding
+each objective's own working-set miss count on top, rather than each objective's own,
+adapter-inflated, decode time.
+
+\subsection{Without Prompt Conditioning}
+\label{sec:results-unconditioned}
+
+\begin{table}[h]
+\centering
+\small
+\caption{Early, in-progress results on OLMoE-1B-7B (1024 held-out prompts). Phi-tiny-MoE
+and the remaining objectives (causal LM alone, the combined reward of
+Section~\ref{sec:sft}) are still running; this table is a placeholder to be replaced by
+the full comparison. Working-set hit ratio and tokens/second are measured at the trained
+capacity ($c=16$, top-8); tokens/second follows the estimated offloaded-inference latency
+model of Appendix~\ref{app:stack} (compute plus a per-expert transfer penalty on every
+working-set miss) rather than a wall-clock trace on real offloading hardware.}
+\begin{tabular}{lccccccc}
+\toprule
+Objective & MMLU & MMMLU & GSM8K & HumanEval & MATH & Hit ratio & Tokens/s \\
+\midrule
+Base (untuned)         & 0.563 & 0.380 & 0.673 & 0.244 & 0.058 & 0.687 & 395.2 \\
+Working-set reward      & 0.563 & 0.367 & 0.664 & 0.329 & 0.061 & \textbf{0.759} & 279.2 \\
+Option-critic controller & 0.527 & 0.311 & 0.542 & 0.140 & 0.002 & 0.684 & 392.2 \\
+MELINOE                & 0.492 & 0.322 & 0.435 & 0.079 & 0.002 & \textbf{0.763} & 439.5 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The working-set reward alone (no supervised anchor) matches or improves the base model on
+every task except MMMLU, and improves HumanEval by 8.5 points, while raising the hit
+ratio by 7.2 points over the base model at the same capacity -- both option-critic and
+MELINOE lose several points of downstream accuracy relative to the base model, most
+sharply on MATH and GSM8K, for a comparable or smaller hit-ratio gain. Tokens/second is
+computed against the base model's own compute pass plus each objective's own working-set
+miss count (see the LoRA note above), which isolates the offload benefit from each
+adapter's own inference-time cost; under this measure the working-set reward variant
+still trails the base model rather than surpassing it, despite the higher hit ratio and
+fewer raw misses, which we attribute to its shorter average completions (530 tokens
+against the base model's 760) dividing a comparable total latency over fewer generated
+tokens, and flag as a limitation of a purely token-averaged throughput metric rather than
+evidence against the working-set benefit itself.
+
+\subsection{With Prompt Conditioning}
+\label{sec:results-conditioned}
+
+
+\section{Conclusion}
+
+We recast working-set-friendly fine-tuning of mixture-of-experts routers as a policy gradient
+problem, using an LRU cache simulator as a stateful reward for GRPO in place of a custom
+auxiliary loss or an architectural change to the routing mechanism. Combining this
+reward with the causal language modeling objective on the same rollouts regularizes
+distribution shift more effectively than a KL penalty against a frozen reference, and a
+prompt conditioning variant lets a single policy serve multiple working-set budgets. We leave
+the full experimental comparison, reported by working-set size and by whether the policy is
+prompt-conditioned, to Section~\ref{sec:results}.
+
+\clearpage
+\bibliographystyle{plainnat}
+\begin{thebibliography}{99}
+
+\bibitem[DeepSeek-AI et al.(2024)]{liu2024deepseekv3}
+DeepSeek-AI, Liu, A., Feng, B., Xue, B., et al.
+\newblock DeepSeek-V3 Technical Report.
+\newblock \emph{arXiv preprint arXiv:2412.19437}, 2024.
+
+\bibitem[Moonshot AI(2025)]{moonshot2025kimi}
+Moonshot AI.
+\newblock Kimi K2: Open Agentic Intelligence.
+\newblock \emph{Technical Report}, 2025.
+
+\bibitem[Kwon et al.(2023)]{kwon2023vllm}
+Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu, C.~H., Gonzalez, J.~E., Zhang, H., and Stoica, I.
+\newblock Efficient Memory Management for Large Language Model Serving with PagedAttention.
+\newblock \emph{Proceedings of the 29th Symposium on Operating Systems Principles}, 2023.
+
+\bibitem[Eliseev and Mazur(2023)]{eliseev2023offloading}
+Eliseev, A. and Mazur, D.
+\newblock Fast Inference of Mixture-of-Experts Language Models with Offloading.
+\newblock \emph{arXiv preprint arXiv:2312.17238}, 2023.
+
+\bibitem[Shen and Henderson(2026)]{shen2026temporal}
+Shen, Y. and Henderson, P.
+\newblock Temporally Extended Mixture-of-Experts via Option-Critic.
+\newblock \emph{arXiv preprint}, 2026.
+
+\bibitem[Bacon et al.(2017)]{bacon2017optioncritic}
+Bacon, P.-L., Harb, J., and Precup, D.
+\newblock The Option-Critic Architecture.
+\newblock \emph{Proceedings of the AAAI Conference on Artificial Intelligence}, 2017.
+
+\bibitem[Harb et al.(2018)]{harb2018waiting}
+Harb, J., Bacon, P.-L., Klissarov, M., and Precup, D.
+\newblock When Waiting is not an Option: Learning Options with a Deliberation Cost.
+\newblock \emph{Proceedings of the AAAI Conference on Artificial Intelligence}, 2018.
+
+\bibitem[Raje et al.(2026)]{raje2026melinoe}
+Raje, A., Nayak, A., and Joshi, A.
+\newblock MELINOE: Fine-Tuning Mixture-of-Experts Language Models for Cache-Friendly Offloaded Inference.
+\newblock \emph{arXiv preprint arXiv:2602.11192}, 2026.
+
+\bibitem[Shao et al.(2024)]{shao2024deepseekmath}
+Shao, Z., Wang, P., Zhu, Q., Xu, R., Song, J., Bi, X., Zhang, H., Zhang, M., Li, Y.~K., Wu, Y., and Guo, D.
+\newblock DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models.
+\newblock \emph{arXiv preprint arXiv:2402.03300}, 2024.
+
+\bibitem[Yu et al.(2025)]{yu2025dapo}
+Yu, Q., Zhang, Z., Zhu, R., Yuan, Y., Zuo, X., Yue, Y., Fan, T., Liu, G., Liu, L., Liu, X., et al.
+\newblock DAPO: An Open-Source LLM Reinforcement Learning System at Scale.
+\newblock \emph{arXiv preprint arXiv:2503.14476}, 2025.
+
+\bibitem[Mattson et al.(1970)]{mattson1970evaluation}
+Mattson, R.~L., Gecsei, J., Slutz, D.~R., and Traiger, I.~L.
+\newblock Evaluation Techniques for Storage Hierarchies.
+\newblock \emph{IBM Systems Journal}, 9(2):78--117, 1970.
+
+\bibitem[Muennighoff et al.(2024)]{muennighoff2024olmoe}
+Muennighoff, N., Soldaini, L., Groeneveld, D., Lo, K., Morrison, J., Min, S., Shi, W., Walsh, P., Tafjord, O., Lambert, N., et al.
+\newblock OLMoE: Open Mixture-of-Experts Language Models.
+\newblock \emph{arXiv preprint arXiv:2409.02060}, 2024.
+
+\bibitem[Hu et al.(2021)]{hu2021lora}
+Hu, E.~J., Shen, Y., Wallis, P., Allen-Zhu, Z., Li, Y., Wang, S., Wang, L., and Chen, W.
+\newblock LoRA: Low-Rank Adaptation of Large Language Models.
+\newblock \emph{arXiv preprint arXiv:2106.09685}, 2021.
+
+\bibitem[Hendrycks et al.(2021)]{hendrycks2021mmlu}
+Hendrycks, D., Burns, C., Basart, S., Zou, A., Mazeika, M., Song, D., and Steinhardt, J.
+\newblock Measuring Massive Multitask Language Understanding.
+\newblock \emph{Proceedings of the International Conference on Learning Representations}, 2021.
+
+\bibitem[Cobbe et al.(2021)]{cobbe2021gsm8k}
+Cobbe, K., Kosaraju, V., Bavarian, M., Chen, M., Jun, H., Kaiser, L., Plappert, M., Tworek, J., Hilton, J., Nakano, R., et al.
+\newblock Training Verifiers to Solve Math Word Problems.
+\newblock \emph{arXiv preprint arXiv:2110.14168}, 2021.
+
+\bibitem[Chen et al.(2021)]{chen2021humaneval}
+Chen, M., Tworek, J., Jun, H., Yuan, Q., Pinto, H.~P.~d.~O., Kaplan, J., Edwards, H., Burda, Y., Joseph, N., Brockman, G., et al.
+\newblock Evaluating Large Language Models Trained on Code.
+\newblock \emph{arXiv preprint arXiv:2107.03374}, 2021.
+
+\bibitem[Hendrycks et al.(2021)]{hendrycks2021math}
+Hendrycks, D., Burns, C., Kadavath, S., Arora, A., Basart, S., Tang, E., Song, D., and Steinhardt, J.
+\newblock Measuring Mathematical Problem Solving with the MATH Dataset.
+\newblock \emph{Proceedings of the Neural Information Processing Systems Track on Datasets and Benchmarks}, 2021.
+
+\bibitem[NVIDIA(2025)]{nvidia2025nemotron}
+NVIDIA.
+\newblock Nemotron Post-Training Dataset v2.
+\newblock \emph{Hugging Face Dataset Card}, 2025.
+
+\bibitem[Jiang et al.(2024)]{jiang2024mixtral}
+Jiang, A.~Q., Sablayrolles, A., Roux, A., Mensch, A., Savary, B., Bamford, C., Chaplot, D.~S., de las Casas, D., Hanna, E.~B., Bressand, F., et al.
+\newblock Mixtral of Experts.
+\newblock \emph{arXiv preprint arXiv:2401.04088}, 2024.
+
+\end{thebibliography}
+
+\appendix
+
+\section{Stack Distance and the Number of Expert Transfers}
+\label{app:stack}
+
+We make precise the relationship between the stack distance defined in
+Section~\ref{sec:metrics} and the total number of CPU-GPU expert transfers an offloaded
+serving system would incur. Let $r^{(\ell,t)} \in \{0,1\}^E$ denote the binary request
+vector at layer $\ell$ and token $t$, with $\|r^{(\ell,t)}\|_1 = K$, and let
+$\mathcal{C}^{(\ell,t)}$ be the set of experts resident in the working set after token $t$
+under an LRU eviction policy of capacity $c$. The number of working-set misses, which equals
+the number of transfers under a cold-start-free serving system, is
+\begin{equation}
+  N_{\mathrm{miss}}(\ell, c) = \sum_{t=1}^{T} \sum_{e \in e_t} \mathbb{1}\!\left[
+    e \notin \mathcal{C}^{(\ell,t^-)}\right] = \sum_{t=1}^{T} \sum_{e \in e_t}
+    \mathbb{1}[d(e, t) > c],
+\end{equation}
+where $d(e, t)$ is the stack distance of the access to $e$ at token $t$, treating a
+compulsory miss as $d = \infty$. Since $d(e, t)$ does not depend on $c$, computing it
+once for every access yields $N_{\mathrm{miss}}(\ell, c)$ for every candidate capacity
+$c$ in a single pass over the routing trace, which is how we obtain the hit ratio curves
+reported in Section~\ref{sec:results} without re-simulating the working set separately per
+capacity.
+
+\section{Regularizing Distribution Shift Without a KL Penalty}
+\label{app:sft}
+
+A KL penalty against a frozen reference, or a distillation-style reward that scores a
+rollout by the reference's own log-likelihood of it, both anchor the policy to the
+reference's original behavior, but neither one ever increases the likelihood the policy
+assigns to a completion known to be correct, since both are only ever satisfied by
+staying close to what the reference already does. The supervised term in
+Equation~\ref{eq:combinedloss} instead directly minimizes the negative log-likelihood of
+the ground truth completion under the current policy, which pushes that likelihood up
+regardless of what the reference would have assigned it, while the working-set reward
+simultaneously pushes the policy toward whichever sampled rollout was most working-set
+friendly. In our runs, we find the KL penalty to be redundant once the supervised term
+is enabled, and disable it accordingly, relying on the supervised term alone to keep the
+policy from drifting into working-set-friendly but degenerate completions.
+
+\section{Hyperparameters}
+\label{app:hparams}
+
+\begin{table}[h]
+\centering
+\caption{Training hyperparameters shared across objectives, per backbone.}
+\begin{tabular}{lcc}
+\toprule
+ & Phi-tiny-MoE-instruct & OLMoE-1B-7B \\
+\midrule
+Experts / top-$K$ & 16 / 2 & 64 / 8 \\
+Layers & 32 & 16 \\
+Working-set layer & 16 & 8 \\
+LoRA rank / alpha & 16 / 32 & 16 / 32 \\
+Group size $G$ & 8 & 8 \\
+Learning rate & $1\mathrm{e}{-4}$ & $1\mathrm{e}{-4}$ \\
+Prompt / completion length & 1024 / 1024 & 1024 / 1024 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\end{document}

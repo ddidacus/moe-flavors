@@ -256,28 +256,27 @@ adapter-inflated, decode time.
 \begin{table}[h]
 \centering
 \small
-\caption{Results on Phi-tiny-MoE-instruct (1024 held-out prompts). Working-set hit ratio,
-misses, ECI, and tokens/second are measured at the trained capacity ($c=4$, top-2).
-Misses is the mean number of working-set misses per sequence (lower is better); ECI is
-the normalized routing entropy $H(p)/\log(E)$ over the empirical expert-choice
-distribution (1.0 = perfectly load-balanced routing across experts, near 0 = collapsed
-onto a few experts). Tokens/second
-follows the estimated offloaded-inference latency model of Appendix~\ref{app:stack}
-(compute plus a per-expert transfer penalty on every working-set miss) rather than a
-wall-clock trace on real offloading hardware, and is normalized against the base model's
-own compute pass (see the LoRA note above) so that adapters touching the expert
-projections are not penalized twice.}
+\caption{Results on Phi-tiny-MoE-instruct (1024 held-out prompts), at the trained working-set
+capacity ($c=4$, top-2). The base model's row reports absolute lm-eval-harness scores; every
+other row reports $\Delta$, the difference from the base model's own score on that task
+(positive is better). Misses is the mean number of working-set misses per sequence (lower is
+better); ECI is the normalized routing entropy $H(p)/\log(E)$ (1.0 = load-balanced, near 0 =
+collapsed onto a few experts). Absolute scores, tokens/second, and the LoRA caveat above apply
+equally to every row here; see Table~\ref{tab:phiresults_full} in Appendix~\ref{app:fulltables}
+for the absolute values this table's deltas are computed from.}
 \resizebox{\textwidth}{!}{%
-\begin{tabular}{lccccccccc}
+\begin{tabular}{l ccccc | ccc}
 \toprule
-Objective & MMLU & MMMLU & GSM8K & HumanEval & MATH & Hit ratio & Misses & ECI & Tokens/s \\
+ & \multicolumn{5}{c|}{lm-eval-harness score ($\Delta$ from base)} & \multicolumn{3}{c}{working-set efficiency} \\
+Objective & MMLU & MMMLU & GSM8K & HumanEval & MATH & Hit ratio & Misses & ECI \\
 \midrule
-Base (untuned)          & 0.614 & 0.345 & 0.622 & 0.024 & 0.090 & 0.571 & 651.1 & 0.892 & 393.3 \\
-Causal LM alone (SFT)   & 0.618 & 0.313 & 0.575 & 0.049 & 0.090 & 0.561 & 694.9 & 0.890 & 411.2 \\
-Working-set reward       & 0.610 & 0.343 & 0.578 & 0.018 & 0.073 & 0.624 & 434.3 & 0.888 & 273.0 \\
-Working-set reward + SFT & 0.618 & 0.346 & 0.561 & 0.037 & 0.071 & \textbf{0.773} & \textbf{441.3} & 0.721 & 509.6 \\
-Option-critic controller & 0.582 & 0.334 & 0.516 & 0.000 & 0.011 & \textbf{1.000} & \textbf{0.1} & 0.279 & 514.8 \\
-MELINOE                 & 0.605 & 0.333 & 0.511 & 0.000 & 0.017 & 0.880 & 236.3 & 0.674 & 517.7 \\
+Base (untuned)          & 0.614 & 0.345 & 0.622 & 0.024 & 0.090 & 0.571 & 651.1 & 0.892 \\
+\midrule
+Causal LM alone (SFT)   & +0.004 & $-$0.032 & $-$0.047 & +0.025 & 0.000  & 0.561 & 694.9 & 0.890 \\
+Working-set reward       & $-$0.004 & $-$0.002 & $-$0.044 & $-$0.006 & $-$0.017 & 0.624 & 434.3 & 0.888 \\
+Working-set reward + SFT & +0.004 & +0.001 & $-$0.061 & +0.013 & $-$0.019 & \textbf{0.773} & \textbf{441.3} & 0.721 \\
+Option-critic controller & $-$0.032 & $-$0.011 & $-$0.106 & $-$0.024 & $-$0.079 & \textbf{1.000} & \textbf{0.1} & 0.279 \\
+MELINOE                 & $-$0.009 & $-$0.012 & $-$0.111 & $-$0.024 & $-$0.073 & 0.880 & 236.3 & 0.674 \\
 \bottomrule
 \end{tabular}%
 }
@@ -287,24 +286,28 @@ MELINOE                 & 0.605 & 0.333 & 0.511 & 0.000 & 0.017 & 0.880 & 236.3 
 \begin{table}[h]
 \centering
 \small
-\caption{Results on OLMoE-1B-7B (1024 held-out prompts). Working-set hit ratio, misses,
-ECI, and tokens/second are measured at the trained capacity ($c=16$, top-8), normalized
-against the base model's own compute pass as above. The combined working-set reward + SFT
-objective for this backbone was still running at submission time and is omitted.}
-\label{tab:olmoeresults}
+\caption{Results on OLMoE-1B-7B (1024 held-out prompts), at the trained working-set capacity
+($c=16$, top-8), same convention as Table~\ref{tab:phiresults}: the base row is absolute, every
+other row is $\Delta$ from the base model. The combined working-set reward + SFT objective for
+this backbone was still running at submission time and is omitted. See
+Table~\ref{tab:olmoeresults_full} in Appendix~\ref{app:fulltables} for absolute scores and
+tokens/second.}
 \resizebox{\textwidth}{!}{%
-\begin{tabular}{lccccccccc}
+\begin{tabular}{l ccccc | ccc}
 \toprule
-Objective & MMLU & MMMLU & GSM8K & HumanEval & MATH & Hit ratio & Misses & ECI & Tokens/s \\
+ & \multicolumn{5}{c|}{lm-eval-harness score ($\Delta$ from base)} & \multicolumn{3}{c}{working-set efficiency} \\
+Objective & MMLU & MMMLU & GSM8K & HumanEval & MATH & Hit ratio & Misses & ECI \\
 \midrule
-Base (untuned)          & 0.563 & 0.380 & 0.673 & 0.244 & 0.058 & 0.687 & 1869.0 & 0.895 & 395.5 \\
-Causal LM alone (SFT)   & 0.549 & 0.370 & 0.592 & 0.189 & 0.036 & 0.679 & 1930.0 & 0.897 & 388.9 \\
-Working-set reward       & 0.563 & 0.367 & 0.664 & 0.329 & 0.061 & \textbf{0.759} & \textbf{1004.2} & 0.895 & 273.9 \\
-Option-critic controller & 0.527 & 0.311 & 0.542 & 0.140 & 0.002 & 0.684 & 2012.7 & 0.888 & 390.5 \\
-MELINOE                 & 0.492 & 0.322 & 0.435 & 0.079 & 0.002 & 0.763 & 1541.9 & 0.838 & 438.2 \\
+Base (untuned)          & 0.563 & 0.380 & 0.673 & 0.244 & 0.058 & 0.687 & 1869.0 & 0.895 \\
+\midrule
+Causal LM alone (SFT)   & $-$0.014 & $-$0.010 & $-$0.081 & $-$0.055 & $-$0.022 & 0.679 & 1930.0 & 0.897 \\
+Working-set reward       & 0.000  & $-$0.013 & $-$0.009 & +0.085 & +0.003 & \textbf{0.759} & \textbf{1004.2} & 0.895 \\
+Option-critic controller & $-$0.036 & $-$0.069 & $-$0.131 & $-$0.104 & $-$0.056 & 0.684 & 2012.7 & 0.888 \\
+MELINOE                 & $-$0.071 & $-$0.058 & $-$0.238 & $-$0.165 & $-$0.056 & 0.763 & 1541.9 & 0.838 \\
 \bottomrule
 \end{tabular}%
 }
+\label{tab:olmoeresults}
 \end{table}
 
 On both backbones the working-set reward alone (no supervised anchor) is competitive with
@@ -550,6 +553,66 @@ simultaneously pushes the policy toward whichever sampled rollout was most worki
 friendly. In our runs, we find the KL penalty to be redundant once the supervised term
 is enabled, and disable it accordingly, relying on the supervised term alone to keep the
 policy from drifting into working-set-friendly but degenerate completions.
+
+\section{Full Results Tables}
+\label{app:fulltables}
+
+Tables~\ref{tab:phiresults} and~\ref{tab:olmoeresults} in Section~\ref{sec:results-unconditioned}
+report every objective's lm-eval-harness scores as $\Delta$ from its own backbone's base model,
+to make relative comparisons across five tasks and two backbones easier to read at a glance.
+Tables~\ref{tab:phiresults_full} and~\ref{tab:olmoeresults_full} below give the same results in
+absolute form, together with tokens/second (omitted from the main-text tables).
+
+\begin{table}[h]
+\centering
+\small
+\caption{Absolute results on Phi-tiny-MoE-instruct (1024 held-out prompts), at the trained
+working-set capacity ($c=4$, top-2) -- the source values for Table~\ref{tab:phiresults}'s
+$\Delta$ columns. Tokens/second follows the estimated offloaded-inference latency model of
+Appendix~\ref{app:stack} (compute plus a per-expert transfer penalty on every working-set
+miss) rather than a wall-clock trace on real offloading hardware, and is normalized against
+the base model's own compute pass (see the LoRA note in Section~\ref{sec:results}) so that
+adapters touching the expert projections are not penalized twice.}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lccccccccc}
+\toprule
+Objective & MMLU & MMMLU & GSM8K & HumanEval & MATH & Hit ratio & Misses & ECI & Tokens/s \\
+\midrule
+Base (untuned)          & 0.614 & 0.345 & 0.622 & 0.024 & 0.090 & 0.571 & 651.1 & 0.892 & 393.3 \\
+Causal LM alone (SFT)   & 0.618 & 0.313 & 0.575 & 0.049 & 0.090 & 0.561 & 694.9 & 0.890 & 411.2 \\
+Working-set reward       & 0.610 & 0.343 & 0.578 & 0.018 & 0.073 & 0.624 & 434.3 & 0.888 & 273.0 \\
+Working-set reward + SFT & 0.618 & 0.346 & 0.561 & 0.037 & 0.071 & \textbf{0.773} & \textbf{441.3} & 0.721 & 509.6 \\
+Option-critic controller & 0.582 & 0.334 & 0.516 & 0.000 & 0.011 & \textbf{1.000} & \textbf{0.1} & 0.279 & 514.8 \\
+MELINOE                 & 0.605 & 0.333 & 0.511 & 0.000 & 0.017 & 0.880 & 236.3 & 0.674 & 517.7 \\
+\bottomrule
+\end{tabular}%
+}
+\label{tab:phiresults_full}
+\end{table}
+
+\begin{table}[h]
+\centering
+\small
+\caption{Absolute results on OLMoE-1B-7B (1024 held-out prompts), at the trained working-set
+capacity ($c=16$, top-8) -- the source values for Table~\ref{tab:olmoeresults}'s $\Delta$
+columns. Tokens/second normalized against the base model's own compute pass as above. The
+combined working-set reward + SFT objective for this backbone was still running at
+submission time and is omitted.}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lccccccccc}
+\toprule
+Objective & MMLU & MMMLU & GSM8K & HumanEval & MATH & Hit ratio & Misses & ECI & Tokens/s \\
+\midrule
+Base (untuned)          & 0.563 & 0.380 & 0.673 & 0.244 & 0.058 & 0.687 & 1869.0 & 0.895 & 395.5 \\
+Causal LM alone (SFT)   & 0.549 & 0.370 & 0.592 & 0.189 & 0.036 & 0.679 & 1930.0 & 0.897 & 388.9 \\
+Working-set reward       & 0.563 & 0.367 & 0.664 & 0.329 & 0.061 & \textbf{0.759} & \textbf{1004.2} & 0.895 & 273.9 \\
+Option-critic controller & 0.527 & 0.311 & 0.542 & 0.140 & 0.002 & 0.684 & 2012.7 & 0.888 & 390.5 \\
+MELINOE                 & 0.492 & 0.322 & 0.435 & 0.079 & 0.002 & 0.763 & 1541.9 & 0.838 & 438.2 \\
+\bottomrule
+\end{tabular}%
+}
+\label{tab:olmoeresults_full}
+\end{table}
 
 \section{Hyperparameters}
 \label{app:hparams}

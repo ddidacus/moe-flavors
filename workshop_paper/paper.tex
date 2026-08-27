@@ -349,11 +349,12 @@ falling in the upper-right quadrant we would want every objective to occupy.
 \includegraphics[width=0.75\textwidth]{figures/delta_score_vs_hit_ratio.png}
 \caption{Change in average lm-eval-harness score (mean of MMLU, MMMLU, GSM8K, HumanEval,
 MATH) versus working-set hit ratio, for every objective on both backbones, relative to
-each backbone's own base model (dashed line at $\Delta=0$). Color distinguishes backbone
-(Phi-tiny-MoE-instruct vs. OLMoE-1B-7B); marker shape distinguishes objective. The
-upper-right quadrant -- higher hit ratio \emph{and} improved downstream accuracy -- is the
-region a working-set-aware objective should target; only OLMoE's working-set reward
-reaches it.}
+each backbone's own base model (dotted line at $\Delta=0$). Color distinguishes backbone
+(Phi-tiny-MoE-instruct vs. OLMoE-1B-7B), each point labeled by objective. The dashed
+staircase is the Pareto front over both axes jointly (higher hit ratio \emph{and} improved
+downstream accuracy is better, toward the upper right); only OLMoE's working-set reward
+combines a positive score delta with a hit-ratio gain, and the option-critic controller
+sets the frontier's hit-ratio extreme at the cost of the largest downstream regression.}
 \label{fig:delta_scatter}
 \end{figure}
 
@@ -583,77 +584,77 @@ generated token (columns), colored by expert id.
 
 \begin{figure}[h]
 \centering
-\includegraphics[width=0.85\textwidth]{figures/phi_base_expert_trace.png}
+\includegraphics[width=0.55\textwidth]{figures/phi_base_expert_trace.png}
 \caption{Phi-tiny-MoE-instruct, base (untuned) model -- expert routing trace at layers 8/16/24.}
 \label{fig:phi_base}
 \end{figure}
 
 \begin{figure}[h]
 \centering
-\includegraphics[width=0.85\textwidth]{figures/phi_sft_baseline_expert_trace.png}
+\includegraphics[width=0.55\textwidth]{figures/phi_sft_baseline_expert_trace.png}
 \caption{Phi-tiny-MoE-instruct, causal LM alone (SFT) -- expert routing trace at layers 8/16/24.}
 \label{fig:phi_sft}
 \end{figure}
 
 \begin{figure}[h]
 \centering
-\includegraphics[width=0.85\textwidth]{figures/phi_cache_reward_expert_trace.png}
+\includegraphics[width=0.55\textwidth]{figures/phi_cache_reward_expert_trace.png}
 \caption{Phi-tiny-MoE-instruct, working-set reward alone -- expert routing trace at layers 8/16/24.}
 \label{fig:phi_reward}
 \end{figure}
 
 \begin{figure}[h]
 \centering
-\includegraphics[width=0.85\textwidth]{figures/phi_cache_sft_expert_trace.png}
+\includegraphics[width=0.55\textwidth]{figures/phi_cache_sft_expert_trace.png}
 \caption{Phi-tiny-MoE-instruct, working-set reward + SFT (combined objective) -- expert routing trace at layers 8/16/24.}
 \label{fig:phi_cachesft}
 \end{figure}
 
 \begin{figure}[h]
 \centering
-\includegraphics[width=0.85\textwidth]{figures/phi_controller_baseline_expert_trace.png}
+\includegraphics[width=0.55\textwidth]{figures/phi_controller_baseline_expert_trace.png}
 \caption{Phi-tiny-MoE-instruct, option-critic controller baseline -- expert routing trace at layers 8/16/24.}
 \label{fig:phi_controller}
 \end{figure}
 
 \begin{figure}[h]
 \centering
-\includegraphics[width=0.85\textwidth]{figures/phi_melinoe_baseline_expert_trace.png}
+\includegraphics[width=0.55\textwidth]{figures/phi_melinoe_baseline_expert_trace.png}
 \caption{Phi-tiny-MoE-instruct, MELINOE baseline -- expert routing trace at layers 8/16/24.}
 \label{fig:phi_melinoe}
 \end{figure}
 
 \begin{figure}[h]
 \centering
-\includegraphics[width=0.85\textwidth]{figures/olmoe_base_expert_trace.png}
+\includegraphics[width=0.55\textwidth]{figures/olmoe_base_expert_trace.png}
 \caption{OLMoE-1B-7B, base (untuned) model -- expert routing trace at layers 4/8/12.}
 \label{fig:olmoe_base}
 \end{figure}
 
 \begin{figure}[h]
 \centering
-\includegraphics[width=0.85\textwidth]{figures/olmoe_sft_baseline_expert_trace.png}
+\includegraphics[width=0.55\textwidth]{figures/olmoe_sft_baseline_expert_trace.png}
 \caption{OLMoE-1B-7B, causal LM alone (SFT) -- expert routing trace at layers 4/8/12.}
 \label{fig:olmoe_sft}
 \end{figure}
 
 \begin{figure}[h]
 \centering
-\includegraphics[width=0.85\textwidth]{figures/olmoe_cache_reward_expert_trace.png}
+\includegraphics[width=0.55\textwidth]{figures/olmoe_cache_reward_expert_trace.png}
 \caption{OLMoE-1B-7B, working-set reward alone -- expert routing trace at layers 4/8/12.}
 \label{fig:olmoe_reward}
 \end{figure}
 
 \begin{figure}[h]
 \centering
-\includegraphics[width=0.85\textwidth]{figures/olmoe_controller_baseline_expert_trace.png}
+\includegraphics[width=0.55\textwidth]{figures/olmoe_controller_baseline_expert_trace.png}
 \caption{OLMoE-1B-7B, option-critic controller baseline -- expert routing trace at layers 4/8/12.}
 \label{fig:olmoe_controller}
 \end{figure}
 
 \begin{figure}[h]
 \centering
-\includegraphics[width=0.85\textwidth]{figures/olmoe_melinoe_baseline_expert_trace.png}
+\includegraphics[width=0.55\textwidth]{figures/olmoe_melinoe_baseline_expert_trace.png}
 \caption{OLMoE-1B-7B, MELINOE baseline -- expert routing trace at layers 4/8/12.}
 \label{fig:olmoe_melinoe}
 \end{figure}

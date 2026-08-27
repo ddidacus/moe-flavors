@@ -333,6 +333,30 @@ model's (0.89 on Phi-tiny-MoE, 0.90 on OLMoE) while still cutting misses by a th
 half, indicating its hit-ratio gains come from exploiting temporal reuse of a still
 load-balanced expert population rather than from collapsing the router.
 
+Figure~\ref{fig:delta_scatter} makes this trade-off explicit across both backbones at
+once: plotting each objective's change in average lm-eval-harness score against its
+working-set hit ratio (both relative to, and at the same capacity as, its own backbone's
+base model) separates the two families of method visually. The option-critic controller
+and MELINOE occupy the upper-left of the plot on Phi-tiny-MoE -- the highest hit ratios in
+the comparison, bought with the largest accuracy regressions -- while the working-set
+reward and its SFT-combined variant sit closer to the vertical zero-delta line while still
+improving hit ratio over the base model, and OLMoE's working-set reward is the only point
+in the entire comparison with a positive score delta together with a hit-ratio gain,
+falling in the upper-right quadrant we would want every objective to occupy.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.75\textwidth]{figures/delta_score_vs_hit_ratio.png}
+\caption{Change in average lm-eval-harness score (mean of MMLU, MMMLU, GSM8K, HumanEval,
+MATH) versus working-set hit ratio, for every objective on both backbones, relative to
+each backbone's own base model (dashed line at $\Delta=0$). Color distinguishes backbone
+(Phi-tiny-MoE-instruct vs. OLMoE-1B-7B); marker shape distinguishes objective. The
+upper-right quadrant -- higher hit ratio \emph{and} improved downstream accuracy -- is the
+region a working-set-aware objective should target; only OLMoE's working-set reward
+reaches it.}
+\label{fig:delta_scatter}
+\end{figure}
+
 \subsection{With Prompt Conditioning}
 \label{sec:results-conditioned}
 

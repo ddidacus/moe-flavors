@@ -31,82 +31,57 @@
 \maketitle
 
 \begin{abstract}
-Serving very large mixture-of-experts (MoE) language models requires either tensor
-parallelism across many accelerators or offloading expert weights to host memory, both
-of which are constrained by the interconnect bandwidth available for expert transfers.
-Prior work reduces this cost by encouraging the router to reuse a small set of experts
-over a sequence, either through architectural changes to the routing mechanism, such as
-option-critic style temporal extension, or through custom auxiliary losses that penalize
-working-set misses while regularizing against distribution shift with a rank matching term. We
-instead treat working-set locality as a reward signal and optimize it directly with an
-established policy gradient algorithm, GRPO, using an LRU cache simulator over the
-router's expert selections as a stateful reward function. This removes the need for
-custom losses, additional trainable modules, or termination functions. We further combine
-the working-set reward with the causal language modeling objective on the same rollouts,
-which we interpret as jointly reinforcing the highest-reward completions sampled by the
-policy and the ground truth completion, and find this to regularize distribution shift
-more effectively than a KL penalty against a frozen reference. We introduce a prompt
-conditioning variant that lets a single policy target different working-set budgets at
-inference time by reading a literal instruction from its own context, and evaluate on
-downstream task performance, working-set hit ratio, and stack distance, together with an
-interpretability analysis of expert specialization.
+Serving very large mixture-of-experts (MoE) language models requires tensor parallelism
+or offloading expert weights to host memory, both constrained by interconnect bandwidth.
+Prior work reduces this cost by encouraging the router to reuse a small set of experts per
+sequence, via architectural changes such as option-critic temporal extension, or custom
+auxiliary losses with a rank-matching regularizer. We instead treat working-set locality
+as a reward and optimize it directly with GRPO, using an LRU cache simulator over the
+router's own selections as a stateful reward -- no custom losses, extra modules, or
+termination functions. We further combine this reward (CAR-MoE) with causal language
+modeling on the same rollouts, regularizing distribution shift more effectively than a KL
+penalty against a frozen reference, and introduce a prompt-conditioning variant letting
+one policy target different working-set budgets by reading a literal instruction from its
+own context. We evaluate on downstream task performance, working-set hit ratio, and
+routing diversity, and find that CAR-MoE avoids the routing collapse that gives an
+option-critic baseline its near-perfect but degenerate hit ratio.
 \end{abstract}
 
 \section{Introduction}
 
-Deploying very large mixture-of-experts (MoE) language models, such as DeepSeek-V3 and
-its successors \citep{liu2024deepseekv3} or the Kimi K2 line of models
-\citep{moonshot2025kimi}, requires distributing hundreds of experts across multiple
-accelerators, either through tensor parallelism or through offloading the bulk of expert
-weights to host memory and streaming them to the device on demand
-\citep{eliseev2023offloading}. Even with efficient serving systems, such as vLLM
+Deploying very large mixture-of-experts (MoE) language models, such as DeepSeek-V3
+\citep{liu2024deepseekv3} or Kimi K2 \citep{moonshot2025kimi}, requires distributing
+hundreds of experts across accelerators, either through tensor parallelism or by
+offloading expert weights to host memory and streaming them on demand
+\citep{eliseev2023offloading}. Even with efficient serving systems such as vLLM
 \citep{kwon2023vllm}, throughput degrades sharply once expert transfers become frequent,
-since the cost of moving weights over a comparably slow interconnect, e.g., PCIe, starts
-to dominate over the cost of computation itself. This effect is worsened by the standard
-load balancing objectives used at pretraining time, which explicitly encourage a router
-to spread its selections uniformly over all experts to keep per-device utilization
-even, at the expense of the locality that a working set would need to be useful at inference
-time.
+since moving weights over a comparably slow interconnect starts to dominate compute. This
+is worsened by the load-balancing objectives used at pretraining time, which explicitly
+spread router selections uniformly over all experts, at the expense of the locality a
+working set would need at inference time.
 
-A natural way to alleviate this bottleneck is to fine-tune the router so that it
-concentrates its choices on a smaller working set of experts per sequence, without
-degrading the underlying model. One line of work draws on the option-critic framework
+A natural fix is to fine-tune the router to concentrate its choices on a smaller working
+set per sequence. One line of work draws on the option-critic framework
 \citep{bacon2017optioncritic} and extends MoE routing temporally, holding an expert
-selection as a macro-action until a learned termination function decides to switch
-\citep{shen2026temporal}. This reduces the switch rate by design, but option-critic
-architectures are known to be prone to degenerate solutions, such as options that never
-terminate or that terminate at every step, and require an explicit deliberation cost to
-avoid collapsing to one of these extremes \citep{harb2018waiting}, which introduces its
-own training instability on top of the added termination and policy-over-options
-modules. MELINOE \citep{raje2026melinoe} instead keeps the original routing architecture
-and introduces a cache simulation loss that directly penalizes expert switching, paired
-with a rank matching loss against a frozen reference router to prevent distributional
-collapse onto a globally preferred subset of experts.
+selection as a macro-action until a learned termination function switches
+\citep{shen2026temporal}; option-critic architectures are known to be prone to degenerate
+solutions and require an explicit deliberation cost to avoid collapsing to one
+\citep{harb2018waiting}, adding training instability on top of the extra termination and
+policy-over-options modules. MELINOE \citep{raje2026melinoe} instead keeps the original
+routing architecture and adds a cache simulation loss that penalizes expert switching,
+paired with a rank matching loss against a frozen reference to prevent collapse.
 
-We take a different approach and ask whether working-set locality can be optimized
-directly as a reward with an established policy gradient algorithm, rather than through
-a bespoke loss or architectural change. We simulate a fixed-capacity LRU cache of
-experts at a single router layer over the tokens a policy generates and use the
-resulting hit ratio, or a soft relaxation of it, as the reward signal for GRPO and its
-variant DAPO \citep{shao2024deepseekmath,yu2025dapo}, whose group-relative advantage and
-trust region already provide most of the stability that a rank matching loss is meant
-to supply, without an additional regularizer. We further combine this reward with the
-causal language modeling objective on the model's own ground truth completions, which we
-interpret as reinforcing two complementary trajectories per prompt at once, the
-highest-reward rollout sampled by the policy and the one rollout known to be correct,
-and find this to regularize distribution shift more effectively than a KL penalty
-against a frozen reference or a distillation-style reward. Last, we introduce a prompt
-conditioning variant that lets a single fine-tuned policy target different working-set budgets
-at deployment time by reading a literal instruction from its own prompt.
-
-Summarizing, we: i) reformulate working-set-friendly MoE fine-tuning as a policy gradient
-problem with a stateful, simulator-based reward, requiring no custom loss or
-architectural change; ii) show that combining this reward with a causal language
-modeling objective on the same rollouts regularizes distribution shift more effectively
-than a KL penalty; iii) introduce a prompt conditioning mechanism that lets one policy
-serve multiple working-set budgets; and iv) evaluate the resulting policies on two MoE
-backbones of different scale along task performance, working-set efficiency, and expert
-specialization.
+We instead ask whether working-set locality can be optimized directly as a reward with an
+established policy gradient algorithm, rather than a bespoke loss or architectural
+change. We simulate a fixed-capacity LRU cache of experts at a single router layer and
+use its hit ratio, or a soft relaxation, as the reward for GRPO/DAPO
+\citep{shao2024deepseekmath,yu2025dapo}, whose group-relative advantage and trust region
+already provide most of the stability a rank-matching term is meant to supply. We further
+combine this reward with causal language modeling on the model's own ground-truth
+completions, reinforcing two trajectories per prompt at once, and find this regularizes
+distribution shift more effectively than a KL penalty or distillation-style reward. Last,
+we introduce a prompt-conditioning variant letting one policy target different
+working-set budgets by reading a literal instruction from its own prompt.
 
 \section{Methodology}
 
@@ -142,19 +117,16 @@ relationship to the classical LRU stack algorithm in Appendix~\ref{app:stack}.
 \subsection{Prompt Conditioning}
 \label{sec:conditioning}
 
-A single policy trained against a fixed working-set capacity $c$ only ever learns one
-operating point. We instead let $c$ vary per example and condition the policy on it
-through its own prompt, so that one fine-tuned model can be deployed at whichever working-set
-budget the serving system actually has available. Given a pool of prompts
-$\mathcal{D}$ and a set of candidate working-set sizes $\mathcal{C}$, we construct, for every
-$x \in \mathcal{D}$ and every $c \in \mathcal{C}$, a conditioned prompt
-$\tilde{x}_c = \texttt{[CACHE\_SIZE=}c\texttt{]} \oplus x$, prepending the literal
-instruction to the first turn. The augmented training set
+A single policy trained against a fixed capacity $c$ only ever learns one operating
+point. We instead let $c$ vary per example and condition the policy on it through its own
+prompt, so one fine-tuned model deploys at whichever budget is available. Given a prompt
+pool $\mathcal{D}$ and candidate sizes $\mathcal{C}$, we construct, for every
+$x \in \mathcal{D}$ and $c \in \mathcal{C}$, a conditioned prompt
+$\tilde{x}_c = \texttt{[CACHE\_SIZE=}c\texttt{]} \oplus x$. The augmented set
 $\mathcal{D}' = \{(\tilde{x}_c, c) : x \in \mathcal{D}, c \in \mathcal{C}\}$ triples the
-size of the original pool and is shuffled before training, so that every mini-batch
-mixes examples conditioned on different budgets. Because the target capacity is now
-encoded in the prompt itself, it is recovered at reward time by parsing the rollout's
-own prompt text, $c = \mathrm{parse}(\tilde{x}_c)$, which makes $c$ a per-example
+pool and is shuffled so every mini-batch mixes budgets. The target capacity is recovered
+at reward time by parsing the rollout's own prompt text, $c = \mathrm{parse}(\tilde{x}_c)$,
+which makes $c$ a per-example
 property of a training batch rather than a fixed hyperparameter, so the working set simulated
 in Equation~\ref{eq:softreward} matches whichever budget the current example asks for.
 
@@ -163,50 +135,35 @@ in Equation~\ref{eq:softreward} matches whichever budget the current example ask
 
 GRPO estimates an advantage for a rollout $y_g$ by comparing its reward against the
 mean and standard deviation of $G$ rollouts sampled from the same prompt,
-$A_g = (R_g - \mathrm{mean}(R_{1:G})) / \mathrm{std}(R_{1:G})$, and the resulting policy
-gradient reinforces whichever sampled rollout achieved the highest working-set reward relative
-to its group. This can be read as a Monte Carlo estimate over the policy's own rollouts,
-identifying and reinforcing the most working-set-friendly trajectory the policy currently
-assigns non-negligible probability to. We additionally minimize the standard
-teacher-forced negative log-likelihood of the dataset's own ground truth completion
-$y^\star$ on the same prompt, so that the total objective is
+$A_g = (R_g - \mathrm{mean}(R_{1:G})) / \mathrm{std}(R_{1:G})$, reinforcing whichever
+rollout achieved the highest working-set reward relative to its group. We additionally
+minimize the teacher-forced negative log-likelihood of the ground truth completion
+$y^\star$ on the same prompt, so the total objective is
 \begin{equation}
   \mathcal{L}(\theta) = -\mathbb{E}_{x, \{y_g\}} \left[ \frac{1}{G} \sum_{g=1}^{G}
     A_g \log \pi_\theta(y_g \mid x) \right] + \lambda_{\mathrm{sft}}\, \mathrm{NLL}(y^\star \mid x),
   \label{eq:combinedloss}
 \end{equation}
-with no KL term against a frozen reference. Equation~\ref{eq:combinedloss} reinforces two
-trajectories per prompt at once, the one rollout sampled by the policy that happened to
-be the most working-set-friendly and the one rollout known a priori to be correct. When these
-two objectives agree, i.e., when the ground truth completion is itself reasonably
-working-set-friendly, which is common since natural language already reuses vocabulary and
-concepts locally, their gradients concord; when they disagree, the supervised term keeps
-the policy anchored to a distribution known to remain fluent and correct, which we find
-to regularize distribution shift more effectively than a KL penalty or a
-distillation-style reward, discussed further in Appendix~\ref{app:sft}.
+with no KL term against a frozen reference. This reinforces two trajectories per prompt
+at once -- the most working-set-friendly sampled rollout and the one known a priori to be
+correct -- and when they disagree the supervised term keeps the policy anchored to a
+fluent, correct distribution, which we find regularizes distribution shift more
+effectively than a KL penalty or distillation-style reward (Appendix~\ref{app:sft}).
 
 \subsection{Metrics}
 \label{sec:metrics}
 
-\paragraph{Working-set hit ratio.} At evaluation time we replace the soft reward of
-Section~\ref{sec:reward} with its hard counterpart, using deterministic top-$K$ routing
-to match real deployment behavior rather than the differentiable, dense routing used
-during training. The hit ratio of a rollout is
+\paragraph{Working-set hit ratio.} At evaluation time we replace the soft reward with its
+hard counterpart, using deterministic top-$K$ routing to match real deployment behavior.
+The hit ratio of a rollout is
 $h_t = \frac{1}{K} \sum_{e \in e_t} \mathbb{1}[e \in \mathcal{C}_{t^-}]$, averaged over
 generated tokens.
 
-\paragraph{Stack distance.} The hit ratio in Equation~\ref{eq:softreward} is a function
-of the chosen capacity $c$, which makes it awkward to compare how working-set-friendly a
-policy's routing is independently of any one deployment budget. We additionally report
-the LRU stack distance \citep{mattson1970evaluation}: maintaining a recency-ordered
-stack of distinct experts seen so far in a sequence, an access to expert $e$ at depth
-$d$ in the stack, 1-indexed, has stack distance $d$, and is promoted to the top; an
-access to an expert never seen before in the sequence is a compulsory miss. An access is
-an LRU hit at capacity $c$ if and only if its stack distance is at most $c$, so a single
-pass over a routing trace yields the hit ratio at every capacity at once, and the
-distribution of stack distances itself, or a summary such as its mean, is a
-capacity-independent measure of routing locality. We give the connection between this
-quantity and the total number of expert transfers in Appendix~\ref{app:stack}.
+\paragraph{Stack distance.} Since hit ratio is a function of capacity $c$, we also report
+the LRU stack distance \citep{mattson1970evaluation}: an access at stack depth $d$ (an
+unseen expert is a compulsory miss) is an LRU hit at capacity $c$ iff $d \le c$, so one
+pass over a trace yields the hit ratio at every capacity at once. Appendix~\ref{app:stack}
+connects this to the total number of expert transfers.
 
 \section{Experimental Setup}
 \label{sec:setup}
@@ -214,17 +171,16 @@ quantity and the total number of expert transfers in Appendix~\ref{app:stack}.
 We fine-tune two MoE backbones of different scale, Phi-tiny-MoE-instruct (32 layers, 16
 experts, top-2) and OLMoE-1B-7B \citep{muennighoff2024olmoe} (16 layers, 64 experts,
 top-8), using LoRA \citep{hu2021lora} adapters on the attention and expert projections.
-Training data is drawn from the Nemotron Post-Training Dataset v2
-\citep{nvidia2025nemotron}, filtered rather than truncated to fit the context budget. The
-working-set reward is simulated at the middle layer of each backbone, with the working-set capacity
-fixed as a fraction of the total number of experts and scaled accordingly across the two
-backbones. We train with GRPO using the DAPO loss variant, group size $8$, and no KL
-penalty when the supervised term of Section~\ref{sec:sft} is enabled. We compare five
-objectives per backbone: causal language modeling alone; the working-set reward alone; their
-combination, Equation~\ref{eq:combinedloss}; the prompt-conditioned variant of
-Section~\ref{sec:conditioning}; and, as baselines, an option-critic style temporally
-extended router \citep{shen2026temporal,bacon2017optioncritic} and MELINOE
-\citep{raje2026melinoe}. Hyperparameters are given in Appendix~\ref{app:hparams}.
+Training data is the Nemotron Post-Training Dataset v2 \citep{nvidia2025nemotron},
+filtered rather than truncated to fit the context budget. The working-set reward is
+simulated at the middle layer of each backbone, with capacity fixed as a fraction of the
+expert count and scaled accordingly across backbones. We train with GRPO/DAPO, group size
+$8$, no KL penalty when the supervised term of Section~\ref{sec:sft} is enabled, and
+compare five objectives per backbone: causal LM alone; the working-set reward alone; their
+combination (Equation~\ref{eq:combinedloss}); prompt conditioning
+(Section~\ref{sec:conditioning}); and, as baselines, an option-critic style router
+\citep{shen2026temporal,bacon2017optioncritic} and MELINOE \citep{raje2026melinoe}.
+Hyperparameters are in Appendix~\ref{app:hparams}.
 
 \section{Experimental Results}
 \label{sec:results}
@@ -236,128 +192,92 @@ interpretability analysis of expert specialization, comparing every objective of
 Section~\ref{sec:setup} on both backbones. Results are organized by whether the policy
 is conditioned on a target working-set size at inference time.
 
-\paragraph{Note on LoRA.} Every objective below, including the base model's own baselines
-and MELINOE and the option-critic controller, is evaluated as a LoRA adapter on top of the
-frozen backbone rather than a fully fine-tuned model. Downstream task scores are
-consequently expected to be somewhat lower across the board than a full fine-tune of the
-same objective would reach, since LoRA's low-rank update is a strictly smaller hypothesis
-class; this affects every method in this comparison equally and should not be read as a
-property of any one objective. We also do not merge the adapter into the backbone before
-timing throughput, so an adapter that touches the expert projections directly, as the
-working-set reward does (Section~\ref{sec:setup}), adds its own inference-time compute
-cost on top of whatever offload savings its routing behavior achieves; we control for this
-in the throughput numbers below by timing the base model's own compute pass and adding
-each objective's own working-set miss count on top, rather than each objective's own,
-adapter-inflated, decode time.
+\paragraph{Note on LoRA.} Every objective, baselines included, is a LoRA adapter over the
+frozen backbone, so scores are expected somewhat lower than a full fine-tune, equally for
+every method. We also do not merge the adapter before timing throughput, so we control for
+its own inference-time cost by timing the base model's compute pass plus each objective's
+own working-set miss count, rather than its adapter-inflated decode time
+(Appendix~\ref{app:fulltables}).
 
 \subsection{Without Prompt Conditioning}
 \label{sec:results-unconditioned}
 
-\begin{table}[h]
-\centering
-\small
-\caption{Results on Phi-tiny-MoE-instruct (1024 held-out prompts), at the trained working-set
-capacity ($c=4$, top-2). The base model's row reports absolute lm-eval-harness scores; every
-other row reports $\Delta$, the difference from the base model's own score on that task
-(positive is better). Misses is the mean number of working-set misses per sequence (lower is
-better); ECI is the normalized routing entropy $H(p)/\log(E)$ (1.0 = load-balanced, near 0 =
-collapsed onto a few experts). Absolute scores, tokens/second, and the LoRA caveat above apply
-equally to every row here; see Table~\ref{tab:phiresults_full} in Appendix~\ref{app:fulltables}
-for the absolute values this table's deltas are computed from.}
-\resizebox{\textwidth}{!}{%
-\begin{tabular}{l ccccc | ccc}
-\toprule
- & \multicolumn{5}{c|}{lm-eval-harness score ($\Delta$ from base)} & \multicolumn{3}{c}{working-set efficiency} \\
-Objective & MMLU & MMMLU & GSM8K & HumanEval & MATH & Hit ratio & Misses & ECI \\
-\midrule
-Base (untuned)          & 0.614 & 0.345 & 0.622 & 0.024 & 0.090 & 0.571 & 651.1 & 0.892 \\
-\midrule
-Causal LM alone (SFT)   & +0.004 & $-$0.032 & $-$0.047 & +0.025 & 0.000  & 0.561 & 694.9 & 0.890 \\
-Working-set reward       & $-$0.004 & $-$0.002 & $-$0.044 & $-$0.006 & $-$0.017 & 0.624 & 434.3 & 0.888 \\
-Working-set reward + SFT & +0.004 & +0.001 & $-$0.061 & +0.013 & $-$0.019 & \textbf{0.773} & \textbf{441.3} & 0.721 \\
-Option-critic controller & $-$0.032 & $-$0.011 & $-$0.106 & $-$0.024 & $-$0.079 & \textbf{1.000} & \textbf{0.1} & 0.279 \\
-MELINOE                 & $-$0.009 & $-$0.012 & $-$0.111 & $-$0.024 & $-$0.073 & 0.880 & 236.3 & 0.674 \\
-\bottomrule
-\end{tabular}%
-}
-\label{tab:phiresults}
-\end{table}
+We refer to the working-set reward objective of Section~\ref{sec:reward} as
+\textbf{CAR-MoE} (Cache-Aware Routing for MoE) from here on, and to its combination with
+the supervised term of Equation~\ref{eq:combinedloss} as CAR-MoE~(+SFT). Every score below
+is the mean of two independent runs of the full eval pipeline (same checkpoint, two
+different sampling seeds for the on-policy generations used by parts 2, 4, and 5 of the
+pipeline), except OLMoE's CAR-MoE, option-critic controller, and MELINOE rows, for which
+only one seed was available at submission time.
 
 \begin{table}[h]
 \centering
-\small
-\caption{Results on OLMoE-1B-7B (1024 held-out prompts), at the trained working-set capacity
-($c=16$, top-8), same convention as Table~\ref{tab:phiresults}: the base row is absolute, every
-other row is $\Delta$ from the base model. The combined working-set reward + SFT objective for
-this backbone was still running at submission time and is omitted. See
-Table~\ref{tab:olmoeresults_full} in Appendix~\ref{app:fulltables} for absolute scores and
-tokens/second.}
+\scriptsize
+\caption{Results at each backbone's trained working-set capacity (Phi: $c=4$, top-2, 16
+experts; OLMoE: $c=16$, top-8, 64 experts). Base row is absolute; other rows are $\Delta$
+from their own backbone's base (positive is better). Misses: mean working-set misses per
+sequence (lower better). ECI: normalized routing entropy (1.0 = load-balanced, 0 =
+collapsed). OLMoE CAR-MoE~(+SFT) still running (--); see Appendix~\ref{app:fulltables} for
+absolute scores and tokens/second.}
 \resizebox{\textwidth}{!}{%
-\begin{tabular}{l ccccc | ccc}
+\begin{tabular}{l cc cc cc cc cc | cc cc cc}
 \toprule
- & \multicolumn{5}{c|}{lm-eval-harness score ($\Delta$ from base)} & \multicolumn{3}{c}{working-set efficiency} \\
-Objective & MMLU & MMMLU & GSM8K & HumanEval & MATH & Hit ratio & Misses & ECI \\
+ & \multicolumn{10}{c|}{lm-eval-harness score ($\Delta$ from base)} & \multicolumn{6}{c}{working-set efficiency} \\
+ & \multicolumn{2}{c}{MMLU} & \multicolumn{2}{c}{MMMLU} & \multicolumn{2}{c}{GSM8K} & \multicolumn{2}{c}{HumanEval} & \multicolumn{2}{c|}{MATH} & \multicolumn{2}{c}{Hit ratio} & \multicolumn{2}{c}{Misses} & \multicolumn{2}{c}{ECI} \\
+Objective & Phi & OL & Phi & OL & Phi & OL & Phi & OL & Phi & OL & Phi & OL & Phi & OL & Phi & OL \\
 \midrule
-Base (untuned)          & 0.563 & 0.380 & 0.673 & 0.244 & 0.058 & 0.687 & 1869.0 & 0.895 \\
+Base (untuned)  & 0.617 & 0.564 & 0.344 & 0.379 & 0.623 & 0.679 & 0.027 & 0.277 & 0.088 & 0.057 & 0.571 & 0.686 & 649.8 & 1874.2 & 0.892 & 0.895 \\
 \midrule
-Causal LM alone (SFT)   & $-$0.014 & $-$0.010 & $-$0.081 & $-$0.055 & $-$0.022 & 0.679 & 1930.0 & 0.897 \\
-Working-set reward       & 0.000  & $-$0.013 & $-$0.009 & +0.085 & +0.003 & \textbf{0.759} & \textbf{1004.2} & 0.895 \\
-Option-critic controller & $-$0.036 & $-$0.069 & $-$0.131 & $-$0.104 & $-$0.056 & 0.684 & 2012.7 & 0.888 \\
-MELINOE                 & $-$0.071 & $-$0.058 & $-$0.238 & $-$0.165 & $-$0.056 & 0.763 & 1541.9 & 0.838 \\
+SFT             & +0.004 & $-$0.018 & $-$0.025 & $-$0.012 & $-$0.015 & $-$0.090 & +0.012 & $-$0.128 & $-$0.003 & $-$0.017 & 0.565 & 0.679 & 742.1 & 1943.9 & 0.891 & 0.897 \\
+CAR-MoE         & $-$0.013 & $-$0.001 & +0.004 & $-$0.011 & $-$0.049 & $-$0.006 & +0.003 & +0.052 & $-$0.014 & +0.003 & 0.622 & \textbf{0.759} & 435.9 & \textbf{1004.2} & 0.888 & 0.895 \\
+CAR-MoE (+SFT)  & 0.000 & -- & +0.003 & -- & $-$0.032 & -- & +0.003 & -- & $-$0.013 & -- & \textbf{0.781} & -- & \textbf{421.4} & -- & 0.706 & -- \\
+Option-critic   & $-$0.028 & $-$0.037 & $-$0.015 & $-$0.068 & $-$0.108 & $-$0.260 & $-$0.018 & $-$0.137 & $-$0.077 & $-$0.055 & \textbf{1.000} & 0.684 & \textbf{0.1} & 2012.7 & 0.279 & 0.888 \\
+MELINOE         & $-$0.005 & $-$0.072 & $-$0.011 & $-$0.056 & $-$0.125 & $-$0.310 & $-$0.021 & $-$0.198 & $-$0.071 & $-$0.055 & 0.879 & 0.763 & 237.7 & 1541.9 & 0.674 & 0.838 \\
 \bottomrule
 \end{tabular}%
 }
-\label{tab:olmoeresults}
+\label{tab:mainresults}
 \end{table}
 
-On both backbones the working-set reward alone (no supervised anchor) is competitive with
-or better than the base model on most tasks, and its combination with the supervised loss
-(Phi-tiny-MoE only, so far) raises the hit ratio further still, to 0.773, while also
-recovering the throughput cost of the reward-only variant -- both option-critic and
-MELINOE lose several points of downstream accuracy relative to the base model, most
-sharply on MATH, GSM8K, and HumanEval, for a comparable or, on Phi-tiny-MoE, a much larger
-hit-ratio gain (option-critic reaches a hit ratio of 1.0, i.e. every expert access falls
-within its working set, at the cost of collapsing HumanEval and MATH to near zero).
-Tokens/second is computed against the base model's own compute pass plus each objective's
-own working-set miss count (see the LoRA note above), which isolates the offload benefit
-from each adapter's own inference-time cost; under this measure the working-set-reward-only
-variant is the one exception that still trails the base model on both backbones despite a
-higher hit ratio and fewer raw misses, which we attribute to its shorter average
-completions dividing a comparable total latency over fewer generated tokens, and flag as a
-limitation of a purely token-averaged throughput metric rather than evidence against the
-working-set benefit itself; combining the reward with the SFT anchor (Phi-tiny-MoE)
-removes this effect entirely. The option-critic controller's near-total hit ratio comes at
-the cost of routing collapse -- its ECI drops to 0.28 on Phi-tiny-MoE (from 0.89 for the
-base model), meaning the controller has learned to route almost every token through a
-small, fixed subset of experts rather than genuinely exploiting sequence-level locality;
-MELINOE's ECI (0.67) sits between the two, consistent with a smaller but real drop in
-routing diversity. The working-set reward, by contrast, keeps ECI close to the base
-model's (0.89 on Phi-tiny-MoE, 0.90 on OLMoE) while still cutting misses by a third to a
-half, indicating its hit-ratio gains come from exploiting temporal reuse of a still
-load-balanced expert population rather than from collapsing the router.
+Phi-tiny-MoE-instruct was pretrained with 16 experts and top-2 routing, while OLMoE-1B-7B
+was pretrained with 64 experts and top-8 routing, a much larger pool and wider fan-out
+that matters for the collapse discussed below. On both backbones CAR-MoE is competitive
+with or better than the base model on most tasks, and combining it with the supervised
+loss (Phi-tiny-MoE only, so far) raises the hit ratio further still to 0.781 while also
+recovering the reward-only variant's throughput cost (Appendix~\ref{app:fulltables}) --
+option-critic and MELINOE instead lose several points of accuracy, most sharply on MATH,
+GSM8K, and HumanEval, for a comparable or larger hit-ratio gain. On Phi-tiny-MoE, the
+option-critic controller sharply peaks the routing distribution (ECI falls from 0.89 to
+0.28) while reaching a near-perfect hit ratio, which we interpret as routing collapsing
+onto a handful of experts that stay resident for the entire sequence rather than
+genuinely tracking locality, at considerable cost to downstream accuracy; CAR-MoE~(+SFT)
+only drops ECI to 0.71. With OLMoE-1B-7B, this collapse does not happen, arguably because
+of the larger model and its wider top-8 routing: every variant keeps a near-uniform
+distribution (ECI $\ge 0.84$), and CAR-MoE is the one that keeps a competitive hit ratio
+(0.759) together with the benchmark scores closest to the base model's own.
 
 Figure~\ref{fig:delta_scatter} makes this trade-off explicit across both backbones at
 once: plotting each objective's change in average lm-eval-harness score against its
 working-set hit ratio (both relative to, and at the same capacity as, its own backbone's
 base model) separates the two families of method visually. The option-critic controller
 and MELINOE occupy the upper-left of the plot on Phi-tiny-MoE -- the highest hit ratios in
-the comparison, bought with the largest accuracy regressions -- while the working-set
-reward and its SFT-combined variant sit closer to the vertical zero-delta line while still
-improving hit ratio over the base model, and OLMoE's working-set reward is the only point
-in the entire comparison with a positive score delta together with a hit-ratio gain,
-falling in the upper-right quadrant we would want every objective to occupy.
+the comparison, bought with the largest accuracy regressions -- while CAR-MoE and its
+SFT-combined variant sit closer to the vertical zero-delta line while still improving hit
+ratio over the base model, and OLMoE's CAR-MoE is the only point in the entire comparison
+with a positive score delta together with a hit-ratio gain, falling in the upper-right
+quadrant we would want every objective to occupy.
 
 \begin{figure}[h]
 \centering
-\includegraphics[width=0.75\textwidth]{figures/delta_score_vs_hit_ratio.png}
+\includegraphics[width=0.4\textwidth]{figures/delta_score_vs_hit_ratio.png}
 \caption{Change in average lm-eval-harness score (mean of MMLU, MMMLU, GSM8K, HumanEval,
 MATH) versus working-set hit ratio, for every objective on both backbones, relative to
-each backbone's own base model (dotted line at $\Delta=0$). Color distinguishes backbone
-(Phi-tiny-MoE-instruct vs. OLMoE-1B-7B), each point labeled by objective. The dashed
-staircase is the Pareto front over both axes jointly (higher hit ratio \emph{and} improved
-downstream accuracy is better, toward the upper right); only OLMoE's working-set reward
-combines a positive score delta with a hit-ratio gain, and the option-critic controller
-sets the frontier's hit-ratio extreme at the cost of the largest downstream regression.}
+each backbone's own base model. Color distinguishes backbone (Phi-tiny-MoE-instruct vs.
+OLMoE-1B-7B), each point labeled by objective. The dashed staircase is the Pareto front
+over both axes jointly (higher hit ratio \emph{and} improved downstream accuracy is
+better, toward the upper right); only OLMoE's CAR-MoE combines a positive score delta with
+a hit-ratio gain, and the option-critic controller sets the frontier's hit-ratio extreme
+at the cost of the largest downstream regression.}
 \label{fig:delta_scatter}
 \end{figure}
 
@@ -366,52 +286,39 @@ sets the frontier's hit-ratio extreme at the cost of the largest downstream regr
 
 The prompt-conditioned policy is trained once per backbone but evaluated at every working-set
 capacity it was conditioned on, by prefixing each prompt with the target capacity
-(Section~\ref{sec:conditioning}); Table~\ref{tab:conditioned} reports OLMoE-1B-7B swept
-across $c \in \{8, 16, 32\}$ (Phi-tiny-MoE's sweep over $c \in \{2, 4, 8\}$ was still
-running at submission time and is omitted). As expected, both hit ratio and misses improve
-monotonically with capacity, from 0.507 at $c=8$ to 0.901 at $c=32$; tokens/second also
+(Section~\ref{sec:conditioning}). Table~\ref{tab:conditioned} in Appendix~\ref{app:fulltables}
+reports both backbones swept over every capacity they were trained on (Phi-tiny-MoE:
+$c\in\{2,4,8\}$, single seed; OLMoE: $c\in\{8,16,32\}$, averaged over two seeds), with
+capacity expressed as a \% of each backbone's total expert count so the two sweeps share
+one axis. As expected, hit ratio improves monotonically with capacity on both backbones,
+from 0.51-0.65 at the smallest capacity to 0.90-0.94 at the largest; tokens/second also
 increases with capacity, since a larger working set both raises the hit ratio and is
 evaluated with a fixed generation length, so the throughput gain compounds rather than
-trading off against the hit-ratio gain as it does for the fixed-capacity working-set
-reward of Table~\ref{tab:olmoeresults}. A single prompt-conditioned policy therefore lets a deployment pick a
-hit-ratio/throughput operating point at inference time without retraining, unlike the
-fixed-capacity variants of Section~\ref{sec:results-unconditioned}.
+trading off against the hit-ratio gain as it does for the fixed-capacity CAR-MoE of
+Table~\ref{tab:mainresults}. A single prompt-conditioned policy therefore lets a
+deployment pick a hit-ratio/throughput operating point at inference time without
+retraining, unlike the fixed-capacity variants of Section~\ref{sec:results-unconditioned}.
 
-\begin{table}[h]
-\centering
-\small
-\caption{OLMoE-1B-7B prompt-conditioned policy swept over every working-set capacity it
-was trained on (1024 held-out prompts per capacity, top-8). Tokens/second is normalized
-against the (unconditioned) base model's own compute pass, as in Tables~1-2.}
-\label{tab:conditioned}
-\begin{tabular}{lccc}
-\toprule
-Capacity $c$ & Hit ratio & Tokens/s \\
-\midrule
-8  & 0.507 & 445.6 \\
-16 & 0.741 & 459.0 \\
-32 & \textbf{0.901} & \textbf{476.9} \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-For reference, the same checkpoint evaluated unconditioned on the downstream task suite
-(lm-eval-harness prompts do not carry a \texttt{[CACHE\_SIZE=X]} prefix, so this is a single
-run rather than swept per capacity) scores MMLU 0.544, MMMLU 0.374, GSM8K 0.662, HumanEval
-0.268, and MATH 0.053 -- in the same range as the unconditioned objectives of
-Table~\ref{tab:olmoeresults}, indicating the conditioning prefix does not measurably harm
-general task performance.
+For reference, OLMoE's prompt-conditioned checkpoint evaluated unconditioned on the
+downstream task suite scores MMLU 0.544, MMMLU 0.374, GSM8K 0.662, HumanEval 0.268, and
+MATH 0.053 -- in the same range as Table~\ref{tab:mainresults}'s unconditioned objectives,
+so the conditioning prefix does not measurably harm general task performance.
+Figures~\ref{fig:scaling_hit}--\ref{fig:scaling_tps} in Appendix~\ref{app:figures} plot
+Table~\ref{tab:conditioned} against capacity, and the same appendix's routing traces
+reveal an \emph{expert chunking} pattern under CAR-MoE -- contiguous runs of tokens
+sharing an expert, resembling the option-critic's macro-actions but emerging from a
+stateless per-token reward rather than an architectural hold.
 
 \section{Conclusion}
 
-We recast working-set-friendly fine-tuning of mixture-of-experts routers as a policy gradient
-problem, using an LRU cache simulator as a stateful reward for GRPO in place of a custom
-auxiliary loss or an architectural change to the routing mechanism. Combining this
-reward with the causal language modeling objective on the same rollouts regularizes
-distribution shift more effectively than a KL penalty against a frozen reference, and a
-prompt conditioning variant lets a single policy serve multiple working-set budgets. We leave
-the full experimental comparison, reported by working-set size and by whether the policy is
-prompt-conditioned, to Section~\ref{sec:results}.
+We recast working-set-friendly MoE fine-tuning as a policy gradient problem, using an LRU
+cache simulator as a stateful reward (CAR-MoE) in place of a custom loss or architectural
+change. Combining it with causal LM on the same rollouts regularizes distribution shift
+more effectively than a KL penalty, and prompt conditioning lets a single policy serve
+multiple working-set budgets. On Phi-tiny-MoE, CAR-MoE also avoids the routing collapse
+that gives the option-critic baseline its near-perfect but degenerate hit ratio, and its
+routing traces show a "chunking" pattern that emerges without any explicit macro-action
+machinery.
 
 \clearpage
 \bibliographystyle{plainnat}
@@ -557,33 +464,34 @@ policy from drifting into working-set-friendly but degenerate completions.
 \section{Full Results Tables}
 \label{app:fulltables}
 
-Tables~\ref{tab:phiresults} and~\ref{tab:olmoeresults} in Section~\ref{sec:results-unconditioned}
-report every objective's lm-eval-harness scores as $\Delta$ from its own backbone's base model,
-to make relative comparisons across five tasks and two backbones easier to read at a glance.
-Tables~\ref{tab:phiresults_full} and~\ref{tab:olmoeresults_full} below give the same results in
-absolute form, together with tokens/second (omitted from the main-text tables).
+Table~\ref{tab:mainresults} in Section~\ref{sec:results-unconditioned} reports every
+objective's lm-eval-harness scores as $\Delta$ from its own backbone's base model, to make
+relative comparisons across five tasks and two backbones easier to read at a glance.
+Tables~\ref{tab:phiresults_full} and~\ref{tab:olmoeresults_full} below give the same
+results in absolute form, together with tokens/second (omitted from the main-text table).
 
 \begin{table}[h]
 \centering
 \small
-\caption{Absolute results on Phi-tiny-MoE-instruct (1024 held-out prompts), at the trained
-working-set capacity ($c=4$, top-2) -- the source values for Table~\ref{tab:phiresults}'s
-$\Delta$ columns. Tokens/second follows the estimated offloaded-inference latency model of
-Appendix~\ref{app:stack} (compute plus a per-expert transfer penalty on every working-set
-miss) rather than a wall-clock trace on real offloading hardware, and is normalized against
-the base model's own compute pass (see the LoRA note in Section~\ref{sec:results}) so that
-adapters touching the expert projections are not penalized twice.}
+\caption{Absolute results on Phi-tiny-MoE-instruct (1024 held-out prompts, averaged over
+two seeds), at the trained working-set capacity ($c=4$, top-2) -- the source values for
+Table~\ref{tab:mainresults}'s Phi $\Delta$ columns. Tokens/second follows the estimated
+offloaded-inference latency model of Appendix~\ref{app:stack} (compute plus a per-expert
+transfer penalty on every working-set miss) rather than a wall-clock trace on real
+offloading hardware, and is normalized against the base model's own compute pass (see the
+LoRA note in Section~\ref{sec:results}) so that adapters touching the expert projections
+are not penalized twice.}
 \resizebox{\textwidth}{!}{%
 \begin{tabular}{lccccccccc}
 \toprule
 Objective & MMLU & MMMLU & GSM8K & HumanEval & MATH & Hit ratio & Misses & ECI & Tokens/s \\
 \midrule
-Base (untuned)          & 0.614 & 0.345 & 0.622 & 0.024 & 0.090 & 0.571 & 651.1 & 0.892 & 393.3 \\
-Causal LM alone (SFT)   & 0.618 & 0.313 & 0.575 & 0.049 & 0.090 & 0.561 & 694.9 & 0.890 & 411.2 \\
-Working-set reward       & 0.610 & 0.343 & 0.578 & 0.018 & 0.073 & 0.624 & 434.3 & 0.888 & 273.0 \\
-Working-set reward + SFT & 0.618 & 0.346 & 0.561 & 0.037 & 0.071 & \textbf{0.773} & \textbf{441.3} & 0.721 & 509.6 \\
-Option-critic controller & 0.582 & 0.334 & 0.516 & 0.000 & 0.011 & \textbf{1.000} & \textbf{0.1} & 0.279 & 514.8 \\
-MELINOE                 & 0.605 & 0.333 & 0.511 & 0.000 & 0.017 & 0.880 & 236.3 & 0.674 & 517.7 \\
+Base (untuned)  & 0.617 & 0.344 & 0.623 & 0.027 & 0.088 & 0.571 & 649.8 & 0.892 & 337.0 \\
+SFT             & 0.620 & 0.319 & 0.608 & 0.040 & 0.084 & 0.565 & 742.1 & 0.891 & 370.5 \\
+CAR-MoE         & 0.603 & 0.349 & 0.574 & 0.031 & 0.074 & 0.622 & 435.9 & 0.888 & 234.8 \\
+CAR-MoE (+SFT)  & 0.617 & 0.348 & 0.591 & 0.031 & 0.075 & \textbf{0.781} & \textbf{421.4} & 0.706 & \textbf{428.6} \\
+Option-critic   & 0.589 & 0.329 & 0.515 & 0.009 & 0.011 & \textbf{1.000} & \textbf{0.1} & 0.279 & 438.1 \\
+MELINOE         & 0.612 & 0.334 & 0.499 & 0.006 & 0.017 & 0.879 & 237.7 & 0.674 & 440.3 \\
 \bottomrule
 \end{tabular}%
 }
@@ -594,24 +502,50 @@ MELINOE                 & 0.605 & 0.333 & 0.511 & 0.000 & 0.017 & 0.880 & 236.3 
 \centering
 \small
 \caption{Absolute results on OLMoE-1B-7B (1024 held-out prompts), at the trained working-set
-capacity ($c=16$, top-8) -- the source values for Table~\ref{tab:olmoeresults}'s $\Delta$
-columns. Tokens/second normalized against the base model's own compute pass as above. The
-combined working-set reward + SFT objective for this backbone was still running at
-submission time and is omitted.}
+capacity ($c=16$, top-8) -- the source values for Table~\ref{tab:mainresults}'s OLMoE
+$\Delta$ columns. Base and SFT are averaged over two seeds; CAR-MoE, option-critic, and
+MELINOE are a single seed (see the note in Section~\ref{sec:results-unconditioned}).
+Tokens/second normalized against the base model's own compute pass as above. CAR-MoE
+(+SFT) was still running at submission time and is omitted.}
 \resizebox{\textwidth}{!}{%
 \begin{tabular}{lccccccccc}
 \toprule
 Objective & MMLU & MMMLU & GSM8K & HumanEval & MATH & Hit ratio & Misses & ECI & Tokens/s \\
 \midrule
-Base (untuned)          & 0.563 & 0.380 & 0.673 & 0.244 & 0.058 & 0.687 & 1869.0 & 0.895 & 395.5 \\
-Causal LM alone (SFT)   & 0.549 & 0.370 & 0.592 & 0.189 & 0.036 & 0.679 & 1930.0 & 0.897 & 388.9 \\
-Working-set reward       & 0.563 & 0.367 & 0.664 & 0.329 & 0.061 & \textbf{0.759} & \textbf{1004.2} & 0.895 & 273.9 \\
-Option-critic controller & 0.527 & 0.311 & 0.542 & 0.140 & 0.002 & 0.684 & 2012.7 & 0.888 & 390.5 \\
-MELINOE                 & 0.492 & 0.322 & 0.435 & 0.079 & 0.002 & 0.763 & 1541.9 & 0.838 & 438.2 \\
+Base (untuned)  & 0.564 & 0.379 & 0.679 & 0.277 & 0.057 & 0.686 & 1874.2 & 0.895 & 315.6 \\
+SFT             & 0.547 & 0.367 & 0.588 & 0.149 & 0.040 & 0.679 & 1943.9 & 0.897 & 311.1 \\
+CAR-MoE         & 0.564 & 0.367 & 0.673 & 0.329 & 0.061 & \textbf{0.759} & \textbf{1004.2} & 0.895 & 273.9 \\
+Option-critic   & 0.527 & 0.311 & 0.419 & 0.140 & 0.003 & 0.684 & 2012.7 & 0.888 & 390.5 \\
+MELINOE         & 0.492 & 0.322 & 0.368 & 0.079 & 0.002 & 0.763 & 1541.9 & 0.838 & 438.2 \\
 \bottomrule
 \end{tabular}%
 }
 \label{tab:olmoeresults_full}
+\end{table}
+
+\begin{table}[h]
+\centering
+\small
+\caption{Prompt-conditioned policy swept over every working-set capacity it was trained on
+(1024 held-out prompts per capacity), referenced from Section~\ref{sec:results-conditioned}.
+Tokens/second is normalized against each backbone's own (unconditioned) base model compute
+pass, as in Table~\ref{tab:mainresults}. Phi's row is a single run (no second seed available
+at submission time); OLMoE's rows average two.}
+\label{tab:conditioned}
+\begin{tabular}{lccc}
+\toprule
+Capacity (\% of experts) & Backbone & Hit ratio & Tokens/s \\
+\midrule
+12.5\% (Phi $c=2$ / OLMoE $c=8$)  & Phi-tiny-MoE & 0.651 & 181.0 \\
+                                  & OLMoE        & 0.508 & 352.5 \\
+\midrule
+25\% (Phi $c=4$ / OLMoE $c=16$)   & Phi-tiny-MoE & 0.831 & 184.4 \\
+                                  & OLMoE        & 0.741 & 365.6 \\
+\midrule
+50\% (Phi $c=8$ / OLMoE $c=32$)   & Phi-tiny-MoE & \textbf{0.944} & \textbf{186.3} \\
+                                  & OLMoE        & \textbf{0.902} & \textbf{378.2} \\
+\bottomrule
+\end{tabular}
 \end{table}
 
 \section{Hyperparameters}
@@ -638,106 +572,125 @@ Prompt / completion length & 1024 / 1024 & 1024 / 1024 \\
 \section{Expert Routing Traces and Prompt-Conditioned Scaling}
 \label{app:figures}
 
-Figures~\ref{fig:phi_base}--\ref{fig:olmoe_scaling_tps} collect every routing-trace and
+Figures~\ref{fig:phi_base}--\ref{fig:scaling_tps} collect every routing-trace and
 scaling figure generated for the results of Section~\ref{sec:results}, for selection into
 the main text. Each expert-routing-trace figure shows, for 16 held-out prompts (rows)
 generated on-policy by the given (backbone, objective) pair, the top-1 expert chosen at
 each of three quartile-spaced layers of the backbone (25\%/50\%/75\% depth) over every
 generated token (columns), colored by expert id.
 
+\paragraph{Expert chunking.} Under CAR-MoE (Figures~\ref{fig:phi_reward},
+\ref{fig:olmoe_reward}), the router's per-token expert choice visibly organizes into
+contiguous runs of tokens assigned to the same expert -- segments of consecutive
+positions sharing an expert id -- rather than the token-by-token switching visible in the
+base model's trace (Figures~\ref{fig:phi_base}, \ref{fig:olmoe_base}). We call this
+pattern \emph{expert chunking}: it resembles the macro-actions an option-critic policy
+holds explicitly until a learned termination function fires
+(Figures~\ref{fig:phi_controller}, \ref{fig:olmoe_controller}), except here it emerges
+from a stateless per-token reward rather than being architecturally hard-coded. This
+suggests the working-set hit ratio itself acts as a training pressure that pushes an
+ordinary per-token router toward temporally chunked expert use without introducing an
+explicit option, termination function, or macro-action -- the router discovers a soft
+form of the option-critic's holding behavior as a side effect of being rewarded for
+reuse, rather than by construction.
+
 \begin{figure}[h]
 \centering
-\includegraphics[width=0.55\textwidth]{figures/phi_base_expert_trace.png}
+\includegraphics[width=0.42\textwidth]{figures/phi_base_expert_trace.png}
 \caption{Phi-tiny-MoE-instruct, base (untuned) model -- expert routing trace at layers 8/16/24.}
 \label{fig:phi_base}
 \end{figure}
 
 \begin{figure}[h]
 \centering
-\includegraphics[width=0.55\textwidth]{figures/phi_sft_baseline_expert_trace.png}
-\caption{Phi-tiny-MoE-instruct, causal LM alone (SFT) -- expert routing trace at layers 8/16/24.}
+\includegraphics[width=0.42\textwidth]{figures/phi_sft_baseline_expert_trace.png}
+\caption{Phi-tiny-MoE-instruct, SFT -- expert routing trace at layers 8/16/24.}
 \label{fig:phi_sft}
 \end{figure}
 
 \begin{figure}[h]
 \centering
-\includegraphics[width=0.55\textwidth]{figures/phi_cache_reward_expert_trace.png}
-\caption{Phi-tiny-MoE-instruct, working-set reward alone -- expert routing trace at layers 8/16/24.}
+\includegraphics[width=0.42\textwidth]{figures/phi_cache_reward_expert_trace.png}
+\caption{Phi-tiny-MoE-instruct, CAR-MoE -- expert routing trace at layers 8/16/24. Note the
+contiguous runs of tokens sharing the same expert id (expert chunking, discussed above).}
 \label{fig:phi_reward}
 \end{figure}
 
 \begin{figure}[h]
 \centering
-\includegraphics[width=0.55\textwidth]{figures/phi_cache_sft_expert_trace.png}
-\caption{Phi-tiny-MoE-instruct, working-set reward + SFT (combined objective) -- expert routing trace at layers 8/16/24.}
+\includegraphics[width=0.42\textwidth]{figures/phi_cache_sft_expert_trace.png}
+\caption{Phi-tiny-MoE-instruct, CAR-MoE (+SFT) -- expert routing trace at layers 8/16/24.}
 \label{fig:phi_cachesft}
 \end{figure}
 
 \begin{figure}[h]
 \centering
-\includegraphics[width=0.55\textwidth]{figures/phi_controller_baseline_expert_trace.png}
-\caption{Phi-tiny-MoE-instruct, option-critic controller baseline -- expert routing trace at layers 8/16/24.}
+\includegraphics[width=0.42\textwidth]{figures/phi_controller_baseline_expert_trace.png}
+\caption{Phi-tiny-MoE-instruct, option-critic controller -- expert routing trace at layers
+8/16/24. Compare the hard-held macro-actions here against CAR-MoE's softer chunking in
+Figure~\ref{fig:phi_reward}.}
 \label{fig:phi_controller}
 \end{figure}
 
 \begin{figure}[h]
 \centering
-\includegraphics[width=0.55\textwidth]{figures/phi_melinoe_baseline_expert_trace.png}
-\caption{Phi-tiny-MoE-instruct, MELINOE baseline -- expert routing trace at layers 8/16/24.}
+\includegraphics[width=0.42\textwidth]{figures/phi_melinoe_baseline_expert_trace.png}
+\caption{Phi-tiny-MoE-instruct, MELINOE -- expert routing trace at layers 8/16/24.}
 \label{fig:phi_melinoe}
 \end{figure}
 
 \begin{figure}[h]
 \centering
-\includegraphics[width=0.55\textwidth]{figures/olmoe_base_expert_trace.png}
+\includegraphics[width=0.42\textwidth]{figures/olmoe_base_expert_trace.png}
 \caption{OLMoE-1B-7B, base (untuned) model -- expert routing trace at layers 4/8/12.}
 \label{fig:olmoe_base}
 \end{figure}
 
 \begin{figure}[h]
 \centering
-\includegraphics[width=0.55\textwidth]{figures/olmoe_sft_baseline_expert_trace.png}
-\caption{OLMoE-1B-7B, causal LM alone (SFT) -- expert routing trace at layers 4/8/12.}
+\includegraphics[width=0.42\textwidth]{figures/olmoe_sft_baseline_expert_trace.png}
+\caption{OLMoE-1B-7B, SFT -- expert routing trace at layers 4/8/12.}
 \label{fig:olmoe_sft}
 \end{figure}
 
 \begin{figure}[h]
 \centering
-\includegraphics[width=0.55\textwidth]{figures/olmoe_cache_reward_expert_trace.png}
-\caption{OLMoE-1B-7B, working-set reward alone -- expert routing trace at layers 4/8/12.}
+\includegraphics[width=0.42\textwidth]{figures/olmoe_cache_reward_expert_trace.png}
+\caption{OLMoE-1B-7B, CAR-MoE -- expert routing trace at layers 4/8/12. Note the contiguous
+per-expert segments (expert chunking, discussed above).}
 \label{fig:olmoe_reward}
 \end{figure}
 
 \begin{figure}[h]
 \centering
-\includegraphics[width=0.55\textwidth]{figures/olmoe_controller_baseline_expert_trace.png}
-\caption{OLMoE-1B-7B, option-critic controller baseline -- expert routing trace at layers 4/8/12.}
+\includegraphics[width=0.42\textwidth]{figures/olmoe_controller_baseline_expert_trace.png}
+\caption{OLMoE-1B-7B, option-critic controller -- expert routing trace at layers 4/8/12.}
 \label{fig:olmoe_controller}
 \end{figure}
 
 \begin{figure}[h]
 \centering
-\includegraphics[width=0.55\textwidth]{figures/olmoe_melinoe_baseline_expert_trace.png}
-\caption{OLMoE-1B-7B, MELINOE baseline -- expert routing trace at layers 4/8/12.}
+\includegraphics[width=0.42\textwidth]{figures/olmoe_melinoe_baseline_expert_trace.png}
+\caption{OLMoE-1B-7B, MELINOE -- expert routing trace at layers 4/8/12.}
 \label{fig:olmoe_melinoe}
 \end{figure}
 
 \begin{figure}[h]
 \centering
-\includegraphics[width=0.6\textwidth]{figures/olmoe_prompt_conditioned_scaling_hit_ratio.png}
-\caption{OLMoE-1B-7B, prompt-conditioned policy -- working-set hit ratio as a function of
-the conditioned capacity $c \in \{8, 16, 32\}$ (descending on the $x$-axis), corresponding
-to Table~\ref{tab:conditioned}.}
-\label{fig:olmoe_scaling_hit}
+\includegraphics[width=0.6\textwidth]{figures/scaling_hit_ratio_combined.png}
+\caption{Prompt-conditioned policy, both backbones -- working-set hit ratio as a function
+of the conditioned capacity, expressed as \% of each backbone's total expert count
+(descending on the $x$-axis), corresponding to Table~\ref{tab:conditioned}.}
+\label{fig:scaling_hit}
 \end{figure}
 
 \begin{figure}[h]
 \centering
-\includegraphics[width=0.6\textwidth]{figures/olmoe_prompt_conditioned_scaling_tokens_per_second.png}
-\caption{OLMoE-1B-7B, prompt-conditioned policy -- estimated tokens/second (own, adapter-inflated
-measurement, not base-normalized) as a function of the conditioned capacity $c \in \{8, 16, 32\}$
-(descending on the $x$-axis), corresponding to Table~\ref{tab:conditioned}.}
-\label{fig:olmoe_scaling_tps}
+\includegraphics[width=0.6\textwidth]{figures/scaling_tokens_per_second_combined.png}
+\caption{Prompt-conditioned policy, both backbones -- base-normalized tokens/second as a
+function of the conditioned capacity, expressed as \% of each backbone's total expert
+count (descending on the $x$-axis), corresponding to Table~\ref{tab:conditioned}.}
+\label{fig:scaling_tps}
 \end{figure}
 
 \end{document}

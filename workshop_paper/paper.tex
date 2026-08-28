@@ -14,16 +14,23 @@
 \usepackage{amssymb}
 \usepackage{nicefrac}
 \usepackage{microtype}
-\usepackage{xcolor}
+\usepackage[table]{xcolor}
 \usepackage{graphicx}
+\usepackage{wrapfig}
 
-\title{Working-Set-Aware Policy Gradients for Efficient Mixture-of-Experts Inference}
+\title{Towards Efficient Mixture of Experts with Cache-Aware Routing}
 \workshoptitle{NeurIPS 2026 Workshop on Efficient Systems for Foundation Models}
 
 \author{
   Diego Calanzone \\
   Mila, Quebec AI Institute \\
-  \texttt{diego.calanzone@mila.quebec}
+  \texttt{diego.calanzone@mila.quebec} \\[1em]
+  Riyasat Ohib \\
+  Georgia Institute of Technology \\
+  \texttt{PLACEHOLDER@gatech.edu} \\[1em]
+  Pierre-Luc Bacon \\
+  Mila, Quebec AI Institute; Universit\'e de Montr\'eal \\
+  \texttt{PLACEHOLDER@umontreal.ca}
 }
 
 \begin{document}
@@ -83,6 +90,14 @@ distribution shift more effectively than a KL penalty or distillation-style rewa
 we introduce a prompt-conditioning variant letting one policy target different
 working-set budgets by reading a literal instruction from its own prompt.
 
+Our contributions are: (i) a simple method, CAR-MoE, that increases MoE inference
+efficiency using a standard, off-the-shelf policy gradient algorithm rather than a custom
+loss or architectural change; (ii) a cache-conditioning procedure that trains a single MoE
+policy to operate at multiple working-set efficiency levels, selectable at deployment
+time; and (iii) a comparison of existing cache-friendly MoE methods along benchmark
+performance, efficiency, and routing patterns, revealing an emergent segmentation of
+experts by contiguous token spans under CAR-MoE.
+
 \section{Methodology}
 
 \subsection{Stateful Working-Set Reward}
@@ -111,8 +126,7 @@ where $T$ is the number of generated tokens and $R(x, y)$ is the sequence-level 
 handed to GRPO. This reward is stateful, since the value assigned to a token depends on
 the entire working-set trajectory up to that point, but it requires no additional trainable
 parameters and no assumption about which eviction policy the router should be tailored
-to beyond the choice of $c$. We give the full derivation of the reward and its
-relationship to the classical LRU stack algorithm in Appendix~\ref{app:stack}.
+to beyond the choice of $c$.
 
 \subsection{Prompt Conditioning}
 \label{sec:conditioning}
@@ -153,17 +167,13 @@ effectively than a KL penalty or distillation-style reward (Appendix~\ref{app:sf
 \subsection{Metrics}
 \label{sec:metrics}
 
-\paragraph{Working-set hit ratio.} At evaluation time we replace the soft reward with its
-hard counterpart, using deterministic top-$K$ routing to match real deployment behavior.
-The hit ratio of a rollout is
+At evaluation time we replace the soft reward with its hard counterpart, using
+deterministic top-$K$ routing to match real deployment behavior. The working-set hit
+ratio of a rollout is
 $h_t = \frac{1}{K} \sum_{e \in e_t} \mathbb{1}[e \in \mathcal{C}_{t^-}]$, averaged over
-generated tokens.
-
-\paragraph{Stack distance.} Since hit ratio is a function of capacity $c$, we also report
-the LRU stack distance \citep{mattson1970evaluation}: an access at stack depth $d$ (an
-unseen expert is a compulsory miss) is an LRU hit at capacity $c$ iff $d \le c$, so one
-pass over a trace yields the hit ratio at every capacity at once. Appendix~\ref{app:stack}
-connects this to the total number of expert transfers.
+generated tokens; a working-set miss inserts the requested expert and evicts the
+least-recently-used one once capacity is exceeded, and we report the mean number of
+misses per sequence alongside the hit ratio.
 
 \section{Experimental Setup}
 \label{sec:setup}
@@ -187,7 +197,7 @@ Hyperparameters are in Appendix~\ref{app:hparams}.
 
 We report downstream task performance (MMLU \citep{hendrycks2021mmlu}, MMMLU, GSM8K
 \citep{cobbe2021gsm8k}, HumanEval \citep{chen2021humaneval}, and MATH
-\citep{hendrycks2021math}), working-set efficiency (hit ratio, stack distance, throughput), and an
+\citep{hendrycks2021math}), working-set efficiency (hit ratio, misses, ECI, throughput), and an
 interpretability analysis of expert specialization, comparing every objective of
 Section~\ref{sec:setup} on both backbones. Results are organized by whether the policy
 is conditioned on a target working-set size at inference time.
@@ -215,24 +225,25 @@ only one seed was available at submission time.
 \scriptsize
 \caption{Results at each backbone's trained working-set capacity (Phi: $c=4$, top-2, 16
 experts; OLMoE: $c=16$, top-8, 64 experts). Base row is absolute; other rows are $\Delta$
-from their own backbone's base (positive is better). Misses: mean working-set misses per
-sequence (lower better). ECI: normalized routing entropy (1.0 = load-balanced, 0 =
-collapsed). OLMoE CAR-MoE~(+SFT) still running (--); see Appendix~\ref{app:fulltables} for
-absolute scores and tokens/second.}
+from their own backbone's base (positive is better). Avg~$\Delta$: mean of the five task
+deltas. Misses: mean working-set misses per sequence (lower better). ECI: normalized
+routing entropy (1.0 = load-balanced, 0 = collapsed). Our CAR-MoE objectives are
+highlighted; OLMoE CAR-MoE~(+SFT) was still running at submission time (--). See
+Appendix~\ref{app:fulltables} for absolute scores and tokens/second.}
 \resizebox{\textwidth}{!}{%
-\begin{tabular}{l cc cc cc cc cc | cc cc cc}
+\begin{tabular}{l cc cc cc cc cc cc | cc cc cc}
 \toprule
- & \multicolumn{10}{c|}{lm-eval-harness score ($\Delta$ from base)} & \multicolumn{6}{c}{working-set efficiency} \\
- & \multicolumn{2}{c}{MMLU} & \multicolumn{2}{c}{MMMLU} & \multicolumn{2}{c}{GSM8K} & \multicolumn{2}{c}{HumanEval} & \multicolumn{2}{c|}{MATH} & \multicolumn{2}{c}{Hit ratio} & \multicolumn{2}{c}{Misses} & \multicolumn{2}{c}{ECI} \\
-Objective & Phi & OL & Phi & OL & Phi & OL & Phi & OL & Phi & OL & Phi & OL & Phi & OL & Phi & OL \\
+ & \multicolumn{12}{c|}{lm-eval-harness score ($\Delta$ from base)} & \multicolumn{6}{c}{working-set efficiency} \\
+ & \multicolumn{2}{c}{MMLU} & \multicolumn{2}{c}{MMMLU} & \multicolumn{2}{c}{GSM8K} & \multicolumn{2}{c}{HumanEval} & \multicolumn{2}{c}{MATH} & \multicolumn{2}{c|}{Avg $\Delta$} & \multicolumn{2}{c}{Hit ratio} & \multicolumn{2}{c}{Misses} & \multicolumn{2}{c}{ECI} \\
+Objective & Phi & OL & Phi & OL & Phi & OL & Phi & OL & Phi & OL & Phi & OL & Phi & OL & Phi & OL & Phi & OL \\
 \midrule
-Base (untuned)  & 0.617 & 0.564 & 0.344 & 0.379 & 0.623 & 0.679 & 0.027 & 0.277 & 0.088 & 0.057 & 0.571 & 0.686 & 649.8 & 1874.2 & 0.892 & 0.895 \\
+Base (untuned) & 0.62 & 0.56 & 0.34 & 0.38 & 0.62 & 0.68 & 0.03 & 0.28 & 0.09 & 0.06 & -- & -- & 0.57 & 0.69 & 649.8 & 1874.2 & 0.89 & 0.90 \\
 \midrule
-SFT             & +0.004 & $-$0.018 & $-$0.025 & $-$0.012 & $-$0.015 & $-$0.090 & +0.012 & $-$0.128 & $-$0.003 & $-$0.017 & 0.565 & 0.679 & 742.1 & 1943.9 & 0.891 & 0.897 \\
-CAR-MoE         & $-$0.013 & $-$0.001 & +0.004 & $-$0.011 & $-$0.049 & $-$0.006 & +0.003 & +0.052 & $-$0.014 & +0.003 & 0.622 & \textbf{0.759} & 435.9 & \textbf{1004.2} & 0.888 & 0.895 \\
-CAR-MoE (+SFT)  & 0.000 & -- & +0.003 & -- & $-$0.032 & -- & +0.003 & -- & $-$0.013 & -- & \textbf{0.781} & -- & \textbf{421.4} & -- & 0.706 & -- \\
-Option-critic   & $-$0.028 & $-$0.037 & $-$0.015 & $-$0.068 & $-$0.108 & $-$0.260 & $-$0.018 & $-$0.137 & $-$0.077 & $-$0.055 & \textbf{1.000} & 0.684 & \textbf{0.1} & 2012.7 & 0.279 & 0.888 \\
-MELINOE         & $-$0.005 & $-$0.072 & $-$0.011 & $-$0.056 & $-$0.125 & $-$0.310 & $-$0.021 & $-$0.198 & $-$0.071 & $-$0.055 & 0.879 & 0.763 & 237.7 & 1541.9 & 0.674 & 0.838 \\
+SFT & +0.00 & $-$0.02 & $-$0.02 & $-$0.01 & $-$0.02 & $-$0.09 & +0.01 & $-$0.13 & $-$0.00 & $-$0.02 & $-$0.01 & $-$0.05 & 0.56 & 0.68 & 742.1 & 1943.9 & 0.89 & 0.90 \\
+Option-critic & $-$0.03 & $-$0.04 & $-$0.02 & $-$0.07 & $-$0.11 & $-$0.26 & $-$0.02 & $-$0.14 & $-$0.08 & $-$0.05 & $-$0.05 & $-$0.11 & 1.00 & 0.68 & 0.1 & 2012.7 & 0.28 & 0.89 \\
+MELINOE & $-$0.00 & $-$0.07 & $-$0.01 & $-$0.06 & $-$0.12 & $-$0.31 & $-$0.02 & $-$0.20 & $-$0.07 & $-$0.05 & $-$0.05 & $-$0.14 & 0.88 & 0.76 & 237.7 & 1541.9 & 0.67 & 0.84 \\
+\rowcolor{black!8} CAR-MoE & $-$0.01 & $-$0.00 & +0.00 & $-$0.01 & $-$0.05 & $-$0.01 & +0.00 & +0.05 & $-$0.01 & +0.00 & $-$0.01 & +0.01 & 0.62 & 0.76 & 435.9 & 1004.2 & 0.89 & 0.90 \\
+\rowcolor{black!8} CAR-MoE (+SFT) & +0.00 & -- & +0.00 & -- & $-$0.03 & -- & +0.00 & -- & $-$0.01 & -- & $-$0.01 & -- & 0.78 & -- & 421.4 & -- & 0.71 & -- \\
 \bottomrule
 \end{tabular}%
 }
@@ -242,19 +253,21 @@ MELINOE         & $-$0.005 & $-$0.072 & $-$0.011 & $-$0.056 & $-$0.125 & $-$0.31
 Phi-tiny-MoE-instruct was pretrained with 16 experts and top-2 routing, while OLMoE-1B-7B
 was pretrained with 64 experts and top-8 routing, a much larger pool and wider fan-out
 that matters for the collapse discussed below. On both backbones CAR-MoE is competitive
-with or better than the base model on most tasks, and combining it with the supervised
-loss (Phi-tiny-MoE only, so far) raises the hit ratio further still to 0.781 while also
-recovering the reward-only variant's throughput cost (Appendix~\ref{app:fulltables}) --
-option-critic and MELINOE instead lose several points of accuracy, most sharply on MATH,
-GSM8K, and HumanEval, for a comparable or larger hit-ratio gain. On Phi-tiny-MoE, the
-option-critic controller sharply peaks the routing distribution (ECI falls from 0.89 to
-0.28) while reaching a near-perfect hit ratio, which we interpret as routing collapsing
+with or better than the base model on most tasks -- option-critic and MELINOE instead
+lose several points of accuracy, most sharply on MATH, GSM8K, and HumanEval, for a
+comparable or larger hit-ratio gain. CAR-MoE~(+SFT) (Phi-tiny-MoE only, so far) raises the
+hit ratio further still to 0.78 while recovering the reward-only variant's throughput cost
+(Appendix~\ref{app:fulltables}), showing our reward objective combines readily with a
+supervised term to ground efficiency optimization in supervised learning. On Phi-tiny-MoE,
+the option-critic controller sharply peaks the routing distribution (ECI falls from 0.89
+to 0.28) while reaching a near-perfect hit ratio, which we interpret as routing collapsing
 onto a handful of experts that stay resident for the entire sequence rather than
-genuinely tracking locality, at considerable cost to downstream accuracy; CAR-MoE~(+SFT)
-only drops ECI to 0.71. With OLMoE-1B-7B, this collapse does not happen, arguably because
-of the larger model and its wider top-8 routing: every variant keeps a near-uniform
-distribution (ECI $\ge 0.84$), and CAR-MoE is the one that keeps a competitive hit ratio
-(0.759) together with the benchmark scores closest to the base model's own.
+genuinely tracking locality, at considerable cost to downstream accuracy; CAR-MoE and
+CAR-MoE~(+SFT) drop ECI by far less (to 0.89 and 0.71 respectively). With OLMoE-1B-7B,
+this collapse does not happen, arguably because of the larger model and its wider top-8
+routing: every variant keeps a near-uniform distribution (ECI $\ge 0.84$), and CAR-MoE is
+the one that keeps a competitive hit ratio (0.76) together with the benchmark scores
+closest to the base model's own.
 
 Figure~\ref{fig:delta_scatter} makes this trade-off explicit across both backbones at
 once: plotting each objective's change in average lm-eval-harness score against its
@@ -284,29 +297,39 @@ at the cost of the largest downstream regression.}
 \subsection{With Prompt Conditioning}
 \label{sec:results-conditioned}
 
+\begin{wrapfigure}{r}{0.32\textwidth}
+\centering
+\vspace{-1em}
+\includegraphics[width=0.3\textwidth]{figures/scaling_hit_ratio_combined.png}
+\vspace{-1.5em}
+\caption{\footnotesize Hit ratio vs.\ capacity (\% of experts), prompt-conditioned policy,
+both backbones (cf.\ Table~\ref{tab:conditioned}).}
+\label{fig:scaling_hit_inline}
+\end{wrapfigure}
 The prompt-conditioned policy is trained once per backbone but evaluated at every working-set
 capacity it was conditioned on, by prefixing each prompt with the target capacity
 (Section~\ref{sec:conditioning}). Table~\ref{tab:conditioned} in Appendix~\ref{app:fulltables}
 reports both backbones swept over every capacity they were trained on (Phi-tiny-MoE:
 $c\in\{2,4,8\}$, single seed; OLMoE: $c\in\{8,16,32\}$, averaged over two seeds), with
 capacity expressed as a \% of each backbone's total expert count so the two sweeps share
-one axis. As expected, hit ratio improves monotonically with capacity on both backbones,
-from 0.51-0.65 at the smallest capacity to 0.90-0.94 at the largest; tokens/second also
-increases with capacity, since a larger working set both raises the hit ratio and is
-evaluated with a fixed generation length, so the throughput gain compounds rather than
-trading off against the hit-ratio gain as it does for the fixed-capacity CAR-MoE of
-Table~\ref{tab:mainresults}. A single prompt-conditioned policy therefore lets a
-deployment pick a hit-ratio/throughput operating point at inference time without
-retraining, unlike the fixed-capacity variants of Section~\ref{sec:results-unconditioned}.
+one axis, plotted alongside in Figure~\ref{fig:scaling_hit_inline}. As expected, hit ratio
+improves monotonically with capacity on both backbones, from 0.51-0.65 at the smallest
+capacity to 0.90-0.94 at the largest; tokens/second also increases with capacity, since a
+larger working set both raises the hit ratio and is evaluated with a fixed generation
+length, so the throughput gain compounds rather than trading off against the hit-ratio
+gain as it does for the fixed-capacity CAR-MoE of Table~\ref{tab:mainresults}. A single
+prompt-conditioned policy therefore lets a deployment pick a hit-ratio/throughput
+operating point at inference time without retraining, unlike the fixed-capacity variants
+of Section~\ref{sec:results-unconditioned}.
 
 For reference, OLMoE's prompt-conditioned checkpoint evaluated unconditioned on the
-downstream task suite scores MMLU 0.544, MMMLU 0.374, GSM8K 0.662, HumanEval 0.268, and
-MATH 0.053 -- in the same range as Table~\ref{tab:mainresults}'s unconditioned objectives,
+downstream task suite scores MMLU 0.54, MMMLU 0.37, GSM8K 0.66, HumanEval 0.27, and
+MATH 0.05 -- in the same range as Table~\ref{tab:mainresults}'s unconditioned objectives,
 so the conditioning prefix does not measurably harm general task performance.
-Figures~\ref{fig:scaling_hit}--\ref{fig:scaling_tps} in Appendix~\ref{app:figures} plot
-Table~\ref{tab:conditioned} against capacity, and the same appendix's routing traces
-reveal an \emph{expert chunking} pattern under CAR-MoE -- contiguous runs of tokens
-sharing an expert, resembling the option-critic's macro-actions but emerging from a
+Figure~\ref{fig:scaling_tps} in Appendix~\ref{app:figures} plots the corresponding
+throughput curves, and the same appendix's routing traces reveal an \emph{expert
+chunking} pattern under CAR-MoE -- contiguous runs of tokens sharing an expert,
+resembling the option-critic's macro-actions but emerging from a
 stateless per-token reward rather than an architectural hold.
 
 \section{Conclusion}
@@ -374,11 +397,6 @@ Yu, Q., Zhang, Z., Zhu, R., Yuan, Y., Zuo, X., Yue, Y., Fan, T., Liu, G., Liu, L
 \newblock DAPO: An Open-Source LLM Reinforcement Learning System at Scale.
 \newblock \emph{arXiv preprint arXiv:2503.14476}, 2025.
 
-\bibitem[Mattson et al.(1970)]{mattson1970evaluation}
-Mattson, R.~L., Gecsei, J., Slutz, D.~R., and Traiger, I.~L.
-\newblock Evaluation Techniques for Storage Hierarchies.
-\newblock \emph{IBM Systems Journal}, 9(2):78--117, 1970.
-
 \bibitem[Muennighoff et al.(2024)]{muennighoff2024olmoe}
 Muennighoff, N., Soldaini, L., Groeneveld, D., Lo, K., Morrison, J., Min, S., Shi, W., Walsh, P., Tafjord, O., Lambert, N., et al.
 \newblock OLMoE: Open Mixture-of-Experts Language Models.
@@ -423,28 +441,6 @@ Jiang, A.~Q., Sablayrolles, A., Roux, A., Mensch, A., Savary, B., Bamford, C., C
 
 \appendix
 
-\section{Stack Distance and the Number of Expert Transfers}
-\label{app:stack}
-
-We make precise the relationship between the stack distance defined in
-Section~\ref{sec:metrics} and the total number of CPU-GPU expert transfers an offloaded
-serving system would incur. Let $r^{(\ell,t)} \in \{0,1\}^E$ denote the binary request
-vector at layer $\ell$ and token $t$, with $\|r^{(\ell,t)}\|_1 = K$, and let
-$\mathcal{C}^{(\ell,t)}$ be the set of experts resident in the working set after token $t$
-under an LRU eviction policy of capacity $c$. The number of working-set misses, which equals
-the number of transfers under a cold-start-free serving system, is
-\begin{equation}
-  N_{\mathrm{miss}}(\ell, c) = \sum_{t=1}^{T} \sum_{e \in e_t} \mathbb{1}\!\left[
-    e \notin \mathcal{C}^{(\ell,t^-)}\right] = \sum_{t=1}^{T} \sum_{e \in e_t}
-    \mathbb{1}[d(e, t) > c],
-\end{equation}
-where $d(e, t)$ is the stack distance of the access to $e$ at token $t$, treating a
-compulsory miss as $d = \infty$. Since $d(e, t)$ does not depend on $c$, computing it
-once for every access yields $N_{\mathrm{miss}}(\ell, c)$ for every candidate capacity
-$c$ in a single pass over the routing trace, which is how we obtain the hit ratio curves
-reported in Section~\ref{sec:results} without re-simulating the working set separately per
-capacity.
-
 \section{Regularizing Distribution Shift Without a KL Penalty}
 \label{app:sft}
 
@@ -476,7 +472,7 @@ results in absolute form, together with tokens/second (omitted from the main-tex
 \caption{Absolute results on Phi-tiny-MoE-instruct (1024 held-out prompts, averaged over
 two seeds), at the trained working-set capacity ($c=4$, top-2) -- the source values for
 Table~\ref{tab:mainresults}'s Phi $\Delta$ columns. Tokens/second follows the estimated
-offloaded-inference latency model of Appendix~\ref{app:stack} (compute plus a per-expert
+offloaded-inference latency model (compute plus a per-expert
 transfer penalty on every working-set miss) rather than a wall-clock trace on real
 offloading hardware, and is normalized against the base model's own compute pass (see the
 LoRA note in Section~\ref{sec:results}) so that adapters touching the expert projections
@@ -486,12 +482,12 @@ are not penalized twice.}
 \toprule
 Objective & MMLU & MMMLU & GSM8K & HumanEval & MATH & Hit ratio & Misses & ECI & Tokens/s \\
 \midrule
-Base (untuned)  & 0.617 & 0.344 & 0.623 & 0.027 & 0.088 & 0.571 & 649.8 & 0.892 & 337.0 \\
-SFT             & 0.620 & 0.319 & 0.608 & 0.040 & 0.084 & 0.565 & 742.1 & 0.891 & 370.5 \\
-CAR-MoE         & 0.603 & 0.349 & 0.574 & 0.031 & 0.074 & 0.622 & 435.9 & 0.888 & 234.8 \\
-CAR-MoE (+SFT)  & 0.617 & 0.348 & 0.591 & 0.031 & 0.075 & \textbf{0.781} & \textbf{421.4} & 0.706 & \textbf{428.6} \\
-Option-critic   & 0.589 & 0.329 & 0.515 & 0.009 & 0.011 & \textbf{1.000} & \textbf{0.1} & 0.279 & 438.1 \\
-MELINOE         & 0.612 & 0.334 & 0.499 & 0.006 & 0.017 & 0.879 & 237.7 & 0.674 & 440.3 \\
+Base (untuned)  & 0.62 & 0.34 & 0.62 & 0.03 & 0.09 & 0.57 & 649.8 & 0.89 & 337.0 \\
+SFT             & 0.62 & 0.32 & 0.61 & 0.04 & 0.08 & 0.56 & 742.1 & 0.89 & 370.5 \\
+Option-critic   & 0.59 & 0.33 & 0.51 & 0.01 & 0.01 & 1.00 & 0.1 & 0.28 & 438.1 \\
+MELINOE         & 0.61 & 0.33 & 0.50 & 0.01 & 0.02 & 0.88 & 237.7 & 0.67 & 440.3 \\
+\rowcolor{black!8} CAR-MoE         & 0.60 & 0.35 & 0.57 & 0.03 & 0.07 & 0.62 & 435.9 & 0.89 & 234.8 \\
+\rowcolor{black!8} CAR-MoE (+SFT)  & 0.62 & 0.35 & 0.59 & 0.03 & 0.07 & 0.78 & 421.4 & 0.71 & 428.6 \\
 \bottomrule
 \end{tabular}%
 }
@@ -512,11 +508,11 @@ Tokens/second normalized against the base model's own compute pass as above. CAR
 \toprule
 Objective & MMLU & MMMLU & GSM8K & HumanEval & MATH & Hit ratio & Misses & ECI & Tokens/s \\
 \midrule
-Base (untuned)  & 0.564 & 0.379 & 0.679 & 0.277 & 0.057 & 0.686 & 1874.2 & 0.895 & 315.6 \\
-SFT             & 0.547 & 0.367 & 0.588 & 0.149 & 0.040 & 0.679 & 1943.9 & 0.897 & 311.1 \\
-CAR-MoE         & 0.564 & 0.367 & 0.673 & 0.329 & 0.061 & \textbf{0.759} & \textbf{1004.2} & 0.895 & 273.9 \\
-Option-critic   & 0.527 & 0.311 & 0.419 & 0.140 & 0.003 & 0.684 & 2012.7 & 0.888 & 390.5 \\
-MELINOE         & 0.492 & 0.322 & 0.368 & 0.079 & 0.002 & 0.763 & 1541.9 & 0.838 & 438.2 \\
+Base (untuned)  & 0.56 & 0.38 & 0.68 & 0.28 & 0.06 & 0.69 & 1874.2 & 0.90 & 315.6 \\
+SFT             & 0.55 & 0.37 & 0.59 & 0.15 & 0.04 & 0.68 & 1943.9 & 0.90 & 311.1 \\
+Option-critic   & 0.53 & 0.31 & 0.42 & 0.14 & 0.00 & 0.68 & 2012.7 & 0.89 & 390.5 \\
+MELINOE         & 0.49 & 0.32 & 0.37 & 0.08 & 0.00 & 0.76 & 1541.9 & 0.84 & 438.2 \\
+\rowcolor{black!8} CAR-MoE         & 0.56 & 0.37 & 0.67 & 0.33 & 0.06 & 0.76 & 1004.2 & 0.90 & 273.9 \\
 \bottomrule
 \end{tabular}%
 }
@@ -536,14 +532,14 @@ at submission time); OLMoE's rows average two.}
 \toprule
 Capacity (\% of experts) & Backbone & Hit ratio & Tokens/s \\
 \midrule
-12.5\% (Phi $c=2$ / OLMoE $c=8$)  & Phi-tiny-MoE & 0.651 & 181.0 \\
-                                  & OLMoE        & 0.508 & 352.5 \\
+12.5\% (Phi $c=2$ / OLMoE $c=8$)  & Phi-tiny-MoE & 0.65 & 181.0 \\
+                                  & OLMoE        & 0.51 & 352.5 \\
 \midrule
-25\% (Phi $c=4$ / OLMoE $c=16$)   & Phi-tiny-MoE & 0.831 & 184.4 \\
-                                  & OLMoE        & 0.741 & 365.6 \\
+25\% (Phi $c=4$ / OLMoE $c=16$)   & Phi-tiny-MoE & 0.83 & 184.4 \\
+                                  & OLMoE        & 0.74 & 365.6 \\
 \midrule
-50\% (Phi $c=8$ / OLMoE $c=32$)   & Phi-tiny-MoE & \textbf{0.944} & \textbf{186.3} \\
-                                  & OLMoE        & \textbf{0.902} & \textbf{378.2} \\
+50\% (Phi $c=8$ / OLMoE $c=32$)   & Phi-tiny-MoE & 0.94 & 186.3 \\
+                                  & OLMoE        & 0.90 & 378.2 \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -673,15 +669,6 @@ per-expert segments (expert chunking, discussed above).}
 \includegraphics[width=0.42\textwidth]{figures/olmoe_melinoe_baseline_expert_trace.png}
 \caption{OLMoE-1B-7B, MELINOE -- expert routing trace at layers 4/8/12.}
 \label{fig:olmoe_melinoe}
-\end{figure}
-
-\begin{figure}[h]
-\centering
-\includegraphics[width=0.6\textwidth]{figures/scaling_hit_ratio_combined.png}
-\caption{Prompt-conditioned policy, both backbones -- working-set hit ratio as a function
-of the conditioned capacity, expressed as \% of each backbone's total expert count
-(descending on the $x$-axis), corresponding to Table~\ref{tab:conditioned}.}
-\label{fig:scaling_hit}
 \end{figure}
 
 \begin{figure}[h]

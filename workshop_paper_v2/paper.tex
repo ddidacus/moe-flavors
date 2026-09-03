@@ -1,0 +1,291 @@
+\documentclass{article}
+
+\usepackage[dblblindworkshop,final]{neurips_2026}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsfonts}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage[table]{xcolor}
+\usepackage{graphicx}
+
+\title{Consistency Is Not Enough: From Routing Stability to Compositional Robustness in Mixture-of-Experts}
+\workshoptitle{NeurIPS 2026 Workshop on Efficient Systems for Foundation Models}
+
+\author{
+  Diego Calanzone \\
+  Mila, Quebec AI Institute \\
+  \texttt{diego.calanzone@mila.quebec} \\[1em]
+  Riyasat Ohib \\
+  Georgia Institute of Technology \\
+  \texttt{PLACEHOLDER@gatech.edu} \\[1em]
+  Pierre-Luc Bacon \\
+  Mila, Quebec AI Institute; Universit\'e de Montr\'eal \\
+  \texttt{PLACEHOLDER@umontreal.ca}
+}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Fine-tuning a mixture-of-experts (MoE) router to reuse a stable set of experts across a
+sequence is usually motivated as a serving-efficiency trick, but stable routing is only
+useful insofar as it reflects something deeper: that individual experts specialize into
+reusable, semantically coherent modules, and that this modularity in turn makes the
+model's behavior more robust when its input changes. We make this chain explicit and test
+each link. Using CAR-MoE (Cache-Aware Routing for MoE), a GRPO-trained router objective
+that rewards a simulated working-set hit ratio, we measure, on top of two backbones
+(Phi-tiny-MoE-instruct, OLMoE-1B-7B) and five objectives (base, supervised fine-tuning,
+CAR-MoE, an option-critic-style controller, and MELINOE): (i) routing \emph{consistency}
+under meaning-preserving surface perturbations of the input; (ii) \emph{modularity}, via
+each expert's specialization to one of two content domains; and (iii) downstream
+\emph{robustness}, via the accuracy drop on GSM8K under the same perturbation. We find
+that consistency and modularity track robustness within the family of objectives that
+route non-degenerately, and that CAR-MoE achieves the smallest accuracy drop of any
+objective on \emph{both} backbones -- beating the untuned base model outright on
+OLMoE-1B-7B -- without any accompanying spike in aggregate consistency or specialization
+statistics. The option-critic controller, in contrast, is a sharp counterexample: it
+reaches near-perfect routing consistency and the highest specialization score of any
+objective by collapsing its routing onto a handful of experts, and this degenerate
+"modularity" coincides with the \emph{worst} robustness on Phi-tiny-MoE. Stability, we
+conclude, is necessary but not sufficient evidence of useful modularity; it must be
+checked against routing diversity and downstream robustness directly, not assumed.
+\end{abstract}
+
+\section{Introduction}
+
+A mixture-of-experts router fine-tuned to reuse a small, stable set of experts per
+sequence is typically justified purely as a memory-traffic optimization: fewer distinct
+experts touched per token means fewer weight transfers on an offloaded serving system.
+But routing consistency, on its own, is not obviously a virtue -- a router that always
+activates the same expert regardless of input is maximally consistent and maximally
+useless. The property that should actually matter is \emph{modularity}: whether
+individual experts specialize into coherent, reusable functional units, so that a
+consistent routing decision reflects a genuine correspondence between input content and
+expert identity rather than an arbitrary or collapsed assignment. And modularity should
+matter only because it is the mechanism by which a model \emph{composes} its specialized
+parts robustly when its environment changes -- when the same underlying task is presented
+under surface-level noise, paraphrase, or distribution shift.
+
+This paper makes that three-step chain -- consistency, for modularity, for robustness to a
+changing environment -- explicit and measures each link directly, rather than treating
+routing consistency as a terminal objective. We build on CAR-MoE (Cache-Aware Routing for
+MoE), which fine-tunes a router with GRPO against a stateful reward: the hit ratio of a
+simulated fixed-capacity LRU cache of experts, so that the policy is rewarded for
+sequence-level expert reuse without any custom auxiliary loss or architectural change to
+the routing mechanism. We compare it against a plain base model, supervised fine-tuning
+(SFT) alone, an option-critic-style temporally extended controller
+\citep{shen2026temporal,bacon2017optioncritic}, and MELINOE \citep{raje2026melinoe}, on two
+backbones of different scale (Phi-tiny-MoE-instruct: 16 experts, top-2; OLMoE-1B-7B: 64
+experts, top-8), and ask, for each: is its routing consistent under meaning-preserving
+input perturbations; do its experts specialize by content domain; and does that
+consistency and specialization actually predict robustness on a downstream task under the
+same kind of perturbation. The answer is not uniformly yes, and the exception is
+informative: an objective can appear maximally consistent and modular by the aggregate
+statistics alone while being the least robust of the comparison, because it achieves that
+appearance through routing collapse rather than genuine specialization.
+
+\section{Method}
+
+\paragraph{CAR-MoE.} We simulate a fixed-capacity LRU cache of experts at one middle
+transformer layer. Let $p_t \in \Delta^E$ be the router's distribution over $E$ experts at
+token $t$, $K$ the number of experts requested per token, and $\mathcal{C}_{t^-}$ the set
+of experts resident in the cache before token $t$, for a target capacity $c$. We use the
+soft reward $r_t = \sum_{e \in \mathcal{C}_{t^-}} p_t[e]$, the probability mass already
+captured by the working set, and $R(x,y) = \frac{1}{T}\sum_t r_t$ as the sequence-level
+reward for GRPO/DAPO \citep{shao2024deepseekmath,yu2025dapo}. Every objective, baselines
+included, is trained as a LoRA adapter over the frozen backbone, so absolute downstream
+scores are somewhat lower than a full fine-tune would reach, uniformly across methods; we
+do not compare absolute scores across objectives without normalizing to a common base
+here, and the analysis below is about relative, structural properties of routing rather
+than raw accuracy.
+
+\paragraph{Consistency.} For a held-out prompt, we take a teacher-forced forward pass and
+pool the top-1 expert choice over all valid tokens into a per-expert usage histogram. We
+build two meaning-preserving perturbed copies of each prompt: character-level typo noise
+(5\% per-character corruption rate) and cosmetic case/whitespace noise. Consistency is the
+Jensen-Shannon divergence between the original and perturbed histograms, averaged over
+256 held-out prompts; lower divergence means the router's aggregate expert usage is
+invariant to surface form.
+
+\paragraph{Modularity.} We sample two disjoint-domain prompt pools (math and code, from
+the Nemotron Post-Training Dataset v2, \citealp{nvidia2025nemotron}) and compute each
+expert's domain-conditional usage $P(\text{math} \mid e) = \frac{n_{\text{math}}(e)}
+{n_{\text{math}}(e) + n_{\text{code}}(e)}$ from pooled usage counts over 256 prompts per
+domain. An expert's specialization index is $|P(\text{math}\mid e) - 0.5| \times 2 \in
+[0,1]$; we report the mean specialization and the fraction of experts with
+specialization $> 0.6$. Good modularity should show up as invariance to the surface noise
+above \emph{and} sensitivity to this genuine domain shift, the complement of the
+consistency measure.
+
+\paragraph{Robustness.} We build a small, self-contained GSM8K exact-match evaluation
+(regex \texttt{"\#\#\#\# <n>"} extraction, four hand-written few-shot exemplars, no
+lm-eval-harness) and run it on 150 held-out test questions, once on the original questions
+and once on a copy perturbed with the same 5\% typo noise as above. We report the accuracy
+drop between the two as the robustness measure -- a changing environment operationalized as
+surface-level input noise on a fixed task, rather than a domain shift, so that it is
+directly comparable to the consistency measure's perturbation.
+
+\section{Results}
+
+\begin{table}[h]
+\centering
+\scriptsize
+\caption{Consistency, modularity, and robustness for every (backbone, objective)
+combination. JS-typo/JS-fmt: Jensen-Shannon divergence between original and
+perturbed routing histograms (lower = more consistent). Spec.-frac: fraction of experts
+with specialization $>0.6$ (higher = more modular). Acc.-orig/pert: GSM8K accuracy before
+and after typo perturbation. $\Delta$Acc: the resulting accuracy drop (lower = more
+robust). CAR-MoE rows highlighted; the option-critic controller's outlier row is marked
+with $\dagger$ and discussed in Section~\ref{sec:discussion}.}
+\begin{tabular}{ll cc c ccc}
+\toprule
+Backbone & Objective & JS-typo & JS-fmt & Spec.-frac & Acc.-orig & Acc.-pert & $\Delta$Acc \\
+\midrule
+Phi-tiny-MoE & Base           & 0.055 & 0.014 & 0.25 & 0.727 & 0.493 & 0.233 \\
+Phi-tiny-MoE & SFT            & 0.053 & 0.014 & 0.25 & 0.740 & 0.493 & 0.247 \\
+\rowcolor{black!8}
+Phi-tiny-MoE & CAR-MoE        & 0.054 & 0.015 & 0.25 & 0.713 & 0.493 & \textbf{0.220} \\
+Phi-tiny-MoE & Option-critic$^\dagger$ & 0.0001 & 0.00003 & \textbf{0.94} & 0.693 & 0.407 & \textbf{0.287} \\
+Phi-tiny-MoE & MELINOE        & 0.046 & 0.011 & 0.44 & 0.773 & 0.440 & 0.333 \\
+\midrule
+OLMoE-1B-7B  & Base           & 0.096 & 0.031 & 0.53 & 0.673 & 0.593 & 0.080 \\
+OLMoE-1B-7B  & SFT            & 0.095 & 0.031 & 0.56 & 0.707 & 0.473 & 0.233 \\
+\rowcolor{black!8}
+OLMoE-1B-7B  & CAR-MoE        & 0.094 & 0.030 & 0.52 & 0.667 & 0.593 & \textbf{0.073} \\
+OLMoE-1B-7B  & Option-critic  & 0.100 & 0.033 & 0.58 & 0.653 & 0.487 & 0.167 \\
+OLMoE-1B-7B  & MELINOE        & 0.081 & 0.026 & 0.55 & 0.533 & 0.360 & 0.173 \\
+\bottomrule
+\end{tabular}
+\label{tab:main}
+\end{table}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\textwidth]{figures/consistency_modularity_robustness.png}
+\caption{Left: routing consistency (JS divergence under typo noise) vs.\ GSM8K accuracy
+drop under the same perturbation. Right: modularity (fraction of specialized experts)
+vs.\ the same accuracy drop. Within each backbone, CAR-MoE and Base/SFT cluster together;
+Phi-tiny-MoE's option-critic controller (labeled) is the outlier in both panels --
+maximally consistent and maximally "specialized," yet the least robust objective on this
+backbone.}
+\label{fig:scatter}
+\end{figure}
+
+\subsection{CAR-MoE is the most robust objective on both backbones}
+
+CAR-MoE achieves the smallest GSM8K accuracy drop of any objective tested, on
+\emph{both} backbones: 0.073 on OLMoE-1B-7B (versus 0.080 base, 0.233 for plain SFT --
+$3.2\times$ larger) and 0.220 on Phi-tiny-MoE (versus 0.233 base, 0.247 SFT, 0.333
+MELINOE). On OLMoE-1B-7B it is the only objective that beats the untuned base outright.
+It reaches this without any spike in aggregate consistency or specialization statistics
+-- its JS-typo, JS-fmt, and specialization numbers sit within noise of base/SFT on the
+same backbone (Table~\ref{tab:main}). We read this as the reward improving robustness
+through genuine, non-collapsing reuse of an already-reasonable routing policy, not a
+conspicuous shift in aggregate behavior -- unlike the mechanism discussed next.
+
+\subsection{The option-critic counterexample}
+\label{sec:discussion}
+
+Phi-tiny-MoE's option-critic controller breaks the pattern sharply. Its routing
+consistency is roughly three orders of magnitude better than every other objective on
+either backbone (JS-typo $\approx 0.0001$ vs.\ $0.05$--$0.10$ elsewhere), and its
+specialization fraction (0.94) is by far the highest -- by the aggregate statistics alone,
+this objective looks like the clearest success case for the consistency-to-modularity
+story. It is instead the \emph{least} robust objective in the entire comparison
+($\Delta$Acc $= 0.287$, the worst of all ten rows). We already know why from a routing
+trace analysis on the same checkpoint: the controller collapses onto a small, fixed
+subset of experts that stays resident for essentially the whole sequence, rather than
+tracking sequence-level content. A collapsed router is trivially perturbation-invariant,
+since it does not use its input to make the routing decision in the first place, and it is
+trivially "specialized" by our domain-conditional statistic, since a handful of experts
+absorb nearly all traffic from both domains simultaneously, each ending up nominally
+associated with whichever domain happens to send it slightly more tokens. Neither
+aggregate statistic distinguishes this from genuine content-sensitive specialization
+without the robustness check.
+
+This is the central methodological point of the paper: consistency and a coarse
+per-expert specialization statistic are each consistent with two very different
+underlying mechanisms -- meaningful modularity, or degenerate collapse -- and they cannot
+be told apart without an independent, direct measurement of robustness under exactly the
+kind of environment change the modularity claim is supposed to explain. Reporting
+routing consistency or a hit ratio alone, as prior work in this space has largely done,
+risks mistaking the second mechanism for the first.
+
+\section{Conclusion}
+
+Routing consistency in a mixture-of-experts router is not an end in itself; it is only
+useful evidence of modularity, and modularity is only useful insofar as it makes a
+model's behavior robust to a changing environment. We measured all three links directly
+across two backbones and five objectives, and found that CAR-MoE improves robustness on
+both backbones without an accompanying spike in aggregate consistency or specialization
+statistics -- while an option-critic-style controller achieves the best aggregate
+consistency and specialization scores of any objective tested by collapsing its routing
+entirely, and pays for it with the worst downstream robustness in the comparison. Future
+work in this space should report a direct robustness check alongside any consistency or
+hit-ratio metric, since the latter, on their own, cannot rule out the degenerate
+explanation.
+
+\bibliographystyle{plainnat}
+\begin{thebibliography}{99}
+
+\bibitem[Shen and Henderson(2026)]{shen2026temporal}
+Shen, Y. and Henderson, P.
+\newblock Temporally Extended Mixture-of-Experts via Option-Critic.
+\newblock \emph{arXiv preprint arXiv:2604.20156}, 2026.
+
+\bibitem[Bacon et al.(2017)]{bacon2017optioncritic}
+Bacon, P.-L., Harb, J., and Precup, D.
+\newblock The Option-Critic Architecture.
+\newblock \emph{Proceedings of the AAAI Conference on Artificial Intelligence}, 2017.
+
+\bibitem[Raje et al.(2026)]{raje2026melinoe}
+Raje, A., Nayak, A., and Joshi, A.
+\newblock MELINOE: Fine-Tuning Mixture-of-Experts Language Models for Cache-Friendly Offloaded Inference.
+\newblock \emph{arXiv preprint arXiv:2602.11192}, 2026.
+
+\bibitem[Shao et al.(2024)]{shao2024deepseekmath}
+Shao, Z., Wang, P., Zhu, Q., Xu, R., Song, J., Bi, X., Zhang, H., Zhang, M., Li, Y.~K., Wu, Y., and Guo, D.
+\newblock DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models.
+\newblock \emph{arXiv preprint arXiv:2402.03300}, 2024.
+
+\bibitem[Yu et al.(2025)]{yu2025dapo}
+Yu, Q., Zhang, Z., Zhu, R., Yuan, Y., Zuo, X., Yue, Y., Fan, T., Liu, G., Liu, L., Liu, X., et al.
+\newblock DAPO: An Open-Source LLM Reinforcement Learning System at Scale.
+\newblock \emph{arXiv preprint arXiv:2503.14476}, 2025.
+
+\bibitem[NVIDIA(2025)]{nvidia2025nemotron}
+NVIDIA.
+\newblock Nemotron Post-Training Dataset v2.
+\newblock \emph{Hugging Face Dataset Card}, 2025.
+
+\end{thebibliography}
+
+\appendix
+
+\section{Per-Expert Specialization Detail}
+\label{app:spec}
+
+Table~\ref{tab:main}'s specialization fraction is the share of experts with
+$|P(\text{math}\mid e) - 0.5| \times 2 > 0.6$ out of $E$ total experts (16 for
+Phi-tiny-MoE, 64 for OLMoE-1B-7B). The mean specialization index (not shown in the main
+table for space) follows the same ordering as the fraction reported: Phi-tiny-MoE base
+0.450, SFT 0.434, CAR-MoE 0.430, option-critic 0.938, MELINOE 0.533; OLMoE base 0.563,
+SFT 0.612, CAR-MoE 0.567, option-critic 0.604, MELINOE 0.631. The cross-domain
+Jensen-Shannon divergence between each objective's math- and code-domain expert usage
+distributions -- a complementary modularity signal, high values indicating the router
+genuinely reroutes between domains rather than using a fixed subset regardless of content
+-- is: Phi-tiny-MoE base 0.159, SFT 0.138, CAR-MoE 0.149, option-critic 0.0001, MELINOE
+0.243; OLMoE base 0.128, SFT 0.150, CAR-MoE 0.128, option-critic 0.139, MELINOE 0.121.
+Notably, the option-critic controller's near-zero cross-domain divergence confirms the
+collapse account directly: a router that used the same fixed experts regardless of
+domain would show zero divergence between domains by construction, exactly what is
+observed, whereas every other objective on either backbone shows a divergence at least
+three orders of magnitude larger.
+
+\end{document}

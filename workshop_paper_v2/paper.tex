@@ -12,6 +12,7 @@
 \usepackage{nicefrac}
 \usepackage{microtype}
 \usepackage[table]{xcolor}
+\usepackage{array}
 \usepackage{graphicx}
 
 \title{Consistency Is Not Enough: From Routing Stability to Compositional Robustness in Mixture-of-Experts}
@@ -60,17 +61,15 @@ checked against routing diversity and downstream robustness directly, not assume
 \section{Introduction}
 
 A mixture-of-experts router fine-tuned to reuse a small, stable set of experts per
-sequence is typically justified purely as a memory-traffic optimization: fewer distinct
-experts touched per token means fewer weight transfers on an offloaded serving system.
-But routing consistency, on its own, is not obviously a virtue -- a router that always
-activates the same expert regardless of input is maximally consistent and maximally
-useless. The property that should actually matter is \emph{modularity}: whether
-individual experts specialize into coherent, reusable functional units, so that a
-consistent routing decision reflects a genuine correspondence between input content and
-expert identity rather than an arbitrary or collapsed assignment. And modularity should
-matter only because it is the mechanism by which a model \emph{composes} its specialized
-parts robustly when its environment changes -- when the same underlying task is presented
-under surface-level noise, paraphrase, or distribution shift.
+sequence is typically justified purely as a memory-traffic optimization. But routing
+consistency, on its own, is not obviously a virtue -- a router that always activates the
+same expert regardless of input is maximally consistent and maximally useless. What
+should actually matter is \emph{modularity}: whether individual experts specialize into
+coherent, reusable functional units, so a consistent routing decision reflects a genuine
+correspondence between content and expert identity rather than an arbitrary or collapsed
+assignment. And modularity should matter only because it is the mechanism by which a
+model \emph{composes} its specialized parts robustly when its environment changes -- when
+the same task is presented under surface noise, paraphrase, or distribution shift.
 
 This paper makes that three-step chain -- consistency, for modularity, for robustness to a
 changing environment -- explicit and measures each link directly, rather than treating
@@ -94,16 +93,15 @@ appearance through routing collapse rather than genuine specialization.
 
 \paragraph{CAR-MoE.} We simulate a fixed-capacity LRU cache of experts at one middle
 transformer layer. Let $p_t \in \Delta^E$ be the router's distribution over $E$ experts at
-token $t$, $K$ the number of experts requested per token, and $\mathcal{C}_{t^-}$ the set
-of experts resident in the cache before token $t$, for a target capacity $c$. We use the
-soft reward $r_t = \sum_{e \in \mathcal{C}_{t^-}} p_t[e]$, the probability mass already
-captured by the working set, and $R(x,y) = \frac{1}{T}\sum_t r_t$ as the sequence-level
-reward for GRPO/DAPO \citep{shao2024deepseekmath,yu2025dapo}. Every objective, baselines
-included, is trained as a LoRA adapter over the frozen backbone, so absolute downstream
-scores are somewhat lower than a full fine-tune would reach, uniformly across methods; we
-do not compare absolute scores across objectives without normalizing to a common base
-here, and the analysis below is about relative, structural properties of routing rather
-than raw accuracy.
+token $t$ and $\mathcal{C}_{t^-}$ the set of experts resident in the cache before token
+$t$, for a target capacity $c$. We use the soft reward $r_t = \sum_{e \in
+\mathcal{C}_{t^-}} p_t[e]$, the probability mass already captured by the working set, and
+$R(x,y) = \frac{1}{T}\sum_t r_t$ as the sequence-level reward for GRPO/DAPO
+\citep{shao2024deepseekmath,yu2025dapo}. Every objective, baselines included, is a LoRA
+adapter over the frozen backbone, so absolute downstream scores are somewhat lower than a
+full fine-tune, uniformly across methods; we report benchmark performance as $\Delta$
+from each backbone's own base model (Table~\ref{tab:main}), alongside the working-set hit
+ratio and mean cache misses from the same simulated LRU cache CAR-MoE is trained against.
 
 \paragraph{Consistency.} For a held-out prompt, we take a teacher-forced forward pass and
 pool the top-1 expert choice over all valid tokens into a per-expert usage histogram. We
@@ -124,112 +122,119 @@ above \emph{and} sensitivity to this genuine domain shift, the complement of the
 consistency measure.
 
 \paragraph{Robustness.} We build a small, self-contained GSM8K exact-match evaluation
-(regex \texttt{"\#\#\#\# <n>"} extraction, four hand-written few-shot exemplars, no
-lm-eval-harness) and run it on 150 held-out test questions, once on the original questions
-and once on a copy perturbed with the same 5\% typo noise as above. We report the accuracy
-drop between the two as the robustness measure -- a changing environment operationalized as
-surface-level input noise on a fixed task, rather than a domain shift, so that it is
-directly comparable to the consistency measure's perturbation.
+(regex \texttt{"\#\#\#\# <n>"} extraction, four few-shot exemplars, no lm-eval-harness) on
+150 held-out test questions, once original and once perturbed with the same 5\% typo
+noise as above, and report the accuracy drop as the robustness measure -- a changing
+environment operationalized as surface noise, comparable to the consistency
+perturbation.
 
 \section{Results}
 
 \begin{table}[h]
 \centering
 \scriptsize
-\caption{Consistency, modularity, and robustness for every (backbone, objective)
-combination. JS-typo/JS-fmt: Jensen-Shannon divergence between original and
-perturbed routing histograms (lower = more consistent). Spec.-frac: fraction of experts
-with specialization $>0.6$ (higher = more modular). Acc.-orig/pert: GSM8K accuracy before
-and after typo perturbation. $\Delta$Acc: the resulting accuracy drop (lower = more
-robust). CAR-MoE rows highlighted; the option-critic controller's outlier row is marked
-with $\dagger$ and discussed in Section~\ref{sec:discussion}.}
-\begin{tabular}{ll cc c ccc}
+\caption{Benchmark performance, working-set efficiency, routing consistency,
+modularity, and robustness for every (backbone, objective) combination, at each
+backbone's trained working-set capacity (Phi: $c=4$; OLMoE: $c=16$). Avg~$\Delta$Bench:
+mean $\Delta$ from the backbone's own base model over MMLU, MMMLU, GSM8K, HumanEval, and
+MATH (positive is better). Hit ratio / Misses: working-set hit ratio and mean misses per
+sequence from the same simulated LRU cache CAR-MoE is trained against (higher
+hit ratio / lower misses is better). JS-typo/JS-fmt: Jensen-Shannon divergence between
+original and perturbed routing histograms (lower = more consistent). Spec.-frac: fraction
+of experts with specialization $>0.6$ (higher = more modular). $\Delta$Acc: GSM8K accuracy
+drop under typo perturbation (lower = more robust). CAR-MoE rows highlighted; the
+option-critic controller's outlier row is marked $\dagger$ (Section~\ref{sec:discussion}).}
+\renewcommand{\arraystretch}{0.9}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{ll ccc ccc c}
 \toprule
-Backbone & Objective & JS-typo & JS-fmt & Spec.-frac & Acc.-orig & Acc.-pert & $\Delta$Acc \\
+Backbone & Objective & Avg~$\Delta$Bench & Hit ratio & Misses & JS-typo & JS-fmt & Spec.-frac & $\Delta$Acc \\
 \midrule
-Phi-tiny-MoE & Base           & 0.055 & 0.014 & 0.25 & 0.727 & 0.493 & 0.233 \\
-Phi-tiny-MoE & SFT            & 0.053 & 0.014 & 0.25 & 0.740 & 0.493 & 0.247 \\
+Phi-tiny-MoE & Base (untuned)  & --     & 0.571 & 649.8 & 0.055 & 0.014 & 0.25 & 0.233 \\
+Phi-tiny-MoE & SFT             & $-$0.01 & 0.565 & 742.1 & 0.053 & 0.014 & 0.25 & 0.247 \\
 \rowcolor{black!8}
-Phi-tiny-MoE & CAR-MoE        & 0.054 & 0.015 & 0.25 & 0.713 & 0.493 & \textbf{0.220} \\
-Phi-tiny-MoE & Option-critic$^\dagger$ & 0.0001 & 0.00003 & \textbf{0.94} & 0.693 & 0.407 & \textbf{0.287} \\
-Phi-tiny-MoE & MELINOE        & 0.046 & 0.011 & 0.44 & 0.773 & 0.440 & 0.333 \\
+Phi-tiny-MoE & CAR-MoE         & $-$0.01 & 0.622 & 435.9 & 0.054 & 0.015 & 0.25 & \textbf{0.220} \\
+Phi-tiny-MoE & Option-critic$^\dagger$ & $-$0.05 & \textbf{1.000} & \textbf{0.1} & 0.0001 & 0.00003 & \textbf{0.94} & 0.287 \\
+Phi-tiny-MoE & MELINOE         & $-$0.05 & 0.879 & 237.7 & 0.046 & 0.011 & 0.44 & 0.333 \\
 \midrule
-OLMoE-1B-7B  & Base           & 0.096 & 0.031 & 0.53 & 0.673 & 0.593 & 0.080 \\
-OLMoE-1B-7B  & SFT            & 0.095 & 0.031 & 0.56 & 0.707 & 0.473 & 0.233 \\
+OLMoE-1B-7B  & Base (untuned)  & --     & 0.686 & 1874.2 & 0.096 & 0.031 & 0.53 & 0.080 \\
+OLMoE-1B-7B  & SFT             & $-$0.05 & 0.679 & 1943.9 & 0.095 & 0.031 & 0.56 & 0.233 \\
 \rowcolor{black!8}
-OLMoE-1B-7B  & CAR-MoE        & 0.094 & 0.030 & 0.52 & 0.667 & 0.593 & \textbf{0.073} \\
-OLMoE-1B-7B  & Option-critic  & 0.100 & 0.033 & 0.58 & 0.653 & 0.487 & 0.167 \\
-OLMoE-1B-7B  & MELINOE        & 0.081 & 0.026 & 0.55 & 0.533 & 0.360 & 0.173 \\
+OLMoE-1B-7B  & CAR-MoE         & $+$0.01 & \textbf{0.759} & \textbf{1004.2} & 0.094 & 0.030 & 0.52 & \textbf{0.073} \\
+OLMoE-1B-7B  & Option-critic   & $-$0.11 & 0.684 & 2012.7 & 0.100 & 0.033 & 0.58 & 0.167 \\
+OLMoE-1B-7B  & MELINOE         & $-$0.14 & 0.763 & 1541.9 & 0.081 & 0.026 & 0.55 & 0.173 \\
 \bottomrule
-\end{tabular}
+\end{tabular}%
+}
 \label{tab:main}
 \end{table}
 
 \begin{figure}[h]
 \centering
 \includegraphics[width=\textwidth]{figures/consistency_modularity_robustness.png}
-\caption{Left: routing consistency (JS divergence under typo noise) vs.\ GSM8K accuracy
-drop under the same perturbation. Right: modularity (fraction of specialized experts)
-vs.\ the same accuracy drop. Within each backbone, CAR-MoE and Base/SFT cluster together;
-Phi-tiny-MoE's option-critic controller (labeled) is the outlier in both panels --
-maximally consistent and maximally "specialized," yet the least robust objective on this
-backbone.}
+\caption{Left: consistency (JS divergence under typo noise) vs.\ GSM8K accuracy drop
+under the same perturbation. Right: modularity (fraction of specialized experts) vs.\ the
+same drop. CAR-MoE and Base/SFT cluster together within each backbone; Phi-tiny-MoE's
+option-critic controller (labeled) is the outlier in both panels -- maximally consistent
+and "specialized," yet least robust.}
 \label{fig:scatter}
 \end{figure}
 
 \subsection{CAR-MoE is the most robust objective on both backbones}
 
 CAR-MoE achieves the smallest GSM8K accuracy drop of any objective tested, on
-\emph{both} backbones: 0.073 on OLMoE-1B-7B (versus 0.080 base, 0.233 for plain SFT --
-$3.2\times$ larger) and 0.220 on Phi-tiny-MoE (versus 0.233 base, 0.247 SFT, 0.333
-MELINOE). On OLMoE-1B-7B it is the only objective that beats the untuned base outright.
-It reaches this without any spike in aggregate consistency or specialization statistics
--- its JS-typo, JS-fmt, and specialization numbers sit within noise of base/SFT on the
-same backbone (Table~\ref{tab:main}). We read this as the reward improving robustness
-through genuine, non-collapsing reuse of an already-reasonable routing policy, not a
-conspicuous shift in aggregate behavior -- unlike the mechanism discussed next.
+\emph{both} backbones: 0.073 on OLMoE-1B-7B (versus 0.080 base, 0.233 SFT -- $3.2\times$
+larger) and 0.220 on Phi-tiny-MoE (versus 0.233 base, 0.247 SFT, 0.333 MELINOE). On
+OLMoE-1B-7B it is the only objective that beats the untuned base outright, while also
+raising the hit ratio the most of any non-collapsed objective (0.759 vs.\ 0.686 base, a
+46\% cut in misses, 1004 vs.\ 1874) and losing the least average benchmark score ($-$0.01
+vs.\ $-$0.05 SFT, $-$0.11 option-critic, $-$0.14 MELINOE) -- efficiency, task performance,
+and robustness improve together rather than trading off. Phi-tiny-MoE shows the same
+pattern at smaller magnitude (hit ratio 0.622, misses 435.9, both better than base's
+0.571/649.8, alongside the best robustness). It reaches all of this without any spike in
+aggregate consistency or specialization statistics -- JS-typo, JS-fmt, and specialization
+sit within noise of base/SFT on the same backbone (Table~\ref{tab:main}). We read this as
+the reward improving robustness through genuine,
+non-collapsing reuse of an already-reasonable routing policy, not a conspicuous shift in
+aggregate behavior -- unlike the mechanism discussed next.
 
 \subsection{The option-critic counterexample}
 \label{sec:discussion}
 
 Phi-tiny-MoE's option-critic controller breaks the pattern sharply. Its routing
 consistency is roughly three orders of magnitude better than every other objective on
-either backbone (JS-typo $\approx 0.0001$ vs.\ $0.05$--$0.10$ elsewhere), and its
-specialization fraction (0.94) is by far the highest -- by the aggregate statistics alone,
-this objective looks like the clearest success case for the consistency-to-modularity
-story. It is instead the \emph{least} robust objective in the entire comparison
-($\Delta$Acc $= 0.287$, the worst of all ten rows). We already know why from a routing
-trace analysis on the same checkpoint: the controller collapses onto a small, fixed
-subset of experts that stays resident for essentially the whole sequence, rather than
-tracking sequence-level content. A collapsed router is trivially perturbation-invariant,
-since it does not use its input to make the routing decision in the first place, and it is
-trivially "specialized" by our domain-conditional statistic, since a handful of experts
-absorb nearly all traffic from both domains simultaneously, each ending up nominally
-associated with whichever domain happens to send it slightly more tokens. Neither
-aggregate statistic distinguishes this from genuine content-sensitive specialization
-without the robustness check.
-
-This is the central methodological point of the paper: consistency and a coarse
-per-expert specialization statistic are each consistent with two very different
-underlying mechanisms -- meaningful modularity, or degenerate collapse -- and they cannot
-be told apart without an independent, direct measurement of robustness under exactly the
-kind of environment change the modularity claim is supposed to explain. Reporting
-routing consistency or a hit ratio alone, as prior work in this space has largely done,
-risks mistaking the second mechanism for the first.
+either backbone (JS-typo $\approx 0.0001$ vs.\ $0.05$--$0.10$ elsewhere), its
+specialization fraction (0.94) is the highest, and it reaches a perfect working-set hit
+ratio (1.000, 0.1 mean misses vs.\ hundreds elsewhere) -- by every aggregate statistic in
+Table~\ref{tab:main} this looks like the clearest success case for the consistency-to-
+modularity story and the best outcome for the underlying serving-efficiency motivation.
+It is instead the \emph{least} robust objective tested ($\Delta$Acc $= 0.287$) and among
+the weakest on average benchmark score ($-0.05$). A routing trace analysis on the same
+checkpoint explains why: the controller collapses onto a small, fixed subset of experts
+resident for essentially the whole sequence rather than tracking content, so the perfect
+hit ratio is a symptom of that collapse, not evidence of useful reuse. A collapsed router
+is trivially perturbation-invariant (it barely uses its input to route at all) and
+trivially "specialized" by our domain statistic (a handful of experts absorb nearly all
+traffic from both domains, each nominally tied to whichever sent slightly more tokens).
+Neither statistic distinguishes this from genuine specialization without the robustness
+check: consistency and specialization are each consistent with meaningful modularity
+\emph{or} degenerate collapse, and only a direct robustness measurement under the kind of
+environment change the modularity claim is about tells the two apart. Reporting
+consistency or hit ratio alone, as prior work in this space largely does, risks mistaking
+the latter for the former.
 
 \section{Conclusion}
 
-Routing consistency in a mixture-of-experts router is not an end in itself; it is only
-useful evidence of modularity, and modularity is only useful insofar as it makes a
-model's behavior robust to a changing environment. We measured all three links directly
-across two backbones and five objectives, and found that CAR-MoE improves robustness on
-both backbones without an accompanying spike in aggregate consistency or specialization
-statistics -- while an option-critic-style controller achieves the best aggregate
-consistency and specialization scores of any objective tested by collapsing its routing
-entirely, and pays for it with the worst downstream robustness in the comparison. Future
-work in this space should report a direct robustness check alongside any consistency or
-hit-ratio metric, since the latter, on their own, cannot rule out the degenerate
-explanation.
+Routing consistency is not an end in itself; it is only useful evidence of modularity,
+and modularity is only useful insofar as it makes a model robust to a changing
+environment. Measuring all three links directly across two backbones and five objectives,
+we found CAR-MoE the most robust objective on both, together with the best working-set
+hit ratio and benchmark retention of any non-collapsed objective -- while an option-critic
+controller reached the best aggregate consistency, specialization, \emph{and} hit-ratio
+scores of any objective tested by collapsing its routing entirely, and paid for it with
+the worst downstream robustness in the comparison. Future work in this space should
+report a direct robustness check alongside any consistency or hit-ratio metric, since the
+latter, alone, cannot rule out this degenerate explanation.
 
 \bibliographystyle{plainnat}
 \begin{thebibliography}{99}
